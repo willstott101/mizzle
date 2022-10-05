@@ -1,0 +1,8 @@
+[package]
+name = "libmizzle"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+trillium = "0.2"
+trillium-smol = "0.2"
