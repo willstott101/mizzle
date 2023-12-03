@@ -1,10 +1,11 @@
 use trillium_smol;
-use trillium::Conn;
+use trillium::{Conn, conn_try};
 use simple_logger::SimpleLogger;
 use log::info;
 // use form_urlencoded;
 // use std::collections::HashMap;
 use gix_packetline::encode::{text_to_write, flush_to_write};
+use gix_packetline::{StreamingPeekableIter, PacketLineRef};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -36,50 +37,65 @@ async fn serve_git_protocol_2(mut conn: trillium::Conn, repo_path: Box<str>, pro
     // The git protocol recommends making sure to prevent any caching
     conn = conn.with_header(trillium::KnownHeaderName::CacheControl, "no-cache");
 
-    // /info/refs
-
-    // let params: HashMap<_, _> = form_urlencoded::parse(conn.querystring().as_bytes()).collect();
-    // if params.get("service").map(|p| (*p).as_ref()) != Some("git-upload-pack") {
-    //     println!("Only git-upload-pack is supported");
-    //     return conn.with_status(501).with_body("Only git-upload-pack is supported").halt();
-    // }
-
-    // StreamingPeekableIter
     info!("REQUEST CONTENT TYPE {:?}", conn.headers().get_str("Content-Type"));
     info!("HTTP {} {} {}", conn.method(), conn.path(), conn.querystring());
     info!("GIT {} {}", repo_path, protocol_path);
 
-    let (reader, mut writer) = piper::pipe(4096);
-    trillium_smol::spawn((|| async move {
-        // Copied from github
-        text_to_write(b"# service=git-upload-pack", &mut writer).await.expect("to write to output");
-        flush_to_write(&mut writer).await.expect("to write to output");
+    if protocol_path.as_ref() == "info/refs" {
+        // let params: HashMap<_, _> = form_urlencoded::parse(conn.querystring().as_bytes()).collect();
+        // if params.get("service").map(|p| (*p).as_ref()) != Some("git-upload-pack") {
+        //     println!("Only git-upload-pack is supported");
+        //     return conn.with_status(501).with_body("Only git-upload-pack is supported").halt();
+        // }
 
-        // Understood in the spec
-        text_to_write(b"version 2", &mut writer).await.expect("to write to output");
-        text_to_write(b"agent=mizzle/dev", &mut writer).await.expect("to write to output");
+        // Part of the V2 handshake
+        conn = conn.with_header(trillium::KnownHeaderName::ContentType, "application/x-git-upload-pack-advertisement");
+        let (reader, mut writer) = piper::pipe(4096);
+        trillium_smol::spawn((|| async move {
+            // Copied from github
+            text_to_write(b"# service=git-upload-pack", &mut writer).await.expect("to write to output");
+            flush_to_write(&mut writer).await.expect("to write to output");
 
-        // Copied from github
-        text_to_write(b"ls-refs=unborn", &mut writer).await.expect("to write to output");
-        text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
-        text_to_write(b"server-option", &mut writer).await.expect("to write to output");
-        text_to_write(b"object-format=sha1", &mut writer).await.expect("to write to output");
+            // Understood in the spec
+            text_to_write(b"version 2", &mut writer).await.expect("to write to output");
+            text_to_write(b"agent=mizzle/dev", &mut writer).await.expect("to write to output");
 
-        // Understood in the spec
-        flush_to_write(&mut writer).await.expect("to write to output");
-    })());
+            // Copied from github
+            text_to_write(b"ls-refs", &mut writer).await.expect("to write to output");
+            // text_to_write(b"ls-refs=unborn", &mut writer).await.expect("to write to output");
+            // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
+            // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
+            // text_to_write(b"object-format=sha1", &mut writer).await.expect("to write to output");
 
-    // 001e# service=git-upload-pack
-    // 0000000eversion 2
-    // 0022agent=git/github-0ecc5b5f94fa
-    // 0013ls-refs=unborn
-    // 0027fetch=shallow wait-for-done filter
-    // 0012server-option
-    // 0017object-format=sha1
-    // 0000
-
-    conn.with_status(trillium::Status::Ok).with_body(trillium::Body::new_streaming(reader, None)).halt()
-    // conn.with_status(trillium::Status::Ok).with_body(format!("000eversion 2\nagent={}/{}\n0000", NAME, VERSION))
-
-    // info!("BODY: {:#?}", conn.request_body_string().await);
+            // Understood in the spec
+            flush_to_write(&mut writer).await.expect("to write to output");
+        })());
+        conn.with_status(trillium::Status::Ok).with_body(trillium::Body::new_streaming(reader, None)).halt()
+    } else if protocol_path.as_ref() == "git-upload-pack" {
+        if conn.headers().get_str(trillium::KnownHeaderName::ContentType) != Some("application/x-git-upload-pack-request") {
+            return conn.with_status(trillium::Status::BadRequest).with_body("Expected content type application/x-git-upload-pack-request").halt();
+        } else {
+            info!("PARSING LINES");
+            let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[]);
+            loop {
+                let line = parser.read_line().await;
+                match line {
+                    Some(found_line) => {
+                        let parsed_line = conn_try!(conn_try!(found_line, conn), conn);
+                        if matches!(parsed_line, PacketLineRef::ResponseEnd | PacketLineRef::Flush) {
+                            break;
+                        }
+                        info!("LINE: {:?}", parsed_line);
+                        info!("LINE: {:#?}", parsed_line.as_bstr());
+                    },
+                    None => {
+                        break
+                    },
+                }
+            }
+        }
+        conn
+    } else {
+        conn
+    }
 }
