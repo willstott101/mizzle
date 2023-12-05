@@ -2,8 +2,7 @@ use trillium_smol;
 use trillium::{Conn, conn_try};
 use simple_logger::SimpleLogger;
 use log::info;
-// use form_urlencoded;
-// use std::collections::HashMap;
+use anyhow::Result;
 use gix_packetline::encode::{text_to_write, flush_to_write};
 use gix_packetline::{StreamingPeekableIter, PacketLineRef};
 
@@ -42,11 +41,7 @@ async fn serve_git_protocol_2(mut conn: trillium::Conn, repo_path: Box<str>, pro
     info!("GIT {} {}", repo_path, protocol_path);
 
     if protocol_path.as_ref() == "info/refs" {
-        // let params: HashMap<_, _> = form_urlencoded::parse(conn.querystring().as_bytes()).collect();
-        // if params.get("service").map(|p| (*p).as_ref()) != Some("git-upload-pack") {
-        //     println!("Only git-upload-pack is supported");
-        //     return conn.with_status(501).with_body("Only git-upload-pack is supported").halt();
-        // }
+        // We also expect a query parameter of ?service=git-upload-pack but I don't see a reason to check for it.
 
         // Part of the V2 handshake
         conn = conn.with_header(trillium::KnownHeaderName::ContentType, "application/x-git-upload-pack-advertisement");
@@ -75,27 +70,35 @@ async fn serve_git_protocol_2(mut conn: trillium::Conn, repo_path: Box<str>, pro
         if conn.headers().get_str(trillium::KnownHeaderName::ContentType) != Some("application/x-git-upload-pack-request") {
             return conn.with_status(trillium::Status::BadRequest).with_body("Expected content type application/x-git-upload-pack-request").halt();
         } else {
-            info!("PARSING LINES");
-            let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[]);
-            loop {
-                let line = parser.read_line().await;
-                match line {
-                    Some(found_line) => {
-                        let parsed_line = conn_try!(conn_try!(found_line, conn), conn);
-                        if matches!(parsed_line, PacketLineRef::ResponseEnd | PacketLineRef::Flush) {
-                            break;
-                        }
-                        info!("LINE: {:?}", parsed_line);
-                        info!("LINE: {:#?}", parsed_line.as_bstr());
-                    },
-                    None => {
-                        break
-                    },
-                }
-            }
+            let lines = conn_try!(read_message_as_unicode_lines(&mut conn).await, conn);
+            info!("LINES: {:?}", lines);
         }
         conn
     } else {
         conn
     }
+}
+
+async fn read_message_as_unicode_lines(conn: &mut trillium::Conn) -> Result<Vec<Option<String>>> {
+    let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[]);
+    let mut v = Vec::new();
+    loop {
+        let line = parser.read_line().await;
+        match line {
+            Some(found_line) => {
+                let parsed_line = found_line??;
+                if matches!(parsed_line, PacketLineRef::ResponseEnd | PacketLineRef::Flush) {
+                    break;
+                }
+                match parsed_line.as_bstr() {
+                    Some(bstr) => v.push(Some(String::from_utf8(bstr.strip_suffix(b"\n").unwrap_or(bstr).to_owned())?)),
+                    None => v.push(None),
+                }
+            },
+            None => {
+                break
+            },
+        }
+    }
+    return Ok(v);
 }

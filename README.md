@@ -7,3 +7,15 @@ mizzle is a library for:
 * writing horizontally-scalable servers exposing git's http protocol
 
 mizzle thanks gitoxide, git, and rust
+
+
+Things to fix in git docs:
+
+	S: 200 OK
+	S: <Some headers>
+	S: ...
+	S:
+	S: 000eversion 2\n
+	S: <capability-advertisement>
+
+then goes on to say that `<capability-advertisement>`` contains `000eversion 2\n`
