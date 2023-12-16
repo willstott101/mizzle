@@ -11,7 +11,10 @@ use trillium_smol;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    SimpleLogger::new().init().unwrap();
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
 
     // port 8080
     trillium_smol::run(|conn: trillium::Conn| async move {
@@ -89,11 +92,10 @@ async fn serve_git_protocol_2(
                 .await
                 .expect("to write to output");
 
-            // Copied from github
-            // text_to_write(b"ls-refs", &mut writer)
-            //     .await
-            //     .expect("to write to output");
-            text_to_write(b"ls-refs=unborn", &mut writer).await.expect("to write to output");
+            text_to_write(b"ls-refs=unborn", &mut writer)
+                .await
+                .expect("to write to output");
+            // Copied from github - yet to be implemented/confirmed
             // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
             // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
             // text_to_write(b"object-format=sha1", &mut writer).await.expect("to write to output");
@@ -130,7 +132,8 @@ async fn serve_git_protocol_2(
                     trillium_smol::spawn((|| async move {
                         perform_listrefs(&repo, &args, writer).await.unwrap();
                     })());
-                    return conn.with_status(trillium::Status::Ok)
+                    return conn
+                        .with_status(trillium::Status::Ok)
                         .with_body(trillium::Body::new_streaming(reader, None))
                         .halt();
                 }
@@ -249,70 +252,84 @@ fn get_head_info(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs) -> Resul
                 None => None,
                 Some(oid) => {
                     if args.symrefs {
-                        Some(format!("{} HEAD symref-target:{}", oid, head_ref.name().as_bstr()))
+                        Some(format!(
+                            "{} HEAD symref-target:{}",
+                            oid,
+                            head_ref.name().as_bstr()
+                        ))
                     } else {
                         Some(format!("{} HEAD", oid))
                     }
-                },
+                }
             }
-        },
+        }
         None => None,
     })
 }
 
-async fn perform_listrefs(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs, mut writer: piper::Writer) -> Result<()> {
-
+async fn perform_listrefs(
+    repo: &gix::ThreadSafeRepository,
+    args: &ListRefsArgs,
+    mut writer: piper::Writer,
+) -> Result<()> {
     match get_head_info(repo, args)? {
         Some(packetline) => {
             text_to_write(packetline.as_bytes(), &mut writer)
                 .await
                 .expect("to write to output");
-        },
+        }
         None => {
             if args.unborn {
                 text_to_write(b"unborn HEAD", &mut writer)
                     .await
                     .expect("to write to output");
             }
-        },
+        }
     }
 
     for reference in repo.refs.iter()?.all()? {
-
         // If it's a fat tag the obj-id is the tag, and we have "peeled:..." in the result, nothing else uses "peeled", and we only do this when the flag is set
 
         // TODO: remove these question marks? how should we handle errors?
         let mut r = reference?;
 
-        println!("REF {:#?}", r);
+        // println!("REF {:#?}", r);
         match r.target.clone() {
             gix_ref::Target::Peeled(oid) => {
                 if args.peel {
                     let peeled = r.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
                     if peeled != oid {
-                        text_to_write(format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(), &mut writer)
-                            .await
-                            .expect("to write to output");
+                        text_to_write(
+                            format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(),
+                            &mut writer,
+                        )
+                        .await
+                        .expect("to write to output");
                         continue;
                     }
                 }
                 text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer)
                     .await
                     .expect("to write to output");
-            },
+            }
             gix_ref::Target::Symbolic(symref_target) => {
                 // SPEED: Can I avoid this clone? Peel only being is quite awkward here.
-                let peeled = r.clone().peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                let peeled = r
+                    .clone()
+                    .peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
                 if args.symrefs {
-                    text_to_write(format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(), &mut writer)
-                        .await
-                        .expect("to write to output");
+                    text_to_write(
+                        format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(),
+                        &mut writer,
+                    )
+                    .await
+                    .expect("to write to output");
                 } else {
                     text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer)
                         .await
                         .expect("to write to output");
                 }
-            },
+            }
         }
     }
 
@@ -337,6 +354,3 @@ where
         }
     }
 }
-
-
-

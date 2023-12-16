@@ -1,23 +1,27 @@
 use anyhow::{bail, Context, Error, Result};
 use futures_lite::AsyncRead;
 use log::info;
-use simple_logger::SimpleLogger;
-use trillium::{conn_try, Conn};
-use trillium_smol::ClientConfig;
 use log::LevelFilter;
+use simple_logger::SimpleLogger;
+use trillium::Method;
+use trillium::{conn_try, Conn};
 use trillium_client::Client;
 use trillium_smol;
-use trillium::Method;
+use trillium_smol::ClientConfig;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    SimpleLogger::new().with_level(LevelFilter::Info).init().unwrap();
+    SimpleLogger::new()
+        .with_level(LevelFilter::Info)
+        .init()
+        .unwrap();
 
     // port 8080
     trillium_smol::run(|mut conn: trillium::Conn| async move {
-        let client = Client::new(trillium_rustls::RustlsConfig::<trillium_smol::ClientConfig>::default())
-            .with_default_pool();
+        let client =
+            Client::new(trillium_rustls::RustlsConfig::<trillium_smol::ClientConfig>::default())
+                .with_default_pool();
 
         if conn
             .headers()
@@ -36,35 +40,36 @@ fn main() {
         println!("REQ {}", url);
 
         let mut upstream_conn = match conn.method() {
-            Method::Get => {
-                client.get(url.as_str())
-            },
+            Method::Get => client.get(url.as_str()),
             Method::Post => {
                 let body = conn.request_body_string().await.unwrap();
                 println!("POST BODY");
                 println!("{}", body);
                 client.post(url.as_str()).with_body(body)
-            },
+            }
             _ => todo!(),
         };
 
         match conn
             .request_headers()
-            .get_str(trillium::KnownHeaderName::ContentType) {
-                Some(v) => {
-                    upstream_conn.request_headers().append(trillium::KnownHeaderName::ContentType, v.to_owned());
-                },
-                None => (),
+            .get_str(trillium::KnownHeaderName::ContentType)
+        {
+            Some(v) => {
+                upstream_conn
+                    .request_headers()
+                    .append(trillium::KnownHeaderName::ContentType, v.to_owned());
             }
+            None => (),
+        }
 
-        match conn
-            .request_headers()
-            .get_str("Git-Protocol") {
-                Some(v) => {
-                    upstream_conn.request_headers().append("Git-Protocol", v.to_owned());
-                },
-                None => (),
+        match conn.request_headers().get_str("Git-Protocol") {
+            Some(v) => {
+                upstream_conn
+                    .request_headers()
+                    .append("Git-Protocol", v.to_owned());
             }
+            None => (),
+        }
 
         // for h in conn.headers().iter() {
         //     upstream_conn.request_headers().append(h.0, h.1.clone());
