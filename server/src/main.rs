@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Error, Result};
 use futures_lite::AsyncRead;
 use gix_packetline::encode::{flush_to_write, text_to_write};
 use gix_packetline::{PacketLineRef, StreamingPeekableIter};
+use gix_ref::file::ReferenceExt;
 use log::info;
 use simple_logger::SimpleLogger;
 use trillium::{conn_try, Conn};
@@ -89,10 +90,10 @@ async fn serve_git_protocol_2(
                 .expect("to write to output");
 
             // Copied from github
-            text_to_write(b"ls-refs", &mut writer)
-                .await
-                .expect("to write to output");
-            // text_to_write(b"ls-refs=unborn", &mut writer).await.expect("to write to output");
+            // text_to_write(b"ls-refs", &mut writer)
+            //     .await
+            //     .expect("to write to output");
+            text_to_write(b"ls-refs=unborn", &mut writer).await.expect("to write to output");
             // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
             // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
             // text_to_write(b"object-format=sha1", &mut writer).await.expect("to write to output");
@@ -116,17 +117,22 @@ async fn serve_git_protocol_2(
                 .with_body("Expected content type application/x-git-upload-pack-request")
                 .halt();
         } else {
+            // println!("{}", conn.request_body_string().await.unwrap());
             let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[]);
             let command = conn_try!(read_command(&mut parser).await, conn);
             match command {
                 Command::ListRefs => {
+                    // println!("{}", conn.request_body_string().await.unwrap());
                     let args = conn_try!(read_lsrefs_args(&mut parser).await, conn);
                     info!("LIST REFS ARGS: {:?}", args);
-                    // let repo = conn_try!(gix::open(some_repo_path), conn);
-                    // let refs = conn_try!(repo.references(), conn);
-                    // let conn_iter = conn_try!(refs.prefixed(...), conn).peeled();
-                    // Actually.. probs easiest to loop over all references and redo the logic here.
-                    // For peeling, multiple prefixes etc
+                    let repo = conn_try!(gix::open("."), conn).into_sync();
+                    let (reader, writer) = piper::pipe(4096);
+                    trillium_smol::spawn((|| async move {
+                        perform_listrefs(&repo, &args, writer).await.unwrap();
+                    })());
+                    return conn.with_status(trillium::Status::Ok)
+                        .with_body(trillium::Body::new_streaming(reader, None))
+                        .halt();
                 }
                 Command::Empty => (),
             }
@@ -183,6 +189,10 @@ struct ListRefsArgs {
     /// show refs not matching the prefix if it chooses, and clients
     /// should filter the result themselves.
     prefixes: Vec<Box<[u8]>>,
+    /// The server will send information about HEAD even if it is a symref
+    /// pointing to an unborn branch in the form "unborn HEAD
+    /// symref-target:<target>".
+    unborn: bool,
 }
 
 async fn read_lsrefs_args<T>(parser: &mut StreamingPeekableIter<T>) -> Result<ListRefsArgs>
@@ -201,6 +211,7 @@ where
     let mut args = ListRefsArgs {
         symrefs: false,
         peel: false,
+        unborn: false,
         prefixes: Vec::new(),
     };
     loop {
@@ -219,6 +230,7 @@ where
                         match arg {
                             b"peel" => args.peel = true,
                             b"symrefs" => args.symrefs = true,
+                            b"unborn" => args.unborn = true,
                             _ => bail!("unrecognised lsrefs argument"),
                         };
                     }
@@ -227,6 +239,87 @@ where
         }
     }
     Ok(args)
+}
+
+fn get_head_info(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs) -> Result<Option<String>> {
+    Ok(match repo.to_thread_local().head_ref()? {
+        Some(mut head_ref) => {
+            head_ref.peel_to_id_in_place()?;
+            match head_ref.inner.peeled {
+                None => None,
+                Some(oid) => {
+                    if args.symrefs {
+                        Some(format!("{} HEAD symref-target:{}", oid, head_ref.name().as_bstr()))
+                    } else {
+                        Some(format!("{} HEAD", oid))
+                    }
+                },
+            }
+        },
+        None => None,
+    })
+}
+
+async fn perform_listrefs(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs, mut writer: piper::Writer) -> Result<()> {
+
+    match get_head_info(repo, args)? {
+        Some(packetline) => {
+            text_to_write(packetline.as_bytes(), &mut writer)
+                .await
+                .expect("to write to output");
+        },
+        None => {
+            if args.unborn {
+                text_to_write(b"unborn HEAD", &mut writer)
+                    .await
+                    .expect("to write to output");
+            }
+        },
+    }
+
+    for reference in repo.refs.iter()?.all()? {
+
+        // If it's a fat tag the obj-id is the tag, and we have "peeled:..." in the result, nothing else uses "peeled", and we only do this when the flag is set
+
+        // TODO: remove these question marks? how should we handle errors?
+        let mut r = reference?;
+
+        println!("REF {:#?}", r);
+        match r.target.clone() {
+            gix_ref::Target::Peeled(oid) => {
+                if args.peel {
+                    let peeled = r.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                    if peeled != oid {
+                        text_to_write(format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(), &mut writer)
+                            .await
+                            .expect("to write to output");
+                        continue;
+                    }
+                }
+                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer)
+                    .await
+                    .expect("to write to output");
+            },
+            gix_ref::Target::Symbolic(symref_target) => {
+                // SPEED: Can I avoid this clone? Peel only being is quite awkward here.
+                let peeled = r.clone().peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                if args.symrefs {
+                    text_to_write(format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(), &mut writer)
+                        .await
+                        .expect("to write to output");
+                } else {
+                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer)
+                        .await
+                        .expect("to write to output");
+                }
+            },
+        }
+    }
+
+    flush_to_write(&mut writer)
+        .await
+        .expect("to write to output");
+    Ok(())
 }
 
 async fn skip_till_delimiter<T>(parser: &mut StreamingPeekableIter<T>) -> Result<()>
@@ -244,3 +337,6 @@ where
         }
     }
 }
+
+
+

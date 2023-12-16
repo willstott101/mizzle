@@ -1,5 +1,5 @@
 [package]
-name = "server"
+name = "sniffer"
 version = "0.1.0"
 edition = "2021"
 
@@ -8,13 +8,12 @@ edition = "2021"
 [dependencies]
 trillium = "0.2"
 trillium-smol = "0.3"
+trillium-client = "*"
 log = "*"
 simple_logger = "*"
 form_urlencoded = "*"
-gix = "*"
-gix-packetline = {version="*", features=["async-io"]}
-gix-ref = "*"
 futures-lite = "*"
 smol = "*"
 piper = "*"
 anyhow = "*"
+trillium-rustls = "*"
