@@ -1,7 +1,8 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
+use gix::ObjectId;
 use gix_packetline::{
-    encode::{flush_to_write, text_to_write},
+    encode::{flush_to_write, text_to_write, delim_to_write},
     PacketLineRef,
 };
 
@@ -98,4 +99,36 @@ where
         }
     }
     Ok(args)
+}
+
+pub async fn perform_fetch(
+    repo: &gix::ThreadSafeRepository,
+    args: &FetchArgs,
+    mut writer: piper::Writer,
+) -> anyhow::Result<()> {
+    let ready = false;
+    let acks: Vec<ObjectId> = Vec::new();
+
+    if !args.done {
+        // TODO: Calculate acks and readiness
+
+        text_to_write(b"acknowledgments", &mut writer).await?;
+        if !ready {
+            if acks.is_empty() {
+                text_to_write(b"nak", &mut writer).await?;
+            } else {
+                for ack in acks {
+                    text_to_write(format!("ack {}", ack).as_bytes(), &mut writer).await?;
+                }
+            }
+            flush_to_write(&mut writer).await?;
+            return Ok(())
+        }
+        text_to_write(b"ready", &mut writer).await?;
+        delim_to_write(&mut writer).await?;
+    }
+
+
+
+    Ok(())
 }
