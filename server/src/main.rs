@@ -95,6 +95,7 @@ async fn serve_git_protocol_2(
             text_to_write(b"ls-refs=unborn", &mut writer)
                 .await
                 .expect("to write to output");
+            text_to_write(b"fetch", &mut writer).await.expect("to write to output");
             // Copied from github - yet to be implemented/confirmed
             // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
             // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
@@ -126,7 +127,7 @@ async fn serve_git_protocol_2(
                 Command::ListRefs => {
                     // println!("{}", conn.request_body_string().await.unwrap());
                     let args = conn_try!(read_lsrefs_args(&mut parser).await, conn);
-                    info!("LIST REFS ARGS: {:?}", args);
+                    // info!("LIST REFS ARGS: {:?}", args);
                     let repo = conn_try!(gix::open("."), conn).into_sync();
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
@@ -288,17 +289,20 @@ async fn perform_listrefs(
     }
 
     for reference in repo.refs.iter()?.all()? {
-        // If it's a fat tag the obj-id is the tag, and we have "peeled:..." in the result, nothing else uses "peeled", and we only do this when the flag is set
+        // TODO: packet-line style error handling
+        let r = reference?;
+        let mut to_peel = r.clone();
 
-        // TODO: remove these question marks? how should we handle errors?
-        let mut r = reference?;
-
-        // println!("REF {:#?}", r);
-        match r.target.clone() {
+        match r.target {
+            // This reference is to an annotated tag or a commit.
             gix_ref::Target::Peeled(oid) => {
                 if args.peel {
-                    let peeled = r.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                    // We check if this is an annotated tag by peeling it
+                    let peeled =
+                        to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                    // The peeled result changes so this must have been an annotated tag
                     if peeled != oid {
+                        // Output the anotated tag's oid & name but also the underlying commit's oid
                         text_to_write(
                             format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(),
                             &mut writer,
@@ -308,15 +312,17 @@ async fn perform_listrefs(
                         continue;
                     }
                 }
+                // Either this isn't an annotated tag, or we weren't asked to peel
+                // So we just return the oid directly
                 text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer)
                     .await
                     .expect("to write to output");
             }
+            // This is a symbolic reference (such as HEAD)
             gix_ref::Target::Symbolic(symref_target) => {
-                // SPEED: Can I avoid this clone? Peel only being is quite awkward here.
-                let peeled = r
-                    .clone()
-                    .peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                // We always need to find the underlying commit oid of the symbolic reference so we do that first.
+                let peeled = to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                // We only output the name of the intermediate reference if requested
                 if args.symrefs {
                     text_to_write(
                         format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(),
