@@ -123,6 +123,18 @@ pub async fn perform_listrefs(
     for reference in repo.refs.iter()?.all()? {
         // TODO: packet-line style error handling
         let r = reference?;
+
+        // Filter requested refs and avoid peeling them
+        if !args.prefixes.is_empty() {
+            if !args
+                .prefixes
+                .iter()
+                .any(|prefix| r.name.as_bstr().starts_with(prefix))
+            {
+                continue;
+            }
+        }
+
         let mut to_peel = r.clone();
 
         match r.target {
