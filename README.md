@@ -19,3 +19,5 @@ Things to fix in git docs:
 	S: <capability-advertisement>
 
 then goes on to say that `<capability-advertisement>`` contains `000eversion 2\n`
+
+not all the fetch args specify that multiple entries of that arg can be specified

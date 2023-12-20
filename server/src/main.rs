@@ -1,14 +1,15 @@
-use anyhow::{bail, Context, Error, Result};
+mod utils;
+mod ls_refs;
+mod fetch;
+
+use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
 use gix_packetline::encode::{flush_to_write, text_to_write};
 use gix_packetline::{PacketLineRef, StreamingPeekableIter};
-use gix_ref::file::ReferenceExt;
 use log::info;
 use simple_logger::SimpleLogger;
 use trillium::{conn_try, Conn};
 use trillium_smol;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     SimpleLogger::new()
@@ -126,12 +127,12 @@ async fn serve_git_protocol_2(
             match command {
                 Command::ListRefs => {
                     // println!("{}", conn.request_body_string().await.unwrap());
-                    let args = conn_try!(read_lsrefs_args(&mut parser).await, conn);
+                    let args = conn_try!(ls_refs::read_lsrefs_args(&mut parser).await, conn);
                     // info!("LIST REFS ARGS: {:?}", args);
                     let repo = conn_try!(gix::open("."), conn).into_sync();
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
-                        perform_listrefs(&repo, &args, writer).await.unwrap();
+                        ls_refs::perform_listrefs(&repo, &args, writer).await.unwrap();
                     })());
                     return conn
                         .with_status(trillium::Status::Ok)
@@ -139,6 +140,11 @@ async fn serve_git_protocol_2(
                         .halt();
                 }
                 Command::Empty => (),
+                Command::Fetch => {
+                    let args = conn_try!(fetch::read_fetch_args(&mut parser).await, conn);
+                    info!("FETCH: {:?}", args);
+                    // println!("{}", conn.request_body_string().await.unwrap());
+                },
             }
         }
         conn
@@ -149,6 +155,7 @@ async fn serve_git_protocol_2(
 
 #[derive(Debug)]
 enum Command {
+    Fetch,
     ListRefs,
     Empty,
 }
@@ -172,191 +179,10 @@ where
         .context("expected command")?;
     match command {
         b"ls-refs" => Ok(Command::ListRefs),
+        b"fetch" => Ok(Command::Fetch),
         command_name => Err(Error::msg(format!(
             "unrecognised command: {:?}",
             command_name
         ))),
-    }
-}
-
-#[derive(Debug)]
-struct ListRefsArgs {
-    /// In addition to the object pointed by it, show the underlying ref
-    /// pointed by it when showing a symbolic ref.
-    symrefs: bool,
-    /// Show peeled tags.
-    peel: bool,
-    /// When specified, only references having a prefix matching one of
-    /// the provided prefixes are displayed. Multiple instances may be
-    /// given, in which case references matching any prefix will be
-    /// shown. Note that this is purely for optimization; a server MAY
-    /// show refs not matching the prefix if it chooses, and clients
-    /// should filter the result themselves.
-    prefixes: Vec<Box<[u8]>>,
-    /// The server will send information about HEAD even if it is a symref
-    /// pointing to an unborn branch in the form "unborn HEAD
-    /// symref-target:<target>".
-    unborn: bool,
-}
-
-async fn read_lsrefs_args<T>(parser: &mut StreamingPeekableIter<T>) -> Result<ListRefsArgs>
-where
-    T: AsyncRead + Unpin,
-{
-    // "command=ls-refs"
-    // "agent=git/2.40.1"
-    // None (delimiter)
-    // "peel"
-    // "symrefs"
-    // "ref-prefix HEAD"
-    // "ref-prefix refs/heads/"
-    // "ref-prefix refs/tags/"
-    skip_till_delimiter(parser).await?; // TODO: Is this info ever useful?
-    let mut args = ListRefsArgs {
-        symrefs: false,
-        peel: false,
-        unborn: false,
-        prefixes: Vec::new(),
-    };
-    loop {
-        let line = parser
-            .read_line()
-            .await
-            .context("unexpected eof (missing flush packet?)")???;
-        match line {
-            PacketLineRef::ResponseEnd | PacketLineRef::Flush => break,
-            PacketLineRef::Delimiter => bail!("unexpected delimiter"),
-            PacketLineRef::Data(d) => {
-                let arg = d.strip_suffix(b"\n").unwrap_or(d);
-                match arg.strip_prefix(b"ref-prefix ") {
-                    Some(prefix) => args.prefixes.push(prefix.into()),
-                    None => {
-                        match arg {
-                            b"peel" => args.peel = true,
-                            b"symrefs" => args.symrefs = true,
-                            b"unborn" => args.unborn = true,
-                            _ => bail!("unrecognised lsrefs argument"),
-                        };
-                    }
-                };
-            }
-        }
-    }
-    Ok(args)
-}
-
-fn get_head_info(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs) -> Result<Option<String>> {
-    Ok(match repo.to_thread_local().head_ref()? {
-        Some(mut head_ref) => {
-            head_ref.peel_to_id_in_place()?;
-            match head_ref.inner.peeled {
-                None => None,
-                Some(oid) => {
-                    if args.symrefs {
-                        Some(format!(
-                            "{} HEAD symref-target:{}",
-                            oid,
-                            head_ref.name().as_bstr()
-                        ))
-                    } else {
-                        Some(format!("{} HEAD", oid))
-                    }
-                }
-            }
-        }
-        None => None,
-    })
-}
-
-async fn perform_listrefs(
-    repo: &gix::ThreadSafeRepository,
-    args: &ListRefsArgs,
-    mut writer: piper::Writer,
-) -> Result<()> {
-    match get_head_info(repo, args)? {
-        Some(packetline) => {
-            text_to_write(packetline.as_bytes(), &mut writer)
-                .await
-                .expect("to write to output");
-        }
-        None => {
-            if args.unborn {
-                text_to_write(b"unborn HEAD", &mut writer)
-                    .await
-                    .expect("to write to output");
-            }
-        }
-    }
-
-    for reference in repo.refs.iter()?.all()? {
-        // TODO: packet-line style error handling
-        let r = reference?;
-        let mut to_peel = r.clone();
-
-        match r.target {
-            // This reference is to an annotated tag or a commit.
-            gix_ref::Target::Peeled(oid) => {
-                if args.peel {
-                    // We check if this is an annotated tag by peeling it
-                    let peeled =
-                        to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
-                    // The peeled result changes so this must have been an annotated tag
-                    if peeled != oid {
-                        // Output the anotated tag's oid & name but also the underlying commit's oid
-                        text_to_write(
-                            format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(),
-                            &mut writer,
-                        )
-                        .await
-                        .expect("to write to output");
-                        continue;
-                    }
-                }
-                // Either this isn't an annotated tag, or we weren't asked to peel
-                // So we just return the oid directly
-                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer)
-                    .await
-                    .expect("to write to output");
-            }
-            // This is a symbolic reference (such as HEAD)
-            gix_ref::Target::Symbolic(symref_target) => {
-                // We always need to find the underlying commit oid of the symbolic reference so we do that first.
-                let peeled = to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
-                // We only output the name of the intermediate reference if requested
-                if args.symrefs {
-                    text_to_write(
-                        format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(),
-                        &mut writer,
-                    )
-                    .await
-                    .expect("to write to output");
-                } else {
-                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer)
-                        .await
-                        .expect("to write to output");
-                }
-            }
-        }
-    }
-
-    flush_to_write(&mut writer)
-        .await
-        .expect("to write to output");
-    Ok(())
-}
-
-async fn skip_till_delimiter<T>(parser: &mut StreamingPeekableIter<T>) -> Result<()>
-where
-    T: AsyncRead + Unpin,
-{
-    loop {
-        let line = parser.read_line().await.context("expected delimiter")???;
-        match line {
-            PacketLineRef::ResponseEnd | PacketLineRef::Flush => {
-                bail!("found end of response expected delimiter")
-            }
-            PacketLineRef::Delimiter => return Ok(()),
-            PacketLineRef::Data(_) => (),
-        }
     }
 }
