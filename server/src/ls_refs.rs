@@ -1,8 +1,10 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
-use gix_packetline::{PacketLineRef, encode::{text_to_write, flush_to_write}};
+use gix_packetline::{
+    encode::{flush_to_write, text_to_write},
+    PacketLineRef,
+};
 use gix_ref::file::ReferenceExt;
-
 
 #[derive(Debug)]
 pub struct ListRefsArgs {
@@ -24,7 +26,9 @@ pub struct ListRefsArgs {
     unborn: bool,
 }
 
-pub async fn read_lsrefs_args<T>(parser: &mut gix_packetline::StreamingPeekableIter<T>) -> anyhow::Result<ListRefsArgs>
+pub async fn read_lsrefs_args<T>(
+    parser: &mut gix_packetline::StreamingPeekableIter<T>,
+) -> anyhow::Result<ListRefsArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
 {
@@ -32,11 +36,11 @@ where
     // "agent=git/2.40.1"
     // None (delimiter)
     skip_till_delimiter(parser).await?; // TODO: Is this info we're skipping ever useful?
-    // "peel"
-    // "symrefs"
-    // "ref-prefix HEAD"
-    // "ref-prefix refs/heads/"
-    // "ref-prefix refs/tags/"
+                                        // "peel"
+                                        // "symrefs"
+                                        // "ref-prefix HEAD"
+                                        // "ref-prefix refs/heads/"
+                                        // "ref-prefix refs/tags/"
     let mut args = ListRefsArgs {
         symrefs: false,
         peel: false,
@@ -70,7 +74,10 @@ where
     Ok(args)
 }
 
-fn get_head_info(repo: &gix::ThreadSafeRepository, args: &ListRefsArgs) -> anyhow::Result<Option<String>> {
+fn get_head_info(
+    repo: &gix::ThreadSafeRepository,
+    args: &ListRefsArgs,
+) -> anyhow::Result<Option<String>> {
     Ok(match repo.to_thread_local().head_ref()? {
         Some(mut head_ref) => {
             head_ref.peel_to_id_in_place()?;

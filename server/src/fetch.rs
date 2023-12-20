@@ -1,7 +1,9 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
-use gix_packetline::{PacketLineRef, encode::{text_to_write, flush_to_write}};
-
+use gix_packetline::{
+    encode::{flush_to_write, text_to_write},
+    PacketLineRef,
+};
 
 #[derive(Debug)]
 pub struct FetchArgs {
@@ -40,7 +42,9 @@ pub struct FetchArgs {
     ofs_delta: bool,
 }
 
-pub async fn read_fetch_args<T>(parser: &mut gix_packetline::StreamingPeekableIter<T>) -> anyhow::Result<FetchArgs>
+pub async fn read_fetch_args<T>(
+    parser: &mut gix_packetline::StreamingPeekableIter<T>,
+) -> anyhow::Result<FetchArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
 {
@@ -48,11 +52,11 @@ where
     // "agent=git/2.40.1"
     // None (delimiter)
     skip_till_delimiter(parser).await?; // TODO: Is this info we're skipping ever useful?
-    // "peel"
-    // "symrefs"
-    // "ref-prefix HEAD"
-    // "ref-prefix refs/heads/"
-    // "ref-prefix refs/tags/"
+                                        // "peel"
+                                        // "symrefs"
+                                        // "ref-prefix HEAD"
+                                        // "ref-prefix refs/heads/"
+                                        // "ref-prefix refs/tags/"
     let mut args = FetchArgs {
         want: Vec::new(),
         have: Vec::new(),

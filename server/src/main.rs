@@ -1,6 +1,6 @@
-mod utils;
-mod ls_refs;
 mod fetch;
+mod ls_refs;
+mod utils;
 
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
@@ -96,7 +96,9 @@ async fn serve_git_protocol_2(
             text_to_write(b"ls-refs=unborn", &mut writer)
                 .await
                 .expect("to write to output");
-            text_to_write(b"fetch", &mut writer).await.expect("to write to output");
+            text_to_write(b"fetch", &mut writer)
+                .await
+                .expect("to write to output");
             // Copied from github - yet to be implemented/confirmed
             // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
             // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
@@ -132,7 +134,9 @@ async fn serve_git_protocol_2(
                     let repo = conn_try!(gix::open("."), conn).into_sync();
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
-                        ls_refs::perform_listrefs(&repo, &args, writer).await.unwrap();
+                        ls_refs::perform_listrefs(&repo, &args, writer)
+                            .await
+                            .unwrap();
                     })());
                     return conn
                         .with_status(trillium::Status::Ok)
@@ -144,7 +148,7 @@ async fn serve_git_protocol_2(
                     let args = conn_try!(fetch::read_fetch_args(&mut parser).await, conn);
                     info!("FETCH: {:?}", args);
                     // println!("{}", conn.request_body_string().await.unwrap());
-                },
+                }
             }
         }
         conn

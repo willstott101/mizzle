@@ -1,8 +1,9 @@
-
 use anyhow::Context;
 use gix_packetline::PacketLineRef;
 
-pub async fn skip_till_delimiter<T>(parser: &mut gix_packetline::StreamingPeekableIter<T>) -> anyhow::Result<()>
+pub async fn skip_till_delimiter<T>(
+    parser: &mut gix_packetline::StreamingPeekableIter<T>,
+) -> anyhow::Result<()>
 where
     T: futures_lite::AsyncRead + Unpin,
 {
