@@ -1,3 +1,5 @@
+use core::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use gix::ObjectId;
@@ -5,18 +7,19 @@ use gix_packetline::{
     encode::{flush_to_write, text_to_write, delim_to_write},
     PacketLineRef,
 };
+use log::info;
 
 #[derive(Debug)]
 pub struct FetchArgs {
     /// Indicates to the server an object which the client wants to
     /// retrieve.  Wants can be anything and are not limited to
     /// advertised objects.
-    want: Vec<Box<[u8]>>,
+    want: Vec<ObjectId>,
     /// Indicates to the server an object which the client has locally.
     /// This allows the server to make a packfile which only contains
     /// the objects that the client needs. Multiple 'have' lines can be
     /// supplied.
-    have: Vec<Box<[u8]>>,
+    have: Vec<ObjectId>,
     /// Indicates to the server that negotiation should terminate (or
     /// not even begin if performing a clone) and that the server should
     /// use the information supplied in the request to construct the
@@ -53,11 +56,6 @@ where
     // "agent=git/2.40.1"
     // None (delimiter)
     skip_till_delimiter(parser).await?; // TODO: Is this info we're skipping ever useful?
-                                        // "peel"
-                                        // "symrefs"
-                                        // "ref-prefix HEAD"
-                                        // "ref-prefix refs/heads/"
-                                        // "ref-prefix refs/tags/"
     let mut args = FetchArgs {
         want: Vec::new(),
         have: Vec::new(),
@@ -78,10 +76,10 @@ where
             PacketLineRef::Data(d) => {
                 let arg = d.strip_suffix(b"\n").unwrap_or(d);
                 match arg.strip_prefix(b"want ") {
-                    Some(oid) => args.want.push(oid.into()),
+                    Some(oid) => args.want.push(ObjectId::from_hex(oid)?),
                     None => {
                         match arg.strip_prefix(b"have ") {
-                            Some(oid) => args.have.push(oid.into()),
+                            Some(oid) => args.have.push(ObjectId::from_hex(oid)?),
                             None => {
                                 match arg {
                                     b"done" => args.done = true,
@@ -102,12 +100,17 @@ where
 }
 
 pub async fn perform_fetch(
-    repo: &gix::ThreadSafeRepository,
+    mut handle: gix::odb::Cache<gix::odb::store::Handle<Arc<gix::odb::Store>>>,
     args: &FetchArgs,
     mut writer: piper::Writer,
 ) -> anyhow::Result<()> {
     let ready = false;
     let acks: Vec<ObjectId> = Vec::new();
+
+    // output = acknowledgements flush-pkt |
+    //   [acknowledgments delim-pkt] [shallow-info delim-pkt]
+    //   [wanted-refs delim-pkt] [packfile-uris delim-pkt]
+    //   packfile flush-pkt
 
     if !args.done {
         // TODO: Calculate acks and readiness
@@ -126,7 +129,46 @@ pub async fn perform_fetch(
         }
         text_to_write(b"ready", &mut writer).await?;
         delim_to_write(&mut writer).await?;
+    } else {
+        // TODO: Start building packfile
+        // See gitoxide-core/pack/create
+        // Uses
+        // gix_pack::data::output::count::objects
+        // gix_pack::data::output::entry::iter_from_counts
+
+        let options =  gix_pack::data::output::count::objects::Options {
+            thread_limit: None,
+            chunk_size: 16,
+            // TODO: How do we give state to this expansion mode?
+            input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
+        };
+
+        // TODO: Allow for interuption on disconnect
+        let should_interrupt = AtomicBool::new(false);
+
+        let progress = gix_features::progress::Discard {};
+
+        // let repo = gix::open(".")?.into_sync();
+        // let mut handle = repo.clone().objects.into_shared_arc().to_cache_arc();
+
+        handle.prevent_pack_unload();
+        handle.ignore_replacements = true;
+
+        let count = gix_pack::data::output::count::objects(
+            handle,
+            Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
+            &progress,
+            &should_interrupt,
+            options,
+        )?;
+
+        info!("COUNTED: {:#?}", count);
     }
+
+    // TODO: Support shallow clones
+    // TODO: Support ref-in-want
+    // TODO: Support packfile-uris (probably only useful for other backends)
+    // TODO: Support wait-for-done
 
 
 

@@ -11,9 +11,11 @@ trillium-smol = "0.3"
 log = "*"
 simple_logger = "*"
 form_urlencoded = "*"
-gix = "*"
+gix = {version="*", features=["parallel"]}
 gix-packetline = {version="*", features=["async-io"]}
 gix-ref = "*"
+gix-pack = "*"
+gix-features = {version="*", features=["parallel"]}
 futures-lite = "*"
 smol = "*"
 piper = "*"
