@@ -2104,6 +2104,7 @@ name = "server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "faster-hex 0.8.1",
  "form_urlencoded",
  "futures-lite 2.0.1",
  "gix",

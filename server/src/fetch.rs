@@ -2,6 +2,7 @@ use core::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
+use futures_lite::AsyncWriteExt;
 use gix::ObjectId;
 use gix_packetline::{
     encode::{flush_to_write, text_to_write, delim_to_write},
@@ -155,14 +156,49 @@ pub async fn perform_fetch(
         handle.ignore_replacements = true;
 
         let count = gix_pack::data::output::count::objects(
-            handle,
+            handle.clone(),
             Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
             &progress,
             &should_interrupt,
             options,
         )?;
 
-        info!("COUNTED: {:#?}", count);
+        let entries = gix_pack::data::output::entry::iter_from_counts(count.0, handle, Box::new(progress), gix_pack::data::output::entry::iter_from_counts::Options {
+                thread_limit: None, // Use all cores
+                mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+                allow_thin_pack: false, // args.thin_pack (IDK if the current thin algo will work here),
+                chunk_size: 16,
+                version: Default::default(),
+            },
+        );
+
+        text_to_write(b"packfile", &mut writer).await?;
+
+        for i in entries {
+            match i {
+                Ok((seq_id, entries)) => {
+                    for entry in entries {
+                        // Can't see an efficient way to give a 0x01 prefix with gitoxide's public api
+
+                        let data_len = entry.compressed_data.len() + 1 + 4;
+                        let buf = crate::utils::u16_to_hex(data_len as u16);
+
+                        writer.write_all(&buf).await?;
+                        writer.write_all(b"\x01").await?;
+                        writer.write_all(&entry.compressed_data).await?;
+
+                        // prefixed_data_to_write(b"\x01", &entry.compressed_data, &mut writer).await?;
+                        // data_to_write(&entry.compressed_data, &mut writer).await?;
+                    }
+                },
+                // TODO: Handle errors
+                Err(_) => todo!(),
+            }
+        }
+
+        flush_to_write(&mut writer).await?;
+
+        // info!("COUNTED: {:#?}", count);
     }
 
     // TODO: Support shallow clones
