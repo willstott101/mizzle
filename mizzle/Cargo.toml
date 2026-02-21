@@ -1,5 +1,5 @@
 [package]
-name = "server"
+name = "mizzle"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,11 +11,11 @@ trillium-smol = "0.3"
 log = "*"
 simple_logger = "*"
 form_urlencoded = "*"
-gix = {version="*", features=["parallel"]}
-gix-packetline = {version="*", features=["async-io"]}
+gix = { version = "*", features = ["parallel"] }
+gix-packetline = { version = "*", features = ["async-io"] }
 gix-ref = "*"
 gix-pack = "*"
-gix-features = {version="*", features=["parallel"]}
+gix-features = { version = "*", features = ["parallel"] }
 futures-lite = "*"
 smol = "*"
 piper = "*"

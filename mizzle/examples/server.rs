@@ -1,22 +1,13 @@
-mod fetch;
-mod ls_refs;
-mod serve;
-mod utils;
+use mizzle::{serve, traits::GitServerCallbacks};
 
 use simple_logger::SimpleLogger;
 use trillium_smol;
-
-pub trait GitServerCallbacks {
-    fn auth(&self, repo_path: &str) -> Box<str>;
-}
 
 #[derive(Clone)]
 struct Config {}
 
 impl GitServerCallbacks for Config {
     fn auth(&self, repo_path: &str) -> Box<str> {
-        // TODO: check if user has access to this repo
-
         let repo_root = ".";
 
         format!("{}/{}", repo_root, repo_path).into()
