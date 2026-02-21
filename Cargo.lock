@@ -1701,6 +1701,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "mizzle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "faster-hex 0.8.1",
+ "form_urlencoded",
+ "futures-lite 1.13.0",
+ "gix",
+ "gix-features",
+ "gix-pack",
+ "gix-packetline",
+ "gix-ref",
+ "log",
+ "piper",
+ "simple_logger",
+ "smol",
+ "trillium",
+ "trillium-smol",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2103,27 +2124,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "faster-hex 0.8.1",
- "form_urlencoded",
- "futures-lite 2.0.1",
- "gix",
- "gix-features",
- "gix-pack",
- "gix-packetline",
- "gix-ref",
- "log",
- "piper",
- "simple_logger",
- "smol",
- "trillium",
- "trillium-smol",
 ]
 
 [[package]]

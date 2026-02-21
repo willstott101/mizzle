@@ -1,3 +1,4 @@
+use crate::{fetch, ls_refs};
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
 use gix_packetline::encode::{flush_to_write, text_to_write};
@@ -5,7 +6,6 @@ use gix_packetline::{PacketLineRef, StreamingPeekableIter};
 use log::info;
 use trillium::{conn_try, Conn};
 use trillium_smol;
-use crate::{fetch, ls_refs};
 
 pub async fn serve_git_protocol_2(
     mut conn: trillium::Conn,
@@ -91,7 +91,7 @@ pub async fn serve_git_protocol_2(
                     // println!("{}", conn.request_body_string().await.unwrap());
                     let args = conn_try!(ls_refs::read_lsrefs_args(&mut parser).await, conn);
                     // info!("LIST REFS ARGS: {:?}", args);
-                    let repo = conn_try!(gix::open("."), conn).into_sync();
+                    let repo = conn_try!(gix::open(repo_path.as_ref()), conn).into_sync();
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
                         ls_refs::perform_listrefs(&repo, &args, writer)
@@ -109,11 +109,11 @@ pub async fn serve_git_protocol_2(
                     info!("FETCH: {:?}", args);
                     // let repo = conn_try!(gix::open("."), conn).into_sync();
                     // let mut handle = repo.clone().objects.into_shared_arc().to_cache_arc();
-                    let repo = conn_try!(gix::open("."), conn);
+                    let repo = conn_try!(gix::open(repo_path.as_ref()), conn);
                     // let handle = repo.objects;
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
-                        // TODO: What exactly should we pass in here to  
+                        // TODO: What exactly should we pass in here to
                         fetch::perform_fetch(repo.objects, &args, writer)
                             .await
                             .unwrap();
