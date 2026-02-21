@@ -21,3 +21,6 @@ smol = "*"
 piper = "*"
 anyhow = "*"
 faster-hex = "*"
+
+[dev-dependencies]
+tempfile = "3.25.0"
