@@ -1,8 +1,9 @@
 mod common;
 use anyhow::Result;
+use trillium::State;
 use std::thread;
 use std::path::PathBuf;
-use mizzle::{serve, traits::GitServerCallbacks};
+use mizzle::{servers::trillium::trillium_handler, traits::GitServerCallbacks};
 
 
 #[derive(Clone)]
@@ -30,37 +31,10 @@ fn test_ls_remote() -> Result<()> {
 
     thread::spawn(|| {
 	    // port 8080
-	    server.run(move |conn: trillium::Conn| {
-	        let config = config.clone();
-	        async move {
-	            if conn
-	                .headers()
-	                .get_str("Git-Protocol")
-	                .unwrap_or("version=2")
-	                != "version=2"
-	            {
-	                println!("Only Git Protocol 2 is supported");
-	                return conn
-	                    .with_status(trillium::Status::NotImplemented)
-	                    .with_body("Only Git Protocol 2 is supported")
-	                    .halt();
-	            }
-
-	            let result = conn.path().rsplit_once(".git/");
-	            match result {
-	                Some((git_repo_path, service_path)) => {
-	                    let repo_path_owned: Box<str> = git_repo_path.into();
-	                    let protocol_path_owned: Box<str> = service_path.into();
-	                    let full_repo_path = config.auth(repo_path_owned.as_ref());
-	                    serve::serve_git_protocol_2(conn, full_repo_path, protocol_path_owned).await
-	                }
-	                None => conn
-	                    .with_status(trillium::Status::BadRequest)
-	                    .with_body("Path doesn't look like a git URL")
-	                    .halt(),
-	            }
-	        }
-	    });
+		server.run((
+			State::new(config),
+			trillium_handler::<Config>,
+		));
     });
 
 	let git_output_from_path = common::run_git(&temprepo.path(), ["ls-remote", temprepo.path().to_str().unwrap()])?;
