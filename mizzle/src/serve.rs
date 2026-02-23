@@ -1,8 +1,10 @@
 use crate::{fetch, ls_refs};
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
-use gix_packetline::encode::{flush_to_write, text_to_write};
-use gix_packetline::{PacketLineRef, StreamingPeekableIter};
+use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
+use gix_packetline::async_io::StreamingPeekableIter;
+// use gix_packetline::encode::{flush_to_write, text_to_write};
+use gix_packetline::PacketLineRef;
 use log::info;
 use trillium::{conn_try, Conn};
 use trillium_smol;
@@ -84,7 +86,7 @@ pub async fn serve_git_protocol_2(
                 .halt();
         } else {
             // println!("{}", conn.request_body_string().await.unwrap());
-            let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[]);
+            let mut parser = StreamingPeekableIter::new(conn.request_body().await, &[], false);
             let command = conn_try!(read_command(&mut parser).await, conn);
             match command {
                 Command::ListRefs => {

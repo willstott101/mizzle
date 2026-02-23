@@ -1,14 +1,14 @@
-use core::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
+use core::sync::atomic::AtomicBool;
 use futures_lite::AsyncWriteExt;
 use gix::ObjectId;
 use gix_packetline::{
-    encode::{flush_to_write, text_to_write, delim_to_write},
+    async_io::encode::{delim_to_write, flush_to_write, text_to_write},
     PacketLineRef,
 };
 use log::info;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct FetchArgs {
@@ -48,7 +48,7 @@ pub struct FetchArgs {
 }
 
 pub async fn read_fetch_args<T>(
-    parser: &mut gix_packetline::StreamingPeekableIter<T>,
+    parser: &mut gix_packetline::async_io::StreamingPeekableIter<T>,
 ) -> anyhow::Result<FetchArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
@@ -101,7 +101,7 @@ where
 }
 
 pub async fn perform_fetch(
-    mut handle: gix::odb::Cache<gix::odb::store::Handle<Arc<gix::odb::Store>>>,
+    mut handle: gix::OdbHandle,
     args: &FetchArgs,
     mut writer: piper::Writer,
 ) -> anyhow::Result<()> {
@@ -126,7 +126,7 @@ pub async fn perform_fetch(
                 }
             }
             flush_to_write(&mut writer).await?;
-            return Ok(())
+            return Ok(());
         }
         text_to_write(b"ready", &mut writer).await?;
         delim_to_write(&mut writer).await?;
@@ -156,14 +156,18 @@ pub async fn perform_fetch(
         handle.ignore_replacements = true;
 
         let count = gix_pack::data::output::count::objects(
-            handle.clone(),
+            handle.clone().into_inner(),
             Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
             &progress,
             &should_interrupt,
             options,
         )?;
 
-        let entries = gix_pack::data::output::entry::iter_from_counts(count.0, handle, Box::new(progress), gix_pack::data::output::entry::iter_from_counts::Options {
+        let entries = gix_pack::data::output::entry::iter_from_counts(
+            count.0,
+            handle.into_inner(),
+            Box::new(progress),
+            gix_pack::data::output::entry::iter_from_counts::Options {
                 thread_limit: None, // Use all cores
                 mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
                 allow_thin_pack: false, // args.thin_pack (IDK if the current thin algo will work here),
@@ -190,7 +194,7 @@ pub async fn perform_fetch(
                         // prefixed_data_to_write(b"\x01", &entry.compressed_data, &mut writer).await?;
                         // data_to_write(&entry.compressed_data, &mut writer).await?;
                     }
-                },
+                }
                 // TODO: Handle errors
                 Err(_) => todo!(),
             }
@@ -205,8 +209,6 @@ pub async fn perform_fetch(
     // TODO: Support ref-in-want
     // TODO: Support packfile-uris (probably only useful for other backends)
     // TODO: Support wait-for-done
-
-
 
     Ok(())
 }

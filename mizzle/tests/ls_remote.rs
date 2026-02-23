@@ -1,14 +1,13 @@
 mod common;
 use anyhow::Result;
-use trillium::State;
-use std::thread;
-use std::path::PathBuf;
 use mizzle::{servers::trillium::trillium_handler, traits::GitServerCallbacks};
-
+use std::path::PathBuf;
+use std::thread;
+use trillium::State;
 
 #[derive(Clone)]
 struct Config {
-	bare_repo_path: PathBuf,
+    bare_repo_path: PathBuf,
 }
 
 impl GitServerCallbacks for Config {
@@ -19,33 +18,35 @@ impl GitServerCallbacks for Config {
 
 #[test]
 fn test_ls_remote() -> Result<()> {
-	let temprepo = common::temprepo()?;
+    let temprepo = common::temprepo()?;
 
     let config = Config {
-    	bare_repo_path: temprepo.path(),
+        bare_repo_path: temprepo.path(),
     };
 
     let stopper = trillium_smol::Stopper::new();
-    let server = trillium_smol::config()
-	    	.with_stopper(stopper.clone());
+    let server = trillium_smol::config().with_stopper(stopper.clone());
 
     thread::spawn(|| {
-	    // port 8080
-		server.run((
-			State::new(config),
-			trillium_handler::<Config>,
-		));
+        // port 8080
+        server.run((State::new(config), trillium_handler::<Config>));
     });
 
-	let git_output_from_path = common::run_git(&temprepo.path(), ["ls-remote", temprepo.path().to_str().unwrap()])?;
-	let git_output_from_server = common::run_git(&temprepo.path(), ["ls-remote", "http://localhost:8080/test.git"])?;
-	println!("{}", git_output_from_path);
-	println!(".....");
-	println!("{}", git_output_from_server);
+    let git_output_from_path = common::run_git(
+        &temprepo.path(),
+        ["ls-remote", temprepo.path().to_str().unwrap()],
+    )?;
+    let git_output_from_server = common::run_git(
+        &temprepo.path(),
+        ["ls-remote", "http://localhost:8080/test.git"],
+    )?;
+    println!("{}", git_output_from_path);
+    println!(".....");
+    println!("{}", git_output_from_server);
 
-	assert_eq!(git_output_from_path, git_output_from_server);
+    assert_eq!(git_output_from_path, git_output_from_server);
 
-	stopper.stop();
+    stopper.stop();
 
-	Ok(())
+    Ok(())
 }

@@ -1,31 +1,28 @@
-use std::path::{PathBuf, Path};
-use std::fs;
+use anyhow::{anyhow, bail, Result};
 use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use anyhow::{bail, anyhow, Result};
 
 use tempfile::{tempdir, TempDir};
 
 pub struct TempRepo {
-	dir: TempDir,
+    dir: TempDir,
 }
 
 impl TempRepo {
-	pub fn path(&self) -> PathBuf {
-		self.dir.path().join("temprepo.git")
-	}
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().join("temprepo.git")
+    }
 }
 
-
 pub fn temprepo() -> Result<TempRepo> {
-	let dir = tempdir()?;
-	let repo = TempRepo {
-		dir,
-	};
+    let dir = tempdir()?;
+    let repo = TempRepo { dir };
 
-	create_bare_repo_with_refs(&repo.path())?;
+    create_bare_repo_with_refs(&repo.path())?;
 
-	Ok(repo)
+    Ok(repo)
 }
 
 const AUTHOR_NAME: &str = "Test Author";
@@ -123,7 +120,10 @@ fn create_bare_repo_with_refs(bare_dir: &Path) -> Result<()> {
     run_git(bare_dir, ["init", "--bare"])?;
 
     // 3) Add bare as a remote and push everything
-    run_git(&work_dir, ["remote", "add", "origin", bare_dir.to_str().unwrap()])?;
+    run_git(
+        &work_dir,
+        ["remote", "add", "origin", bare_dir.to_str().unwrap()],
+    )?;
 
     // Push branches + tags + "normal" refs
     // --mirror pushes refs under refs/* (including custom ones) and deletes remote refs not present locally.
@@ -138,7 +138,6 @@ fn create_bare_repo_with_refs(bare_dir: &Path) -> Result<()> {
 
     Ok(())
 }
-
 
 pub fn run_git<I, S>(cwd: &Path, args: I) -> Result<String>
 where
@@ -164,7 +163,9 @@ where
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!(
             "git failed (status {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            output.status, stdout, stderr
+            output.status,
+            stdout,
+            stderr
         );
     }
 

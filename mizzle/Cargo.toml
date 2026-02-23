@@ -7,20 +7,20 @@ edition = "2021"
 
 [dependencies]
 trillium = "0.2"
-trillium-smol = "0.3"
-log = "*"
-simple_logger = "*"
-form_urlencoded = "*"
-gix = { version = "*", features = ["parallel"] }
-gix-packetline = { version = "*", features = ["async-io"] }
-gix-ref = "*"
-gix-pack = "*"
-gix-features = { version = "*", features = ["parallel"] }
-futures-lite = "*"
-smol = "*"
-piper = "*"
-anyhow = "*"
-faster-hex = "*"
+trillium-smol = "0.4"
+log = "0.4"
+simple_logger = "5.2"
+form_urlencoded = "1.2"
+gix = { version = "0.80", features = ["parallel"] }
+gix-packetline = { version = "0.21", features = ["async-io"] }
+gix-ref = "0.60"
+gix-pack = "0.67"
+gix-features = { version = "0.46", features = ["parallel"] }
+futures-lite = "2.6"
+smol = "2.0"
+piper = "0.2"
+anyhow = "1.0"
+faster-hex = "0.10"
 
 [dev-dependencies]
 tempfile = "3.25.0"

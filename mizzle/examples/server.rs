@@ -1,7 +1,7 @@
 use mizzle::{servers::trillium::trillium_handler, traits::GitServerCallbacks};
 
 use simple_logger::SimpleLogger;
-use trillium::{State};
+use trillium::State;
 use trillium_smol;
 
 #[derive(Clone)]
@@ -24,8 +24,5 @@ fn main() {
     let config = Config {};
 
     // port 8080
-    trillium_smol::run((
-        State::new(config),
-        trillium_handler::<Config>,
-    ));
+    trillium_smol::run((State::new(config), trillium_handler::<Config>));
 }

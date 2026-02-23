@@ -2,7 +2,9 @@ use trillium::Conn;
 
 use crate::{serve::serve_git_protocol_2, traits::GitServerCallbacks};
 
-pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(conn: trillium::Conn) -> Conn {
+pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(
+    conn: trillium::Conn,
+) -> Conn {
     let config = conn.state::<T>().unwrap();
     if conn
         .headers()

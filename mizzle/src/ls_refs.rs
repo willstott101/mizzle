@@ -1,7 +1,7 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use gix_packetline::{
-    encode::{flush_to_write, text_to_write},
+    async_io::encode::{flush_to_write, text_to_write},
     PacketLineRef,
 };
 use gix_ref::file::ReferenceExt;
@@ -27,7 +27,7 @@ pub struct ListRefsArgs {
 }
 
 pub async fn read_lsrefs_args<T>(
-    parser: &mut gix_packetline::StreamingPeekableIter<T>,
+    parser: &mut gix_packetline::async_io::StreamingPeekableIter<T>,
 ) -> anyhow::Result<ListRefsArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
@@ -80,7 +80,7 @@ fn get_head_info(
 ) -> anyhow::Result<Option<String>> {
     Ok(match repo.to_thread_local().head_ref()? {
         Some(mut head_ref) => {
-            head_ref.peel_to_id_in_place()?;
+            head_ref.peel_to_id()?;
             match head_ref.inner.peeled {
                 None => None,
                 Some(oid) => {
@@ -139,11 +139,10 @@ pub async fn perform_listrefs(
 
         match r.target {
             // This reference is to an annotated tag or a commit.
-            gix_ref::Target::Peeled(oid) => {
+            gix_ref::Target::Object(oid) => {
                 if args.peel {
                     // We check if this is an annotated tag by peeling it
-                    let peeled =
-                        to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                    let peeled = to_peel.peel_to_id(&repo.refs, &repo.objects.to_handle())?;
                     // The peeled result changes so this must have been an annotated tag
                     if peeled != oid {
                         // Output the anotated tag's oid & name but also the underlying commit's oid
@@ -165,7 +164,7 @@ pub async fn perform_listrefs(
             // This is a symbolic reference (such as HEAD)
             gix_ref::Target::Symbolic(symref_target) => {
                 // We always need to find the underlying commit oid of the symbolic reference so we do that first.
-                let peeled = to_peel.peel_to_id_in_place(&repo.refs, &repo.objects.to_handle())?;
+                let peeled = to_peel.peel_to_id(&repo.refs, &repo.objects.to_handle())?;
                 // We only output the name of the intermediate reference if requested
                 if args.symrefs {
                     text_to_write(
