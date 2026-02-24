@@ -10,20 +10,18 @@ use piper::Reader;
 use trillium::{conn_try, Conn};
 use trillium_smol;
 
-
 pub struct GitResponse {
     pub content_type: String,
-    pub reader: Reader
+    pub reader: Reader,
 }
 
-
+#[cfg(feature = "axum")]
 pub async fn serve_git_protocol_2_2(repo_path: Box<str>, protocol_path: Box<str>) -> GitResponse {
     info!("GIT {} {}", repo_path, protocol_path);
 
     if protocol_path.as_ref() == "info/refs" {
-        
-        // let (reader, mut writer) = piper::pipe(4096);
-        let (mut writer, reader) = tokio::io::duplex(4096);
+        let (reader, mut writer) = piper::pipe(4096);
+        // let (mut writer, reader) = tokio::io::duplex(4096);
         tokio::spawn(async move {
             // Copied from github
             text_to_write(b"# service=git-upload-pack", &mut writer)
@@ -57,7 +55,10 @@ pub async fn serve_git_protocol_2_2(repo_path: Box<str>, protocol_path: Box<str>
                 .await
                 .expect("to write to output");
         });
-        GitResponse {content_type: "application/x-git-upload-pack-advertisement".to_string(), reader: reader}
+        GitResponse {
+            content_type: "application/x-git-upload-pack-advertisement".to_string(),
+            reader: reader,
+        }
     } else if protocol_path.as_ref() == "git-upload-pack" {
         todo!();
         // GitResponse {content_type: "application/x-git-upload-pack-advertisement".to_string()} // what content_type do we want here?
@@ -72,12 +73,8 @@ pub async fn serve_git_protocol_2(
     protocol_path: Box<str>,
 ) -> Conn {
     // The git protocol recommends making sure to prevent any caching
-    conn = conn.with_header(trillium::KnownHeaderName::CacheControl, "no-cache");
+    conn = conn.with_response_header(trillium::KnownHeaderName::CacheControl, "no-cache");
 
-    info!(
-        "REQUEST CONTENT TYPE {:?}",
-        conn.headers().get_str("Content-Type")
-    );
     info!(
         "HTTP {} {} {}",
         conn.method(),
@@ -90,7 +87,7 @@ pub async fn serve_git_protocol_2(
         // We also expect a query parameter of ?service=git-upload-pack but I don't see a reason to check for it.
 
         // Part of the V2 handshake
-        conn = conn.with_header(
+        conn = conn.with_response_header(
             trillium::KnownHeaderName::ContentType,
             "application/x-git-upload-pack-advertisement",
         );
@@ -133,7 +130,7 @@ pub async fn serve_git_protocol_2(
             .halt()
     } else if protocol_path.as_ref() == "git-upload-pack" {
         if conn
-            .headers()
+            .request_headers()
             .get_str(trillium::KnownHeaderName::ContentType)
             != Some("application/x-git-upload-pack-request")
         {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{routing::get, Router};
 
 use mizzle::servers::axum::axum_handler;
-use mizzle::traits::{GitServerCallbacks};
+use mizzle::traits::GitServerCallbacks;
 
 #[derive(Clone)]
 struct Config;

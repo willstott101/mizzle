@@ -7,8 +7,6 @@ use gix_packetline::{
     async_io::encode::{delim_to_write, flush_to_write, text_to_write},
     PacketLineRef,
 };
-use log::info;
-use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct FetchArgs {
@@ -180,7 +178,7 @@ pub async fn perform_fetch(
 
         for i in entries {
             match i {
-                Ok((seq_id, entries)) => {
+                Ok((_seq_id, entries)) => {
                     for entry in entries {
                         // Can't see an efficient way to give a 0x01 prefix with gitoxide's public api
 

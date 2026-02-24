@@ -1,18 +1,25 @@
 use axum::{
-    body::Body, extract::{Path, Request, State}, http::{HeaderMap, StatusCode, header}, response::{IntoResponse, Response}
+    body::Body,
+    extract::{Path, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
 };
 use std::sync::Arc;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 
-use crate::{serve::{GitResponse, serve_git_protocol_2_2}, traits::GitServerCallbacks};
+use crate::{
+    serve::{serve_git_protocol_2_2, GitResponse},
+    traits::GitServerCallbacks,
+};
 
 impl IntoResponse for GitResponse {
     fn into_response(self) -> Response {
-        let body = Body::from_stream(self.reader);
+        let body = Body::from_stream(tokio_util::io::ReaderStream::new(self.reader.compat()));
 
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_TYPE, self.content_type.parse().unwrap());
         headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
-    
+
         (headers, body).into_response()
     }
 }
@@ -28,7 +35,8 @@ pub async fn axum_handler<T: GitServerCallbacks>(
         return (
             StatusCode::NOT_IMPLEMENTED,
             format!("Only Git Protocol 2 is supported"),
-        ).into_response();
+        )
+            .into_response();
     }
 
     let result = path.rsplit_once(".git/");
@@ -46,6 +54,7 @@ pub async fn axum_handler<T: GitServerCallbacks>(
         None => (
             StatusCode::BAD_REQUEST,
             format!("Path doesn't look like a git URL"),
-        ).into_response(),
+        )
+            .into_response(),
     }
 }
