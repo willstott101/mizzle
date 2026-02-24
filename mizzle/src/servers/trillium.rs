@@ -7,7 +7,7 @@ pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(
 ) -> Conn {
     let config = conn.state::<T>().unwrap();
     if conn
-        .headers()
+        .request_headers()
         .get_str("Git-Protocol")
         .unwrap_or("version=2")
         != "version=2"

@@ -6,8 +6,65 @@ use gix_packetline::async_io::StreamingPeekableIter;
 // use gix_packetline::encode::{flush_to_write, text_to_write};
 use gix_packetline::PacketLineRef;
 use log::info;
+use piper::Reader;
 use trillium::{conn_try, Conn};
 use trillium_smol;
+
+
+pub struct GitResponse {
+    pub content_type: String,
+    pub reader: Reader
+}
+
+
+pub async fn serve_git_protocol_2_2(repo_path: Box<str>, protocol_path: Box<str>) -> GitResponse {
+    info!("GIT {} {}", repo_path, protocol_path);
+
+    if protocol_path.as_ref() == "info/refs" {
+        
+        // let (reader, mut writer) = piper::pipe(4096);
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            // Copied from github
+            text_to_write(b"# service=git-upload-pack", &mut writer)
+                .await
+                .expect("to write to output");
+            flush_to_write(&mut writer)
+                .await
+                .expect("to write to output");
+
+            // Understood in the spec
+            text_to_write(b"version 2", &mut writer)
+                .await
+                .expect("to write to output");
+            text_to_write(b"agent=mizzle/dev", &mut writer)
+                .await
+                .expect("to write to output");
+
+            text_to_write(b"ls-refs=unborn", &mut writer)
+                .await
+                .expect("to write to output");
+            text_to_write(b"fetch", &mut writer)
+                .await
+                .expect("to write to output");
+            // Copied from github - yet to be implemented/confirmed
+            // text_to_write(b"fetch=shallow wait-for-done filter", &mut writer).await.expect("to write to output");
+            // text_to_write(b"server-option", &mut writer).await.expect("to write to output");
+            // text_to_write(b"object-format=sha1", &mut writer).await.expect("to write to output");
+
+            // Understood in the spec
+            flush_to_write(&mut writer)
+                .await
+                .expect("to write to output");
+        });
+        GitResponse {content_type: "application/x-git-upload-pack-advertisement".to_string(), reader: reader}
+    } else if protocol_path.as_ref() == "git-upload-pack" {
+        todo!();
+        // GitResponse {content_type: "application/x-git-upload-pack-advertisement".to_string()} // what content_type do we want here?
+    } else {
+        todo!();
+    }
+}
 
 pub async fn serve_git_protocol_2(
     mut conn: trillium::Conn,
