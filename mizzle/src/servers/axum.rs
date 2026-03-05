@@ -4,8 +4,11 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use futures_util::TryStreamExt;
+use std::io;
 use std::sync::Arc;
-use tokio_util::compat::FuturesAsyncReadCompatExt;
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use tokio_util::io::StreamReader;
 
 use crate::{
     serve::{serve_git_protocol_2_2, GitResponse},
@@ -14,11 +17,16 @@ use crate::{
 
 impl IntoResponse for GitResponse {
     fn into_response(self) -> Response {
-        let body = Body::from_stream(tokio_util::io::ReaderStream::new(self.reader.compat()));
-
         let mut headers = HeaderMap::new();
-        headers.insert(header::CONTENT_TYPE, self.content_type.parse().unwrap());
         headers.insert(header::CACHE_CONTROL, "no-cache".parse().unwrap());
+        if let Some(content_type) = self.content_type {
+            headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+        }
+
+        let body = match self.reader {
+            Some(reader) => Body::from_stream(tokio_util::io::ReaderStream::new(reader.compat())),
+            None => Body::from(self.body.unwrap_or("".to_string())),
+        };
 
         (headers, body).into_response()
     }
@@ -38,6 +46,16 @@ pub async fn axum_handler<T: GitServerCallbacks>(
         )
             .into_response();
     }
+    let content_type_header = req.headers().get(header::CONTENT_TYPE).unwrap();
+    let content_type: Box<str> = content_type_header.to_str().unwrap().into();
+
+    let stream = req
+        .into_body()
+        .into_data_stream()
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
+    let reader = StreamReader::new(stream);
+
+    let reader = reader.compat();
 
     let result = path.rsplit_once(".git/");
     match result {
@@ -45,11 +63,10 @@ pub async fn axum_handler<T: GitServerCallbacks>(
             let repo_path_owned: Box<str> = git_repo_path.into();
             let protocol_path_owned: Box<str> = service_path.into();
             let full_repo_path = config.auth(repo_path_owned.as_ref());
-            let res = serve_git_protocol_2_2(full_repo_path, protocol_path_owned).await;
+            let res =
+                serve_git_protocol_2_2(full_repo_path, protocol_path_owned, content_type, reader)
+                    .await;
             res.into_response()
-            // let mut res = Response::new(format!("bob"));
-            // res.headers_mut().insert("Cache-Control", "no-cache".parse().unwrap());
-            // res
         }
         None => (
             StatusCode::BAD_REQUEST,

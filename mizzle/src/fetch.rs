@@ -1,11 +1,11 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
+use log::info;
 use core::sync::atomic::AtomicBool;
 use futures_lite::AsyncWriteExt;
 use gix::ObjectId;
 use gix_packetline::{
-    async_io::encode::{delim_to_write, flush_to_write, text_to_write},
-    PacketLineRef,
+    Channel, PacketLineRef, async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write}
 };
 
 #[derive(Debug)]
@@ -112,6 +112,7 @@ pub async fn perform_fetch(
     //   packfile flush-pkt
 
     if !args.done {
+        unimplemented!();
         // TODO: Calculate acks and readiness
 
         text_to_write(b"acknowledgments", &mut writer).await?;
@@ -181,14 +182,15 @@ pub async fn perform_fetch(
                 Ok((_seq_id, entries)) => {
                     for entry in entries {
                         // Can't see an efficient way to give a 0x01 prefix with gitoxide's public api
+                        println!("writing new entry");
 
-                        let data_len = entry.compressed_data.len() + 1 + 4;
-                        let buf = crate::utils::u16_to_hex(data_len as u16);
+                        // let data_len = entry.compressed_data.len() + 1 + 4;
+                        // let buf = crate::utils::u16_to_hex(data_len as u16);
 
-                        writer.write_all(&buf).await?;
-                        writer.write_all(b"\x01").await?;
-                        writer.write_all(&entry.compressed_data).await?;
-
+                        // writer.write_all(&buf).await?;
+                        // writer.write_all(b"\x01").await?;
+                        // writer.write_all(&entry.compressed_data).await?;
+                        band_to_write(Channel::Data, &entry.compressed_data, &mut writer).await?;
                         // prefixed_data_to_write(b"\x01", &entry.compressed_data, &mut writer).await?;
                         // data_to_write(&entry.compressed_data, &mut writer).await?;
                     }

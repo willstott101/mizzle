@@ -2,8 +2,10 @@ use std::sync::Arc;
 
 use axum::{routing::get, Router};
 
+use log::info;
 use mizzle::servers::axum::axum_handler;
 use mizzle::traits::GitServerCallbacks;
+use simple_logger::SimpleLogger;
 
 #[derive(Clone)]
 struct Config;
@@ -18,6 +20,11 @@ impl GitServerCallbacks for Config {
 
 #[tokio::main]
 async fn main() {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+
     let config = Arc::new(Config {});
 
     // build our application with a single route
@@ -27,5 +34,7 @@ async fn main() {
 
     // run our app with hyper, listening globally on port 3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    info!("Server running at http://{}", address);
     axum::serve(listener, app).await.unwrap();
 }

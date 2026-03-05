@@ -1,8 +1,16 @@
 use anyhow::{anyhow, bail, Result};
+use axum::routing::get;
+use axum::Router;
+use mizzle::servers::axum::axum_handler;
+use mizzle::servers::trillium::trillium_handler;
+use mizzle::traits::GitServerCallbacks;
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::{fs, thread};
+use tokio::sync::oneshot::Sender;
+use trillium::State;
 
 use tempfile::{tempdir, TempDir};
 
@@ -68,70 +76,70 @@ fn create_bare_repo_with_refs(bare_dir: &Path) -> Result<()> {
     fs::create_dir_all(&work_dir)?;
 
     // 1) Init working repo
-    run_git(&work_dir, ["init", "-b", "main"])?;
+    _run_git(&work_dir, ["init", "-b", "main"])?;
 
     // Set an identity so commits succeed even without global git config
-    run_git(&work_dir, ["config", "user.name", "Example Bot"])?;
-    run_git(&work_dir, ["config", "user.email", "bot@example.invalid"])?;
+    _run_git(&work_dir, ["config", "user.name", "Example Bot"])?;
+    _run_git(&work_dir, ["config", "user.email", "bot@example.invalid"])?;
 
     // Disable features that can introduce nondeterminism
-    run_git(&work_dir, ["config", "commit.gpgsign", "false"])?;
-    run_git(&work_dir, ["config", "core.autocrlf", "false"])?;
-    run_git(&work_dir, ["config", "core.filemode", "false"])?;
+    _run_git(&work_dir, ["config", "commit.gpgsign", "false"])?;
+    _run_git(&work_dir, ["config", "core.autocrlf", "false"])?;
+    _run_git(&work_dir, ["config", "core.filemode", "false"])?;
 
     // Create initial commit
     fs::write(work_dir.join("README.md"), "# Demo repo\n")?;
-    run_git(&work_dir, ["add", "."])?;
-    run_git(&work_dir, ["commit", "-m", "Initial commit"])?;
+    _run_git(&work_dir, ["add", "."])?;
+    _run_git(&work_dir, ["commit", "-m", "Initial commit"])?;
 
     // Second commit on main
     fs::write(work_dir.join("hello.txt"), "hello\n")?;
-    run_git(&work_dir, ["add", "."])?;
-    run_git(&work_dir, ["commit", "-m", "Add hello.txt"])?;
+    _run_git(&work_dir, ["add", "."])?;
+    _run_git(&work_dir, ["commit", "-m", "Add hello.txt"])?;
 
     // Create a dev branch with an extra commit
-    run_git(&work_dir, ["checkout", "-b", "dev"])?;
+    _run_git(&work_dir, ["checkout", "-b", "dev"])?;
     fs::write(work_dir.join("dev.txt"), "dev branch work\n")?;
-    run_git(&work_dir, ["add", "."])?;
-    run_git(&work_dir, ["commit", "-m", "Dev commit"])?;
+    _run_git(&work_dir, ["add", "."])?;
+    _run_git(&work_dir, ["commit", "-m", "Dev commit"])?;
 
     // Back to main
-    run_git(&work_dir, ["checkout", "main"])?;
+    _run_git(&work_dir, ["checkout", "main"])?;
 
     // Create a tag on main (lightweight)
-    run_git(&work_dir, ["tag", "v1.0.0"])?;
+    _run_git(&work_dir, ["tag", "v1.0.0"])?;
 
     // Create a custom ref pointing at the current HEAD (main)
-    let head_oid = run_git(&work_dir, ["rev-parse", "HEAD"])?;
-    run_git(
+    let head_oid = _run_git(&work_dir, ["rev-parse", "HEAD"])?;
+    _run_git(
         &work_dir,
         ["update-ref", "refs/custom/demo", head_oid.as_str()],
     )?;
 
     // Create another custom ref pointing at dev tip
-    let dev_oid = run_git(&work_dir, ["rev-parse", "dev"])?;
-    run_git(
+    let dev_oid = _run_git(&work_dir, ["rev-parse", "dev"])?;
+    _run_git(
         &work_dir,
         ["update-ref", "refs/custom/dev-tip", dev_oid.as_str()],
     )?;
 
     // 2) Init bare repo
     fs::create_dir_all(bare_dir)?;
-    run_git(bare_dir, ["init", "--bare"])?;
+    _run_git(bare_dir, ["init", "--bare"])?;
 
     // 3) Add bare as a remote and push everything
-    run_git(
+    _run_git(
         &work_dir,
         ["remote", "add", "origin", bare_dir.to_str().unwrap()],
     )?;
 
     // Push branches + tags + "normal" refs
     // --mirror pushes refs under refs/* (including custom ones) and deletes remote refs not present locally.
-    run_git(&work_dir, ["push", "--mirror", "origin"])?;
+    _run_git(&work_dir, ["push", "--mirror", "origin"])?;
 
     // Create a symbolic ref in the bare repo so HEAD points to main.
     // (Some tooling expects HEAD to reference the default branch.)
-    run_git(bare_dir, ["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    _run_git(bare_dir, ["symbolic-ref", "HEAD", "refs/heads/main"])?;
 
     // Cleanup working dir
     fs::remove_dir_all(&work_dir)?;
@@ -155,6 +163,10 @@ where
         .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
         .env("GIT_COMMITTER_DATE", FIXED_TIME)
         .env("TZ", "UTC")
+        .env("GIT_TRACE_PACKET", "1")
+        .env("GIT_TRACE", "2")
+        .env("GIT_CURL_VERBOSE", "1")
+
         .stdin(Stdio::null())
         .output()?;
 
@@ -170,4 +182,84 @@ where
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn _run_git<I, S>(cwd: &Path, args: I) -> Result<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        // Specified for determinism
+        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
+        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
+        .env("GIT_AUTHOR_DATE", FIXED_TIME)
+        .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
+        .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
+        .env("GIT_COMMITTER_DATE", FIXED_TIME)
+        .env("TZ", "UTC")
+
+        .stdin(Stdio::null())
+        .output()?;
+
+    if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git failed (status {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
+            output.status,
+            stdout,
+            stderr
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Clone)]
+pub struct Config {
+    pub bare_repo_path: PathBuf,
+}
+
+impl GitServerCallbacks for Config {
+    fn auth(&self, _repo_path: &str) -> Box<str> {
+        self.bare_repo_path.to_str().unwrap().into()
+    }
+}
+
+pub fn trillium_server(config: Config) -> trillium_smol::Stopper {
+    let stopper = trillium_smol::Stopper::new();
+    let server = trillium_smol::config().with_stopper(stopper.clone());
+
+    thread::spawn(|| {
+        // port 8080
+        server.run((State::new(config), trillium_handler::<Config>));
+    });
+
+    stopper
+}
+
+pub fn axum_server(config: Config) -> Sender<()> {
+    let config = Arc::new(config);
+
+    // build our application with a single route
+    let app = Router::new()
+        .route("/", get(axum_handler))
+        .with_state(config);
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    thread::spawn(async || {
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+
+    tx
 }
