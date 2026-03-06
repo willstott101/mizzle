@@ -1,12 +1,12 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
-use log::info;
 use core::sync::atomic::AtomicBool;
-use futures_lite::AsyncWriteExt;
-use gix::ObjectId;
+use gix::{parallel::InOrderIter, ObjectId};
 use gix_packetline::{
-    Channel, PacketLineRef, async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write}
+    async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
+    Channel, PacketLineRef,
 };
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct FetchArgs {
@@ -136,34 +136,50 @@ pub async fn perform_fetch(
         // gix_pack::data::output::count::objects
         // gix_pack::data::output::entry::iter_from_counts
 
-        let options =  gix_pack::data::output::count::objects::Options {
-            thread_limit: None,
-            chunk_size: 16,
-            // TODO: How do we give state to this expansion mode?
-            input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
-        };
-
         // TODO: Allow for interuption on disconnect
         let should_interrupt = AtomicBool::new(false);
 
         let progress = gix_features::progress::Discard {};
 
-        // let repo = gix::open(".")?.into_sync();
-        // let mut handle = repo.clone().objects.into_shared_arc().to_cache_arc();
-
         handle.prevent_pack_unload();
         handle.ignore_replacements = true;
 
-        let count = gix_pack::data::output::count::objects(
+        // To get all the objectIds required for a clone, we need to use ::objects twice with the two different modes.
+        // TODO: why? 
+        let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
             Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
             &progress,
             &should_interrupt,
-            options,
+            gix_pack::data::output::count::objects::Options {
+                thread_limit: None,
+                chunk_size: 16,
+                // TODO: How do we give state to this expansion mode?
+                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
+            },
         )?;
+        let mut counts_set: HashSet<_> = counts.into_iter().collect();
 
-        let entries = gix_pack::data::output::entry::iter_from_counts(
-            count.0,
+        let (counts, _) = gix_pack::data::output::count::objects(
+            handle.clone().into_inner(),
+            Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
+            &progress,
+            &should_interrupt,
+            gix_pack::data::output::count::objects::Options {
+                thread_limit: None,
+                chunk_size: 16,
+                // TODO: How do we give state to this expansion mode?
+                input_object_expansion:
+                    gix_pack::data::output::count::objects::ObjectExpansion::TreeContents,
+            },
+        )?;
+        counts_set.extend(counts);
+        let counts: Vec<_> = counts_set.into_iter().collect();
+
+        let num_objects = counts.len();
+
+        let mut in_order_entries = InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
+            counts,
             handle.into_inner(),
             Box::new(progress),
             gix_pack::data::output::entry::iter_from_counts::Options {
@@ -173,36 +189,27 @@ pub async fn perform_fetch(
                 chunk_size: 16,
                 version: Default::default(),
             },
+        ));
+
+        let mut buf: Vec<u8> = vec![];
+
+        let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
+            in_order_entries.by_ref(),
+            &mut buf,
+            num_objects as u32,
+            Default::default(),
+            gix_hash::Kind::default(),
         );
+
+        pack_iter.try_for_each(|_| Ok::<_, anyhow::Error>(()))?;
 
         text_to_write(b"packfile", &mut writer).await?;
 
-        for i in entries {
-            match i {
-                Ok((_seq_id, entries)) => {
-                    for entry in entries {
-                        // Can't see an efficient way to give a 0x01 prefix with gitoxide's public api
-                        println!("writing new entry");
-
-                        // let data_len = entry.compressed_data.len() + 1 + 4;
-                        // let buf = crate::utils::u16_to_hex(data_len as u16);
-
-                        // writer.write_all(&buf).await?;
-                        // writer.write_all(b"\x01").await?;
-                        // writer.write_all(&entry.compressed_data).await?;
-                        band_to_write(Channel::Data, &entry.compressed_data, &mut writer).await?;
-                        // prefixed_data_to_write(b"\x01", &entry.compressed_data, &mut writer).await?;
-                        // data_to_write(&entry.compressed_data, &mut writer).await?;
-                    }
-                }
-                // TODO: Handle errors
-                Err(_) => todo!(),
-            }
+        for chunk in buf.chunks(65516 - 16) {
+            band_to_write(Channel::Data, chunk, &mut writer).await?;
         }
 
         flush_to_write(&mut writer).await?;
-
-        // info!("COUNTED: {:#?}", count);
     }
 
     // TODO: Support shallow clones

@@ -200,15 +200,13 @@ pub async fn serve_git_protocol_2(
                     let args = conn_try!(fetch::read_fetch_args(&mut parser).await, conn);
                     info!("FETCH: {:?}", args);
                     // let repo = conn_try!(gix::open("."), conn).into_sync();
-                    // let mut handle = repo.clone().objects.into_shared_arc().to_cache_arc();
                     let repo = conn_try!(gix::open(repo_path.as_ref()), conn);
+                    let handle = repo.objects.into_arc().unwrap();
                     // let handle = repo.objects;
                     let (reader, writer) = piper::pipe(4096);
                     trillium_smol::spawn((|| async move {
                         // TODO: What exactly should we pass in here to
-                        fetch::perform_fetch(repo.objects, &args, writer)
-                            .await
-                            .unwrap();
+                        fetch::perform_fetch(handle, &args, writer).await.unwrap();
                     })());
                     return conn
                         .with_status(trillium::Status::Ok)
