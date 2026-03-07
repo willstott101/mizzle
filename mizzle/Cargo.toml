@@ -30,7 +30,6 @@ gix-hash = "0.22.1"
 [dev-dependencies]
 tempfile = "3.25.0"
 async-net = "2.0.0"
-trillium-testing = { version = "0.7.0", features = ["smol"] }
 
 [features]
 default = ["trillium_smol", "axum"]

@@ -244,9 +244,7 @@ pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
 
     let stopper = trillium_smol::Stopper::new();
 
-    let listener =
-        trillium_testing::block_on(async { async_net::TcpListener::bind("127.0.0.1:0").await })
-            .unwrap();
+    let listener = smol::block_on(async_net::TcpListener::bind("127.0.0.1:0")).unwrap();
     let port = listener.local_addr().unwrap().port();
 
     let server = trillium_smol::config()
@@ -273,7 +271,7 @@ pub fn axum_server(config: Config) -> (u16, Sender<()>) {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
     let listener = rt
-        .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
         .unwrap();
     let port = listener.local_addr().unwrap().port();
 
