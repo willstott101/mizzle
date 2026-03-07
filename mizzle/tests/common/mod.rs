@@ -4,6 +4,7 @@ use axum::Router;
 use mizzle::servers::axum::axum_handler;
 use mizzle::servers::trillium::trillium_handler;
 use mizzle::traits::GitServerCallbacks;
+use simple_logger::SimpleLogger;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -228,6 +229,11 @@ impl GitServerCallbacks for Config {
 }
 
 pub fn trillium_server(config: Config) -> trillium_smol::Stopper {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+
     let stopper = trillium_smol::Stopper::new();
     let server = trillium_smol::config().with_stopper(stopper.clone());
 
@@ -240,11 +246,16 @@ pub fn trillium_server(config: Config) -> trillium_smol::Stopper {
 }
 
 pub fn axum_server(config: Config) -> Sender<()> {
+    SimpleLogger::new()
+        .with_level(log::LevelFilter::Info)
+        .init()
+        .unwrap();
+
     let config = Arc::new(config);
 
     // build our application with a single route
     let app = Router::new()
-        .route("/{*key}", get(axum_handler))
+        .route("/{*key}", get(axum_handler).post(axum_handler))
         .with_state(config);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();

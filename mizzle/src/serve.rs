@@ -185,11 +185,11 @@ pub async fn serve_git_protocol_2(
                     // info!("LIST REFS ARGS: {:?}", args);
                     let repo = conn_try!(gix::open(repo_path.as_ref()), conn).into_sync();
                     let (reader, writer) = piper::pipe(4096);
-                    trillium_smol::spawn((|| async move {
+                    trillium_smol::spawn(async move {
                         ls_refs::perform_listrefs(&repo, &args, writer)
                             .await
                             .unwrap();
-                    })());
+                    });
                     return conn
                         .with_status(trillium::Status::Ok)
                         .with_body(trillium::Body::new_streaming(reader, None))
@@ -204,10 +204,10 @@ pub async fn serve_git_protocol_2(
                     let handle = repo.objects.into_arc().unwrap();
                     // let handle = repo.objects;
                     let (reader, writer) = piper::pipe(4096);
-                    trillium_smol::spawn((|| async move {
+                    trillium_smol::spawn(async move {
                         // TODO: What exactly should we pass in here to
                         fetch::perform_fetch(handle, &args, writer).await.unwrap();
-                    })());
+                    });
                     return conn
                         .with_status(trillium::Status::Ok)
                         .with_body(trillium::Body::new_streaming(reader, None))

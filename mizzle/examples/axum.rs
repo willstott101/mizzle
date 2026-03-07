@@ -30,7 +30,7 @@ async fn main() {
 
     // build our application with a single route
     let app = Router::new()
-        .route("/{*key}", get(axum_handler))
+        .route("/{*key}", get(axum_handler).post(axum_handler))
         .with_state(config);
 
     // run our app with hyper, listening globally on port 8080
