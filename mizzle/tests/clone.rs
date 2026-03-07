@@ -13,11 +13,14 @@ fn test_clone_trillium() -> Result<()> {
         bare_repo_path: temprepo.path(),
     };
 
-    let stopper = trillium_server(config);
+    let (port, stopper) = trillium_server(config);
 
     let git_output_from_server = common::run_git(
         tempdir()?.path(),
-        ["clone", "http://localhost:8080/test.git"],
+        [
+            "clone",
+            format!("http://localhost:{}/test.git", port).as_ref(),
+        ],
     )?;
     println!("{}", git_output_from_server);
 
@@ -34,12 +37,17 @@ fn test_clone_axum() -> Result<()> {
         bare_repo_path: temprepo.path(),
     };
 
-    let tx = axum_server(config);
+    let (port, tx) = axum_server(config);
 
     let cloned = tempdir()?;
 
-    let git_output_from_server =
-        common::run_git(cloned.path(), ["clone", "http://localhost:8080/test.git"])?;
+    let git_output_from_server = common::run_git(
+        cloned.path(),
+        [
+            "clone",
+            format!("http://localhost:{}/test.git", port).as_ref(),
+        ],
+    )?;
     println!("{:?}", git_output_from_server);
 
     let _ = tx.send(());

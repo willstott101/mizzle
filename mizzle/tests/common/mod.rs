@@ -8,7 +8,7 @@ use simple_logger::SimpleLogger;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::{fs, thread};
 use tokio::sync::oneshot::Sender;
 use trillium::State;
@@ -228,28 +228,39 @@ impl GitServerCallbacks for Config {
     }
 }
 
-pub fn trillium_server(config: Config) -> trillium_smol::Stopper {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
+static INIT: Once = Once::new();
+
+pub fn init_logging() {
+    INIT.call_once(|| {
+        SimpleLogger::new()
+            .with_level(log::LevelFilter::Info)
+            .init()
+            .unwrap();
+    });
+}
+
+pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
+    init_logging();
+
+    // bind random port
+    let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
 
     let stopper = trillium_smol::Stopper::new();
-    let server = trillium_smol::config().with_stopper(stopper.clone());
+    let server = trillium_smol::config()
+        .with_stopper(stopper.clone())
+        .with_host("127.0.0.1")
+        .with_port(port);
 
-    thread::spawn(|| {
-        // port 8080
+    thread::spawn(move || {
         server.run((State::new(config), trillium_handler::<Config>));
     });
 
-    stopper
+    (port, stopper)
 }
 
-pub fn axum_server(config: Config) -> Sender<()> {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
+pub fn axum_server(config: Config) -> (u16, Sender<()>) {
+    init_logging();
 
     let config = Arc::new(config);
 
@@ -259,12 +270,17 @@ pub fn axum_server(config: Config) -> Sender<()> {
         .with_state(config);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let (port_tx, port_rx) = tokio::sync::oneshot::channel::<u16>();
 
     thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+
+            let _ = port_tx.send(port);
+
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
                     rx.await.ok();
@@ -274,5 +290,7 @@ pub fn axum_server(config: Config) -> Sender<()> {
         })
     });
 
-    tx
+    let port = port_rx.blocking_recv().unwrap();
+
+    (port, tx)
 }
