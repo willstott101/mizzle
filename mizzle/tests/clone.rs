@@ -1,4 +1,6 @@
 mod common;
+use std::{thread, time::Duration};
+
 use anyhow::Result;
 use tempfile::tempdir;
 
@@ -39,7 +41,9 @@ fn test_clone_axum() -> Result<()> {
 
     let git_output_from_server =
         common::run_git(cloned.path(), ["clone", "http://localhost:8080/test.git"])?;
-    println!("{}", git_output_from_server);
+    println!("{:?}", git_output_from_server);
+
+    // thread::sleep(Duration::from_secs(99999));
 
     let _ = tx.send(());
 

@@ -46,8 +46,11 @@ pub async fn axum_handler<T: GitServerCallbacks>(
         )
             .into_response();
     }
-    let content_type_header = req.headers().get(header::CONTENT_TYPE).unwrap();
-    let content_type: Box<str> = content_type_header.to_str().unwrap().into();
+
+    let content_type = match req.headers().get(header::CONTENT_TYPE) {
+        Some(header) => header.to_str().unwrap().into(),
+        None => "".into(),
+    };
 
     let stream = req
         .into_body()

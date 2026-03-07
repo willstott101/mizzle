@@ -166,7 +166,6 @@ where
         .env("GIT_TRACE_PACKET", "1")
         .env("GIT_TRACE", "2")
         .env("GIT_CURL_VERBOSE", "1")
-
         .stdin(Stdio::null())
         .output()?;
 
@@ -200,7 +199,6 @@ where
         .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
         .env("GIT_COMMITTER_DATE", FIXED_TIME)
         .env("TZ", "UTC")
-
         .stdin(Stdio::null())
         .output()?;
 
@@ -246,19 +244,23 @@ pub fn axum_server(config: Config) -> Sender<()> {
 
     // build our application with a single route
     let app = Router::new()
-        .route("/", get(axum_handler))
+        .route("/{*key}", get(axum_handler))
         .with_state(config);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
 
-    thread::spawn(async || {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
-                rx.await.ok();
-            })
-            .await
-            .unwrap();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+                .unwrap();
+        })
     });
 
     tx

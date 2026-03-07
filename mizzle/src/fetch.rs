@@ -145,7 +145,7 @@ pub async fn perform_fetch(
         handle.ignore_replacements = true;
 
         // To get all the objectIds required for a clone, we need to use ::objects twice with the two different modes.
-        // TODO: why? 
+        // TODO: why?
         let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
             Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
