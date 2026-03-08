@@ -11,7 +11,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    serve::{serve_git_protocol_2_2, GitResponse},
+    serve::{serve_git_protocol_2, GitResponse, MizzleRuntime},
     traits::GitServerCallbacks,
 };
 
@@ -27,8 +27,9 @@ impl IntoResponse for GitResponse {
             Some(reader) => Body::from_stream(tokio_util::io::ReaderStream::new(reader.compat())),
             None => Body::from(self.body.unwrap_or("".to_string())),
         };
-
-        (headers, body).into_response()
+        let status_code =
+            StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        (status_code, headers, body).into_response()
     }
 }
 
@@ -66,9 +67,14 @@ pub async fn axum_handler<T: GitServerCallbacks>(
             let repo_path_owned: Box<str> = git_repo_path.into();
             let protocol_path_owned: Box<str> = service_path.into();
             let full_repo_path = config.auth(repo_path_owned.as_ref());
-            let res =
-                serve_git_protocol_2_2(full_repo_path, protocol_path_owned, content_type, reader)
-                    .await;
+            let res = serve_git_protocol_2(
+                MizzleRuntime::Tokio,
+                full_repo_path,
+                protocol_path_owned,
+                content_type,
+                reader,
+            )
+            .await;
             res.into_response()
         }
         None => (
