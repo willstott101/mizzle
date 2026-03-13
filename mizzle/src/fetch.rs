@@ -1,7 +1,7 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use core::sync::atomic::AtomicBool;
-use gix::{parallel::InOrderIter, ObjectId};
+use gix::{ObjectId, objs::Exists, parallel::InOrderIter};
 use gix_packetline::{
     async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
     Channel, PacketLineRef,
@@ -104,7 +104,7 @@ pub async fn perform_fetch(
     mut writer: piper::Writer,
 ) -> anyhow::Result<()> {
     let ready = false;
-    let acks: Vec<ObjectId> = Vec::new();
+    let mut acks: Vec<ObjectId> = Vec::new();
 
     // output = acknowledgements flush-pkt |
     //   [acknowledgments delim-pkt] [shallow-info delim-pkt]
@@ -112,16 +112,20 @@ pub async fn perform_fetch(
     //   packfile flush-pkt
 
     if !args.done {
-        unimplemented!();
         // TODO: Calculate acks and readiness
+        for id in args.have.iter() {
+            if handle.clone().into_inner().exists(id) {
+                acks.push(id.clone());
+            }
+        }
 
         text_to_write(b"acknowledgments", &mut writer).await?;
         if !ready {
             if acks.is_empty() {
-                text_to_write(b"nak", &mut writer).await?;
+                text_to_write(b"NAK", &mut writer).await?;
             } else {
                 for ack in acks {
-                    text_to_write(format!("ack {}", ack).as_bytes(), &mut writer).await?;
+                    text_to_write(format!("ACK {}", ack).as_bytes(), &mut writer).await?;
                 }
             }
             flush_to_write(&mut writer).await?;
