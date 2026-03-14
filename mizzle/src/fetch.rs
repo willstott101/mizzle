@@ -147,26 +147,18 @@ pub async fn perform_fetch(
         handle.prevent_pack_unload();
         handle.ignore_replacements = true;
 
-        // Walk commits reachable from "want" but not from "have", then expand
-        // each commit to its full set of trees and blobs via TreeContents.
-        // Note: this correctly excludes commits the client already has, but does
-        // not deduplicate tree/blob objects that happen to be shared between the
-        // sent commits and the client's have-side trees.
-        let wanted_commits: Vec<Result<ObjectId, Box<dyn std::error::Error + Send + Sync>>> =
-            gix::traverse::commit::Simple::new(args.want.iter().copied(), handle.clone().into_inner())
-                .hide(args.have.iter().copied())?
-                .map(|res| res.map(|info| info.id).map_err(|e| Box::new(e) as _))
-                .collect();
+        let pack_objects =
+            crate::pack::objects_for_fetch(handle.clone().into_inner(), &args.want, &args.have)?;
 
         let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
-            Box::new(wanted_commits.into_iter()),
+            Box::new(pack_objects.objects.into_iter().map(|id| Ok(id))),
             &progress,
             &should_interrupt,
             gix_pack::data::output::count::objects::Options {
                 thread_limit: None,
                 chunk_size: 16,
-                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeContents,
+                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
             },
         )?;
         let counts: Vec<_> = counts.into_iter().collect();
@@ -180,7 +172,7 @@ pub async fn perform_fetch(
             gix_pack::data::output::entry::iter_from_counts::Options {
                 thread_limit: None, // Use all cores
                 mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
-                allow_thin_pack: false, // args.thin_pack (IDK if the current thin algo will work here),
+                allow_thin_pack: args.thin_pack,
                 chunk_size: 16,
                 version: Default::default(),
             },
