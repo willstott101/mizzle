@@ -6,7 +6,6 @@ use gix_packetline::{
     async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
     Channel, PacketLineRef,
 };
-use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct FetchArgs {
@@ -148,37 +147,29 @@ pub async fn perform_fetch(
         handle.prevent_pack_unload();
         handle.ignore_replacements = true;
 
-        // To get all the objectIds required for a clone, we need to use ::objects twice with the two different modes.
-        // TODO: why?
-        let (counts, _) = gix_pack::data::output::count::objects(
-            handle.clone().into_inner(),
-            Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
-            &progress,
-            &should_interrupt,
-            gix_pack::data::output::count::objects::Options {
-                thread_limit: None,
-                chunk_size: 16,
-                // TODO: How do we give state to this expansion mode?
-                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeAdditionsComparedToAncestor,
-            },
-        )?;
-        let mut counts_set: HashSet<_> = counts.into_iter().collect();
+        // Walk commits reachable from "want" but not from "have", then expand
+        // each commit to its full set of trees and blobs via TreeContents.
+        // Note: this correctly excludes commits the client already has, but does
+        // not deduplicate tree/blob objects that happen to be shared between the
+        // sent commits and the client's have-side trees.
+        let wanted_commits: Vec<Result<ObjectId, Box<dyn std::error::Error + Send + Sync>>> =
+            gix::traverse::commit::Simple::new(args.want.iter().copied(), handle.clone().into_inner())
+                .hide(args.have.iter().copied())?
+                .map(|res| res.map(|info| info.id).map_err(|e| Box::new(e) as _))
+                .collect();
 
         let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
-            Box::new(args.want.clone().into_iter().map(|i| Ok(i))),
+            Box::new(wanted_commits.into_iter()),
             &progress,
             &should_interrupt,
             gix_pack::data::output::count::objects::Options {
                 thread_limit: None,
                 chunk_size: 16,
-                // TODO: How do we give state to this expansion mode?
-                input_object_expansion:
-                    gix_pack::data::output::count::objects::ObjectExpansion::TreeContents,
+                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::TreeContents,
             },
         )?;
-        counts_set.extend(counts);
-        let counts: Vec<_> = counts_set.into_iter().collect();
+        let counts: Vec<_> = counts.into_iter().collect();
 
         let num_objects = counts.len();
 
