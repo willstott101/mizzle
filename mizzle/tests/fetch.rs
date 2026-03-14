@@ -66,9 +66,7 @@ fn test_fetch_axum() -> Result<()> {
 
 #[test]
 fn fetch_with_thin_pack() -> anyhow::Result<()> {
-    let temprepo = tempdir()?;
-    // Initialize the bare repo and commit as usual.
-    common::run_git(temprepo.path(), ["init", "--bare", "--initial-branch=main"])?;
+    let temprepo = common::temprepo()?;
 
     let config = Config {
         bare_repo_path: temprepo.path().to_path_buf(),
@@ -121,7 +119,7 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
             "fetch",
             "--no-tags",
             "--recurse-submodules=no",
-            "--prefer-ofs-delta",
+            // "--prefer-ofs-delta", // needs specific version of git?
             "origin",
             "main",
         ],
