@@ -110,7 +110,9 @@ fn extract_pack_from_response(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
         let header_end = search_from + rel + 4;
 
         let headers = std::str::from_utf8(&raw[search_from..header_end]).unwrap_or("");
-        let is_chunked = headers.to_lowercase().contains("transfer-encoding: chunked");
+        let is_chunked = headers
+            .to_lowercase()
+            .contains("transfer-encoding: chunked");
 
         // Dechunk the body, tracking how many raw bytes were consumed so we can
         // find the start of the next HTTP response on the same connection.
@@ -284,11 +286,11 @@ fn test_fetch_axum() -> Result<()> {
 
     // Verify we got the new commit
     let main_after = common::run_git(clone_dir.as_path(), ["rev-parse", "origin/main"])?;
-    assert_eq!(main_after, new_commit, "origin/main should be the new commit");
-    assert_ne!(
-        main_before, main_after,
-        "origin/main should have advanced"
+    assert_eq!(
+        main_after, new_commit,
+        "origin/main should be the new commit"
     );
+    assert_ne!(main_before, main_after, "origin/main should have advanced");
 
     let _ = tx.send(());
 
@@ -331,7 +333,9 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     common::run_git(setup_work.path(), ["clone", server.to_str().unwrap()])?;
     let setup_repo = setup_work.path().join("temprepo");
     let large_base: String = (0u32..3000)
-        .map(|i| format!("line {i:05}: payload data for thin-pack delta compression testing abc xyz\n"))
+        .map(|i| {
+            format!("line {i:05}: payload data for thin-pack delta compression testing abc xyz\n")
+        })
         .collect();
     fs::write(setup_repo.join("large.txt"), &large_base)?;
     common::run_git(&setup_repo, ["add", "large.txt"])?;
@@ -341,7 +345,9 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     // Pack all existing server objects so delta chains are built.
     common::run_git(&server, ["repack", "-a", "-d"])?;
 
-    let (server_port, tx) = axum_server(Config { bare_repo_path: server.clone() });
+    let (server_port, tx) = axum_server(Config {
+        bare_repo_path: server.clone(),
+    });
 
     // A sniffing proxy forwards all traffic to the server and records every
     // server→client response.  All git HTTP operations below go through it.
@@ -369,11 +375,16 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     common::run_git(server_work.path(), ["clone", server.to_str().unwrap()])?;
     let server_repo = server_work.path().join("temprepo");
     let large_modified: String = (0u32..2950)
-        .map(|i| format!("line {i:05}: payload data for thin-pack delta compression testing abc xyz\n"))
+        .map(|i| {
+            format!("line {i:05}: payload data for thin-pack delta compression testing abc xyz\n")
+        })
         .collect();
     fs::write(server_repo.join("large.txt"), &large_modified)?;
     common::run_git(&server_repo, ["add", "large.txt"])?;
-    common::run_git(&server_repo, ["commit", "-m", "Modify large.txt for thin-pack test"])?;
+    common::run_git(
+        &server_repo,
+        ["commit", "-m", "Modify large.txt for thin-pack test"],
+    )?;
     common::run_git(&server_repo, ["push", "origin", "main"])?;
     let new_commit = common::run_git(&server_repo, ["rev-parse", "HEAD"])?;
 
@@ -386,7 +397,10 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     common::run_git(&clone_dir, ["fetch", "origin", "main"])?;
 
     let main_after = common::run_git(&clone_dir, ["rev-parse", "origin/main"])?;
-    assert_eq!(main_after, new_commit, "origin/main should point to the new commit");
+    assert_eq!(
+        main_after, new_commit,
+        "origin/main should point to the new commit"
+    );
     assert_ne!(main_before, main_after, "origin/main should have advanced");
 
     // fsck verifies that git successfully thickened the thin pack (resolved all

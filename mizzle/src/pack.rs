@@ -89,10 +89,7 @@ pub fn objects_for_fetch(
 
 /// Builds a set of all object IDs reachable from the `have` commits. Used to
 /// exclude already-known objects when building a pack for the want side.
-fn build_have_set(
-    odb: impl Find + Clone,
-    have: &[ObjectId],
-) -> anyhow::Result<HashSet<ObjectId>> {
+fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<HashSet<ObjectId>> {
     let mut have_set: HashSet<ObjectId> = HashSet::new();
     let mut state = gix::traverse::tree::breadthfirst::State::default();
     let mut commit_buf = Vec::new();
@@ -319,7 +316,10 @@ mod tests {
         assert!(result.contains(&c2));
         assert!(result.contains(&hello_blob));
         assert!(!result.contains(&c1), "have-side commit must be excluded");
-        assert!(!result.contains(&readme_blob), "unchanged blob must be excluded");
+        assert!(
+            !result.contains(&readme_blob),
+            "unchanged blob must be excluded"
+        );
     }
 
     // ── tree-skip optimisation ────────────────────────────────────────────────
@@ -352,8 +352,14 @@ mod tests {
             .collect();
         assert_eq!(result, rev_list_objects(p, &[c2], &[c1]));
 
-        assert!(!result.contains(&subdir_tree), "unchanged subtree must be excluded");
-        assert!(!result.contains(&deep_blob), "blob under unchanged subtree must be excluded");
+        assert!(
+            !result.contains(&subdir_tree),
+            "unchanged subtree must be excluded"
+        );
+        assert!(
+            !result.contains(&deep_blob),
+            "blob under unchanged subtree must be excluded"
+        );
     }
 
     // ── want == have ─────────────────────────────────────────────────────────
@@ -419,6 +425,9 @@ mod tests {
             .collect();
 
         assert!(result.contains(&new_blob));
-        assert!(!result.contains(&shared_blob), "blob known via have branch must be excluded");
+        assert!(
+            !result.contains(&shared_blob),
+            "blob known via have branch must be excluded"
+        );
     }
 }

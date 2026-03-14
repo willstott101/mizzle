@@ -1,7 +1,7 @@
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use core::sync::atomic::AtomicBool;
-use gix::{ObjectId, objs::Exists, parallel::InOrderIter};
+use gix::{objs::Exists, parallel::InOrderIter, ObjectId};
 use gix_packetline::{
     async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
     Channel, PacketLineRef,
@@ -158,7 +158,8 @@ pub async fn perform_fetch(
             gix_pack::data::output::count::objects::Options {
                 thread_limit: None,
                 chunk_size: 16,
-                input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
+                input_object_expansion:
+                    gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
             },
         )?;
         let counts: Vec<_> = counts.into_iter().collect();
