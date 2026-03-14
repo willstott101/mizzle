@@ -1,101 +1,183 @@
 mod common;
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::Result;
 use tempfile::tempdir;
 
 use common::{axum_server, Config};
 
-/// Makes a raw git-upload-pack v2 fetch request and returns the raw pack bytes
-/// (all sideband channel-1 data concatenated).
-fn fetch_pack_over_http(port: u16, path: &str, want: &str, have: &str) -> anyhow::Result<Vec<u8>> {
-    fn pkt(data: &[u8]) -> Vec<u8> {
-        let len = data.len() + 4;
-        let mut v = format!("{:04x}", len).into_bytes();
-        v.extend_from_slice(data);
-        v
+/// A TCP proxy that sits between the git client and the mizzle server, recording
+/// all server→client bytes for every connection.  Run git commands through
+/// `proxy.port`; afterwards call `has_thin_pack_in_response` to inspect the
+/// captured traffic.
+struct SniffingProxy {
+    /// Point the git client at this port.
+    pub port: u16,
+    responses: Arc<Mutex<Vec<Vec<u8>>>>,
+}
+
+impl SniffingProxy {
+    fn new(upstream_port: u16) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let responses: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let responses_clone = Arc::clone(&responses);
+
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(client) = stream else { break };
+                let responses = Arc::clone(&responses_clone);
+                thread::spawn(move || {
+                    if let Ok(bytes) = proxy_connection(client, upstream_port) {
+                        responses.lock().unwrap().push(bytes);
+                    }
+                });
+            }
+        });
+
+        SniffingProxy { port, responses }
     }
 
-    let mut body: Vec<u8> = Vec::new();
-    body.extend(pkt(b"command=fetch\n"));
-    body.extend(pkt(b"agent=git/test\n"));
-    body.extend_from_slice(b"0001"); // delimiter
-    body.extend(pkt(format!("want {want}\n").as_bytes()));
-    body.extend(pkt(format!("have {have}\n").as_bytes()));
-    body.extend(pkt(b"thin-pack\n"));
-    body.extend(pkt(b"ofs-delta\n"));
-    body.extend(pkt(b"done\n"));
-    body.extend_from_slice(b"0000"); // flush
+    /// Returns true if any captured response contains an OBJ_REF_DELTA (type-7)
+    /// pack entry.
+    fn has_thin_pack_in_response(&self) -> anyhow::Result<bool> {
+        // Wait for any in-flight proxy threads to finish recording.
+        thread::sleep(std::time::Duration::from_millis(100));
 
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))?;
-    write!(
-        stream,
-        "POST /{path}/git-upload-pack HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Git-Protocol: version=2\r\n\
-         Content-Type: application/x-git-upload-pack-request\r\n\
-         Accept: application/x-git-upload-pack-result\r\n\
-         Content-Length: {}\r\n\
-         Connection: close\r\n\
-         \r\n",
-        body.len()
-    )?;
-    stream.write_all(&body)?;
+        let responses = self.responses.lock().unwrap();
+        for bytes in responses.iter() {
+            if let Ok(pack) = extract_pack_from_response(bytes) {
+                if is_thin_pack(&pack)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+}
 
-    let mut reader = BufReader::new(stream);
+/// Proxy one TCP connection: forward client↔server, capturing server→client bytes.
+fn proxy_connection(client: TcpStream, upstream_port: u16) -> anyhow::Result<Vec<u8>> {
+    let server = TcpStream::connect(format!("127.0.0.1:{upstream_port}"))?;
+    let mut client_r = client.try_clone()?;
+    let mut client_w = client;
+    let mut server_r = server.try_clone()?;
+    let mut server_w = server;
 
-    // Parse HTTP headers
-    let mut is_chunked = false;
-    let mut line = String::new();
+    // Forward client → server.  When the client closes its write side (git is
+    // done sending), half-close the proxy→server direction so the server sees
+    // EOF and can close its side promptly, unblocking our capture loop below.
+    let fwd = thread::spawn(move || {
+        let _ = io::copy(&mut client_r, &mut server_w);
+        let _ = server_w.shutdown(std::net::Shutdown::Write);
+    });
+
+    // Forward server → client, capturing everything sent.
+    let mut captured = Vec::new();
+    let mut buf = [0u8; 16384];
     loop {
-        line.clear();
-        reader.read_line(&mut line)?;
-        if line.trim().is_empty() {
+        match server_r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                captured.extend_from_slice(&buf[..n]);
+                client_w.write_all(&buf[..n])?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let _ = fwd.join();
+    Ok(captured)
+}
+
+/// Parse raw server→client TCP bytes and extract sideband channel-1 pack bytes
+/// from a git-upload-pack response.  A single captured TCP stream may contain
+/// multiple HTTP responses (HTTP/1.1 keep-alive), so this iterates over all of
+/// them and returns the first one that contains packfile data.
+fn extract_pack_from_response(raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let mut search_from = 0;
+
+    while search_from < raw.len() {
+        // Find the end of the next HTTP response headers.
+        let Some(rel) = raw[search_from..].windows(4).position(|w| w == b"\r\n\r\n") else {
+            break;
+        };
+        let header_end = search_from + rel + 4;
+
+        let headers = std::str::from_utf8(&raw[search_from..header_end]).unwrap_or("");
+        let is_chunked = headers.to_lowercase().contains("transfer-encoding: chunked");
+
+        // Dechunk the body, tracking how many raw bytes were consumed so we can
+        // find the start of the next HTTP response on the same connection.
+        let (body, body_raw_len) = dechunk_body(&raw[header_end..], is_chunked)?;
+
+        if let Ok(pack) = pack_from_pkt_lines(&body) {
+            return Ok(pack);
+        }
+
+        search_from = header_end + body_raw_len;
+    }
+
+    anyhow::bail!("no pack data found in any HTTP response")
+}
+
+/// Dechunk an HTTP response body starting at `raw`.  Returns the decoded body
+/// bytes and the number of raw bytes consumed (so the caller can advance past
+/// this response to the next one on a keep-alive connection).
+fn dechunk_body(raw: &[u8], is_chunked: bool) -> anyhow::Result<(Vec<u8>, usize)> {
+    if !is_chunked {
+        // Without chunking we can't know where this response ends without a
+        // Content-Length header, so conservatively consume everything.
+        return Ok((raw.to_vec(), raw.len()));
+    }
+
+    let mut reader = BufReader::new(raw);
+    let mut body = Vec::new();
+    let mut consumed = 0;
+
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        consumed += n;
+        let size_str = line.trim().split(';').next().unwrap_or("0");
+        let size = usize::from_str_radix(size_str, 16)?;
+        if size == 0 {
+            // Consume the trailing \r\n after the terminating zero chunk.
+            let mut crlf = [0u8; 2];
+            if reader.read_exact(&mut crlf).is_ok() {
+                consumed += 2;
+            }
             break;
         }
-        if line.to_lowercase().contains("transfer-encoding: chunked") {
-            is_chunked = true;
-        }
+        let mut chunk = vec![0u8; size];
+        reader.read_exact(&mut chunk)?;
+        body.extend_from_slice(&chunk);
+        consumed += size;
+        let mut crlf = [0u8; 2];
+        reader.read_exact(&mut crlf)?;
+        consumed += 2;
     }
 
-    // Read the HTTP response body
-    let mut raw_body: Vec<u8> = Vec::new();
-    if is_chunked {
-        loop {
-            let mut size_line = String::new();
-            reader.read_line(&mut size_line)?;
-            let size_str = size_line.trim().split(';').next().unwrap_or("0");
-            let size = usize::from_str_radix(size_str, 16)?;
-            if size == 0 {
-                break;
-            }
-            let mut chunk = vec![0u8; size];
-            reader.read_exact(&mut chunk)?;
-            raw_body.extend_from_slice(&chunk);
-            let mut crlf = [0u8; 2];
-            reader.read_exact(&mut crlf)?;
-        }
-    } else {
-        reader.read_to_end(&mut raw_body)?;
-    }
+    Ok((body, consumed))
+}
 
-    // Parse pkt-lines to extract sideband channel-1 (pack data).
-    // Protocol v2 fetch (with `done`) response:
-    //   PKT-LINE("packfile\n")
-    //   PKT-LINE(\x01 <pack-bytes>)*
-    //   flush (0000)
+/// Scan a dechunked pkt-line body for a "packfile" section and return the
+/// concatenated sideband channel-1 bytes.
+fn pack_from_pkt_lines(body: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut pos = 0;
-    let mut pack_bytes: Vec<u8> = Vec::new();
+    let mut pack_bytes = Vec::new();
     let mut in_packfile = false;
 
     loop {
-        if pos + 4 > raw_body.len() {
+        if pos + 4 > body.len() {
             break;
         }
-        let len_hex = std::str::from_utf8(&raw_body[pos..pos + 4])?;
+        let len_hex = std::str::from_utf8(&body[pos..pos + 4])?;
         let pkt_len = usize::from_str_radix(len_hex, 16)?;
         if pkt_len == 0 {
             break; // flush
@@ -104,28 +186,40 @@ fn fetch_pack_over_http(port: u16, path: &str, want: &str, have: &str) -> anyhow
             pos += 4; // delimiter
             continue;
         }
-        if pos + pkt_len > raw_body.len() {
+        if pos + pkt_len > body.len() {
             break;
         }
-        let data = &raw_body[pos + 4..pos + pkt_len];
+        let data = &body[pos + 4..pos + pkt_len];
         let data_stripped = data.strip_suffix(b"\n").unwrap_or(data);
 
         if !in_packfile && data_stripped == b"packfile" {
             in_packfile = true;
-        } else if in_packfile && data[0] == 1 {
-            // Channel 1 = pack data; strip the band byte
+        } else if in_packfile && !data.is_empty() && data[0] == 1 {
             pack_bytes.extend_from_slice(&data[1..]);
         }
 
         pos += pkt_len;
     }
 
+    if pack_bytes.is_empty() {
+        anyhow::bail!("no packfile section found");
+    }
     Ok(pack_bytes)
 }
 
-/// Returns true if the pack contains at least one OBJ_REF_DELTA (type 7) entry.
-fn has_ref_delta_entries(pack: &[u8]) -> anyhow::Result<bool> {
+/// Verifies that a pack is "truly thin":
+///   1. It contains at least one OBJ_REF_DELTA (type 7) entry — the delta.
+///   2. It contains no full OBJ_BLOB (type 3) entries — the base blob is absent.
+///
+/// In this test the only differing content between commits is a large blob.  A
+/// correct thin pack sends the new blob as a RefDelta against the old blob (which
+/// the client already holds) and does NOT include the old blob as a full object.
+/// If the base were mistakenly included as a full Blob the pack would not be thin.
+fn is_thin_pack(pack: &[u8]) -> anyhow::Result<bool> {
     use gix_pack::data::{entry::Header, input};
+
+    let mut ref_delta_count = 0usize;
+    let mut full_blob_count = 0usize;
 
     let iter = input::BytesToEntriesIter::new_from_header(
         BufReader::new(pack),
@@ -134,11 +228,14 @@ fn has_ref_delta_entries(pack: &[u8]) -> anyhow::Result<bool> {
         gix_hash::Kind::Sha1,
     )?;
     for entry in iter {
-        if matches!(entry?.header, Header::RefDelta { .. }) {
-            return Ok(true);
+        match entry?.header {
+            Header::RefDelta { .. } => ref_delta_count += 1,
+            Header::Blob => full_blob_count += 1,
+            _ => {}
         }
     }
-    Ok(false)
+
+    Ok(ref_delta_count > 0 && full_blob_count == 0)
 }
 
 #[test]
@@ -203,12 +300,14 @@ fn test_fetch_axum() -> Result<()> {
 // For a thin pack to actually contain RefDelta entries the objects being sent
 // must be stored as OfsDelta in the server's pack file, with their bases outside
 // the output set.  We arrange this by:
-//   1. Pushing a large file (guaranteed to be delta-compressed by git) to the
-//      server and repacking before the client clones.
-//   2. Pushing a new commit that modifies that large file by one line — the
-//      updated blob is an excellent delta candidate against the original.
-//   3. Repacking again so the new blob is delta-compressed against the old one
-//      which the client already holds.
+//   1. Pushing a large file (~200 KB, moderate entropy) to the server and
+//      repacking before the client clones, so existing objects live in a pack
+//      with delta chains.
+//   2. Pushing a new commit that *removes* the last 50 lines from that file.
+//      The shortened blob is a good OFS_DELTA candidate against the original
+//      (git prefers the larger object as the delta base), so after repack the
+//      new blob is stored as OFS_DELTA against the blob the client already has.
+//   3. Repacking again so the new objects are delta-compressed.
 //
 // git automatically includes `thin-pack` in its fetch capabilities whenever the
 // client has existing objects, so no special client flags are needed.
@@ -216,18 +315,18 @@ fn test_fetch_axum() -> Result<()> {
 // We verify correctness two ways:
 //   a. `git fsck` — git thickens thin packs on receipt and fsck catches any pack
 //      that references a base the client doesn't have.
-//   b. Direct wire inspection — we make a raw HTTP git-upload-pack request and
-//      parse the returned pack bytes with `BytesToEntriesIter`, asserting that at
-//      least one OBJ_REF_DELTA (type-7) entry is present.
+//   b. Wire sniffing — a TCP proxy sits between the real git client and our
+//      server; we parse the captured server→client bytes and assert that at least
+//      one OBJ_REF_DELTA (type-7) entry appears in the pack git actually received.
 #[test]
 fn fetch_with_thin_pack() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let server = temprepo.path();
 
-    // Push a large file (~200 KB, moderate entropy) so git will definitely build a delta chain
-    // between the old and new blob during repack.  We use numbered lines so the content isn't
-    // trivially compressible — git skips delta compression when zlib shrinks blobs to almost
-    // nothing, which happens with purely repeated text.
+    // Push a large file (~200 KB, moderate entropy) so git will definitely build
+    // a delta chain between the old and new blob during repack.  We use numbered
+    // lines so the content isn't trivially compressible — git skips delta
+    // compression when zlib shrinks blobs to almost nothing.
     let setup_work = tempdir()?;
     common::run_git(setup_work.path(), ["clone", server.to_str().unwrap()])?;
     let setup_repo = setup_work.path().join("temprepo");
@@ -242,12 +341,13 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     // Pack all existing server objects so delta chains are built.
     common::run_git(&server, ["repack", "-a", "-d"])?;
 
-    let config = Config {
-        bare_repo_path: server.clone(),
-    };
-    let (port, tx) = axum_server(config);
+    let (server_port, tx) = axum_server(Config { bare_repo_path: server.clone() });
 
-    // Clone so the client has the large file.
+    // A sniffing proxy forwards all traffic to the server and records every
+    // server→client response.  All git HTTP operations below go through it.
+    let proxy = SniffingProxy::new(server_port);
+
+    // Clone so the client holds the large file.
     let cloned = tempdir()?;
     common::run_git(
         cloned.path(),
@@ -255,16 +355,16 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
             "clone",
             "--branch",
             "main",
-            format!("http://localhost:{}/test.git", port).as_ref(),
+            format!("http://localhost:{}/test.git", proxy.port).as_ref(),
         ],
     )?;
     let clone_dir = cloned.path().join("test");
     let main_before = common::run_git(&clone_dir, ["rev-parse", "origin/main"])?;
 
-    // Push a new commit that *removes* the last 50 lines from large.txt.  Shorter
+    // Push a new commit that removes the last 50 lines from large.txt.  Shorter
     // content means the new blob is stored as OFS_DELTA against the old one (git
-    // prefers larger objects as full bases), which is exactly what thin-pack needs:
-    // the delta base (old blob) is already held by the client.
+    // prefers larger objects as full bases), which is exactly what thin-pack
+    // needs: the delta base is already held by the client.
     let server_work = tempdir()?;
     common::run_git(server_work.path(), ["clone", server.to_str().unwrap()])?;
     let server_repo = server_work.path().join("temprepo");
@@ -277,13 +377,12 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     common::run_git(&server_repo, ["push", "origin", "main"])?;
     let new_commit = common::run_git(&server_repo, ["rev-parse", "HEAD"])?;
 
-    // Repack so the new blob lands in a pack file and git builds a delta between
-    // the old and new large.txt blobs.
+    // Repack so the new blob lands in a pack file and git builds a delta against
+    // the old blob (which the client already holds).
     common::run_git(&server, ["repack", "-a", "-d"])?;
 
-    // Fetch — git automatically sends `thin-pack` since the client has existing
-    // objects, so the server will produce RefDelta entries for any blobs whose
-    // delta base is held by the client.
+    // The real git client fetches through the proxy.  It automatically sends
+    // `thin-pack` since it has existing objects.
     common::run_git(&clone_dir, ["fetch", "origin", "main"])?;
 
     let main_after = common::run_git(&clone_dir, ["rev-parse", "origin/main"])?;
@@ -294,15 +393,14 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     // RefDelta bases from the local objects) and that the result is consistent.
     common::run_git(&clone_dir, ["fsck", "--no-progress"])?;
 
-    // Verify that the server actually sends a thin pack (OBJ_REF_DELTA entries)
-    // over the wire by making a raw HTTP fetch request and inspecting the pack.
-    let pack = fetch_pack_over_http(port, "test.git", &new_commit, &main_before)?;
+    // Verify the pack the real git client received is a true thin pack:
+    // it contains RefDelta entries (the delta) but no full Blob (the base is absent).
     assert!(
-        has_ref_delta_entries(&pack)?,
-        "expected at least one RefDelta entry in the thin pack sent over the wire"
+        proxy.has_thin_pack_in_response()?,
+        "expected a thin pack with RefDelta entries and no full base blob in the pack \
+         the real git client received"
     );
 
     let _ = tx.send(());
     Ok(())
 }
-
