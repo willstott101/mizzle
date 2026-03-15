@@ -26,9 +26,9 @@ macro_rules! res_try {
                 error!("{}:{} res_try error: {}", file!(), line!(), error);
                 return GitResponse {
                     reader: None,
-                    body: None,
+                    body: Some(format!("internal error: {:#}", error)),
                     status_code: 500,
-                    content_type: None,
+                    content_type: Some("text/plain".to_string()),
                 };
             }
         }
