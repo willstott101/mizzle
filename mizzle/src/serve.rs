@@ -175,12 +175,19 @@ where
         if !rejected.is_empty() {
             spawn(Box::pin(async move {
                 let mut w = writer;
-                text_to_write(b"unpack ok", &mut w).await.unwrap();
-                for (refname, msg) in rejected {
-                    let line = format!("ng {} {}", refname, msg);
-                    text_to_write(line.as_bytes(), &mut w).await.unwrap();
+                let result: anyhow::Result<()> = async {
+                    text_to_write(b"unpack ok", &mut w).await?;
+                    for (refname, msg) in rejected {
+                        let line = format!("ng {} {}", refname, msg);
+                        text_to_write(line.as_bytes(), &mut w).await?;
+                    }
+                    flush_to_write(&mut w).await?;
+                    Ok(())
                 }
-                flush_to_write(&mut w).await.unwrap();
+                .await;
+                if let Err(e) = result {
+                    error!("auth rejection write error: {:#}", e);
+                }
             }));
         } else {
             spawn(Box::pin(async move {

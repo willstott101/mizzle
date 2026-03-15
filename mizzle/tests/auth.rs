@@ -7,6 +7,14 @@ use tempfile::tempdir;
 
 use mizzle::traits::{PushKind, PushRef, RepoAccess};
 
+/// Spin up an axum server pointing at a repo path that does not exist.
+#[cfg(feature = "axum")]
+fn bad_repo_server() -> common::ServerHandle {
+    common::axum_server(common::Config {
+        bare_repo_path: PathBuf::from("/nonexistent/path/that/does/not/exist.git"),
+    })
+}
+
 // An access type that allows reads but rejects all pushes.
 #[derive(Clone)]
 struct DenyPushAccess {
@@ -317,5 +325,27 @@ fn test_delete_denied() {
         "expected 'Delete' in error, got: {err}"
     );
 
+    server.stop();
+}
+
+/// A server pointing at a non-existent repo path should return HTTP 500 with a
+/// non-empty error body immediately — not a silent truncated stream.
+#[cfg(feature = "axum")]
+#[test]
+fn test_bad_repo_path_returns_500() {
+    let server = bad_repo_server();
+    let clone_dir = tempdir().unwrap();
+
+    let err = common::run_git(
+        clone_dir.path(),
+        [
+            "clone",
+            "--branch",
+            "main",
+            &format!("http://localhost:{}/test.git", server.port),
+        ],
+    );
+
+    assert!(err.is_err(), "clone from bad repo path should fail");
     server.stop();
 }
