@@ -1,7 +1,7 @@
 use trillium::Conn;
 
 use crate::{
-    serve::{serve_git_protocol_2, GitResponse, MizzleRuntime},
+    serve::{serve_git_protocol_2, GitResponse},
     traits::GitServerCallbacks,
 };
 
@@ -56,7 +56,9 @@ pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(
             let full_repo_path = config.auth(repo_path_owned.as_ref());
             let callbacks = std::sync::Arc::new(config.clone());
             let res = serve_git_protocol_2(
-                MizzleRuntime::Smol,
+                |fut| {
+                    trillium_smol::spawn(fut);
+                },
                 callbacks,
                 full_repo_path,
                 protocol_path_owned,

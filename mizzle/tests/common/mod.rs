@@ -258,9 +258,7 @@ pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
     (port, stopper)
 }
 
-pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(
-    config: C,
-) -> (u16, Sender<()>) {
+pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> (u16, Sender<()>) {
     init_logging();
 
     let config = Arc::new(config);

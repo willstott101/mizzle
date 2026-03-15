@@ -11,7 +11,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    serve::{serve_git_protocol_2, GitResponse, MizzleRuntime},
+    serve::{serve_git_protocol_2, GitResponse},
     traits::GitServerCallbacks,
 };
 
@@ -76,7 +76,9 @@ pub async fn axum_handler<T: GitServerCallbacks + Send + Sync + 'static>(
             let protocol_path_owned: Box<str> = service_path.into();
             let full_repo_path = config.auth(repo_path_owned.as_ref());
             let res = serve_git_protocol_2(
-                MizzleRuntime::Tokio,
+                |fut| {
+                    tokio::spawn(fut);
+                },
                 config.clone(),
                 full_repo_path,
                 protocol_path_owned,

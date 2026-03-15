@@ -27,11 +27,7 @@ pub trait GitServerCallbacks: Clone {
     /// ref-update commands have been parsed but before the packfile is
     /// written.  Return `Err(reason)` to reject the entire push; `reason` is
     /// sent back to the client.
-    fn authorize_push(
-        &self,
-        _repo_path: &str,
-        _refs: &[PushRef<'_>],
-    ) -> Result<(), String> {
+    fn authorize_push(&self, _repo_path: &str, _refs: &[PushRef<'_>]) -> Result<(), String> {
         Ok(())
     }
 }

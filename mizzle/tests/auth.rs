@@ -27,11 +27,7 @@ impl GitServerCallbacks for DenyPushConfig {
         self.bare_repo_path.to_str().unwrap().into()
     }
 
-    fn authorize_push(
-        &self,
-        _repo_path: &str,
-        _refs: &[PushRef<'_>],
-    ) -> Result<(), String> {
+    fn authorize_push(&self, _repo_path: &str, _refs: &[PushRef<'_>]) -> Result<(), String> {
         Err("permission denied".to_string())
     }
 }
@@ -90,7 +86,10 @@ fn test_push_denied() {
     let bare_head =
         common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"]).unwrap();
     let local_head = common::run_git(&repo_dir, ["rev-parse", "HEAD"]).unwrap();
-    assert_ne!(bare_head, local_head, "bare repo should not have been updated");
+    assert_ne!(
+        bare_head, local_head,
+        "bare repo should not have been updated"
+    );
 
     let _ = tx.send(());
 }

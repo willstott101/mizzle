@@ -1,5 +1,5 @@
-use crate::{fetch, ls_refs, receive};
 use crate::traits::GitServerCallbacks;
+use crate::{fetch, ls_refs, receive};
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
@@ -7,8 +7,9 @@ use gix_packetline::async_io::StreamingPeekableIter;
 use gix_packetline::PacketLineRef;
 use log::{error, info};
 use piper::{Reader, Writer};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use trillium_smol;
 
 pub struct GitResponse {
     pub status_code: u16,
@@ -35,20 +36,22 @@ macro_rules! res_try {
     };
 }
 
-pub enum MizzleRuntime {
-    Tokio,
-    Smol,
-}
+pub type SpawnFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + Send + Sync + 'static>(
-    runtime: MizzleRuntime,
+pub async fn serve_git_protocol_2<T, C, S>(
+    spawn: S,
     callbacks: Arc<C>,
     repo_path: Box<str>,
     protocol_path: Box<str>,
     query_string: Box<str>,
     content_type: Box<str>,
     body: T,
-) -> GitResponse {
+) -> GitResponse
+where
+    T: AsyncRead + Unpin,
+    C: GitServerCallbacks + Send + Sync + 'static,
+    S: Fn(SpawnFut),
+{
     info!("GIT {} {}", repo_path, protocol_path);
 
     // Receive-pack discovery: GET /info/refs?service=git-receive-pack
@@ -58,54 +61,29 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
             .any(|kv| kv == "service=git-receive-pack")
     {
         let (reader, writer) = piper::pipe(4096);
-        match runtime {
-            MizzleRuntime::Tokio => {
-                tokio::spawn(async move {
-                    let mut w = writer;
-                    text_to_write(b"# service=git-receive-pack", &mut w)
-                        .await
-                        .expect("write");
-                    flush_to_write(&mut w).await.expect("flush");
-                    receive::info_refs_receive_pack_task(repo_path, w).await;
-                });
-            }
-            MizzleRuntime::Smol => {
-                trillium_smol::spawn(async move {
-                    let mut w = writer;
-                    text_to_write(b"# service=git-receive-pack", &mut w)
-                        .await
-                        .expect("write");
-                    flush_to_write(&mut w).await.expect("flush");
-                    receive::info_refs_receive_pack_task(repo_path, w).await;
-                });
-            }
-        }
+        spawn(Box::pin(async move {
+            let mut w = writer;
+            text_to_write(b"# service=git-receive-pack", &mut w)
+                .await
+                .expect("write");
+            flush_to_write(&mut w).await.expect("flush");
+            receive::info_refs_receive_pack_task(repo_path, w).await;
+        }));
         return GitResponse {
             status_code: 200,
-            content_type: Some(
-                "application/x-git-receive-pack-advertisement".to_string(),
-            ),
+            content_type: Some("application/x-git-receive-pack-advertisement".to_string()),
             reader: Some(reader),
             body: None,
         };
     }
 
-    // Upload-pack discovery: GET /info/refs (upload-pack)
+    // Upload-pack discovery: GET /info/refs
     if protocol_path.as_ref() == "info/refs" {
         let (reader, writer) = piper::pipe(4096);
-        match runtime {
-            MizzleRuntime::Tokio => {
-                tokio::spawn(info_refs_task(writer));
-            }
-            MizzleRuntime::Smol => {
-                trillium_smol::spawn(info_refs_task(writer));
-            }
-        }
+        spawn(Box::pin(info_refs_task(writer)));
         return GitResponse {
             status_code: 200,
-            content_type: Some(
-                "application/x-git-upload-pack-advertisement".to_string(),
-            ),
+            content_type: Some("application/x-git-upload-pack-advertisement".to_string()),
             reader: Some(reader),
             body: None,
         };
@@ -119,14 +97,12 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
                 content_type: None,
                 reader: None,
                 body: Some(
-                    "Expected content type application/x-git-receive-pack-request"
-                        .to_string(),
+                    "Expected content type application/x-git-receive-pack-request".to_string(),
                 ),
             };
         }
 
-        let (ref_updates, pack_data) =
-            res_try!(receive::read_receive_request(body).await);
+        let (ref_updates, pack_data) = res_try!(receive::read_receive_request(body).await);
 
         // Auth check: open the repo once, compute push kind for each ref,
         // and ask the callbacks whether it's allowed.  This happens before
@@ -153,57 +129,21 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
         let (reader, writer) = piper::pipe(4096);
 
         if !rejected.is_empty() {
-            match runtime {
-                MizzleRuntime::Tokio => {
-                    tokio::spawn(async move {
-                        let mut w = writer;
-                        text_to_write(b"unpack ok", &mut w).await.unwrap();
-                        for (refname, msg) in rejected {
-                            let line = format!("ng {} {}", refname, msg);
-                            text_to_write(line.as_bytes(), &mut w).await.unwrap();
-                        }
-                        flush_to_write(&mut w).await.unwrap();
-                    });
+            spawn(Box::pin(async move {
+                let mut w = writer;
+                text_to_write(b"unpack ok", &mut w).await.unwrap();
+                for (refname, msg) in rejected {
+                    let line = format!("ng {} {}", refname, msg);
+                    text_to_write(line.as_bytes(), &mut w).await.unwrap();
                 }
-                MizzleRuntime::Smol => {
-                    trillium_smol::spawn(async move {
-                        let mut w = writer;
-                        text_to_write(b"unpack ok", &mut w).await.unwrap();
-                        for (refname, msg) in rejected {
-                            let line = format!("ng {} {}", refname, msg);
-                            text_to_write(line.as_bytes(), &mut w).await.unwrap();
-                        }
-                        flush_to_write(&mut w).await.unwrap();
-                    });
-                }
-            }
+                flush_to_write(&mut w).await.unwrap();
+            }));
         } else {
-            match runtime {
-                MizzleRuntime::Tokio => {
-                    tokio::spawn(async move {
-                        receive::perform_receive(
-                            repo_path.as_ref(),
-                            ref_updates,
-                            pack_data,
-                            writer,
-                        )
-                        .await
-                        .unwrap();
-                    });
-                }
-                MizzleRuntime::Smol => {
-                    trillium_smol::spawn(async move {
-                        receive::perform_receive(
-                            repo_path.as_ref(),
-                            ref_updates,
-                            pack_data,
-                            writer,
-                        )
-                        .await
-                        .unwrap();
-                    });
-                }
-            }
+            spawn(Box::pin(async move {
+                receive::perform_receive(repo_path.as_ref(), ref_updates, pack_data, writer)
+                    .await
+                    .unwrap();
+            }));
         }
 
         return GitResponse {
@@ -219,13 +159,10 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
         if content_type.as_ref() != "application/x-git-upload-pack-request" {
             return GitResponse {
                 status_code: 400,
-                content_type: Some(
-                    "application/x-git-upload-pack-advertisement".to_string(),
-                ),
+                content_type: Some("application/x-git-upload-pack-advertisement".to_string()),
                 reader: None,
                 body: Some(
-                    "Expected content type application/x-git-upload-pack-request"
-                        .to_string(),
+                    "Expected content type application/x-git-upload-pack-request".to_string(),
                 ),
             };
         }
@@ -237,22 +174,11 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
                 let args = res_try!(ls_refs::read_lsrefs_args(&mut parser).await);
                 let repo = res_try!(gix::open(repo_path.as_ref())).into_sync();
                 let (reader, writer) = piper::pipe(4096);
-                match runtime {
-                    MizzleRuntime::Tokio => {
-                        tokio::spawn(async move {
-                            ls_refs::perform_listrefs(&repo, &args, writer)
-                                .await
-                                .unwrap();
-                        });
-                    }
-                    MizzleRuntime::Smol => {
-                        trillium_smol::spawn(async move {
-                            ls_refs::perform_listrefs(&repo, &args, writer)
-                                .await
-                                .unwrap();
-                        });
-                    }
-                }
+                spawn(Box::pin(async move {
+                    ls_refs::perform_listrefs(&repo, &args, writer)
+                        .await
+                        .unwrap();
+                }));
                 return GitResponse {
                     status_code: 200,
                     content_type: None,
@@ -266,22 +192,11 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
                 info!("FETCH: {:?}", args);
                 let repo = res_try!(gix::open(repo_path.as_ref()));
                 let (reader, writer) = piper::pipe(4096);
-                match runtime {
-                    MizzleRuntime::Tokio => {
-                        tokio::spawn(async move {
-                            fetch::perform_fetch(repo.objects, &args, writer)
-                                .await
-                                .unwrap();
-                        });
-                    }
-                    MizzleRuntime::Smol => {
-                        trillium_smol::spawn(async move {
-                            fetch::perform_fetch(repo.objects, &args, writer)
-                                .await
-                                .unwrap();
-                        });
-                    }
-                }
+                spawn(Box::pin(async move {
+                    fetch::perform_fetch(repo.objects, &args, writer)
+                        .await
+                        .unwrap();
+                }));
                 return GitResponse {
                     status_code: 200,
                     content_type: None,
@@ -301,7 +216,6 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + 
 }
 
 async fn info_refs_task(mut writer: Writer) {
-    // Copied from github
     text_to_write(b"# service=git-upload-pack", &mut writer)
         .await
         .expect("to write to output");
@@ -309,14 +223,12 @@ async fn info_refs_task(mut writer: Writer) {
         .await
         .expect("to write to output");
 
-    // Understood in the spec
     text_to_write(b"version 2", &mut writer)
         .await
         .expect("to write to output");
     text_to_write(b"agent=mizzle/dev", &mut writer)
         .await
         .expect("to write to output");
-
     text_to_write(b"ls-refs=unborn", &mut writer)
         .await
         .expect("to write to output");
@@ -324,7 +236,6 @@ async fn info_refs_task(mut writer: Writer) {
         .await
         .expect("to write to output");
 
-    // Understood in the spec
     flush_to_write(&mut writer)
         .await
         .expect("to write to output");
