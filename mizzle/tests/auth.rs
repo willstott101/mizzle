@@ -109,7 +109,10 @@ where
     };
     use std::sync::Arc;
 
-    async fn handler<A: RepoAccess + Send + 'static, F: Fn(Box<str>) -> A + Send + Sync + 'static>(
+    async fn handler<
+        A: RepoAccess + Send + 'static,
+        F: Fn(Box<str>) -> A + Send + Sync + 'static,
+    >(
         State(state): State<Arc<(String, F)>>,
         Path(path): Path<String>,
         req: Request,
@@ -200,7 +203,10 @@ fn test_push_denied() {
     let bare_head =
         common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"]).unwrap();
     let local_head = common::run_git(&repo_dir, ["rev-parse", "HEAD"]).unwrap();
-    assert_ne!(bare_head, local_head, "bare repo should not have been updated");
+    assert_ne!(
+        bare_head, local_head,
+        "bare repo should not have been updated"
+    );
 
     server.stop();
 }
@@ -305,8 +311,7 @@ fn test_delete_denied() {
     common::run_git(&repo_dir, ["push", "origin", "main"]).unwrap();
 
     // Deleting a remote branch should be rejected.
-    let err =
-        common::run_git(&repo_dir, ["push", "origin", "--delete", "dev"]).unwrap_err();
+    let err = common::run_git(&repo_dir, ["push", "origin", "--delete", "dev"]).unwrap_err();
     assert!(
         err.to_string().contains("Delete"),
         "expected 'Delete' in error, got: {err}"

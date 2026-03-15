@@ -63,12 +63,7 @@ impl<'r> FromRequest<'r> for GitRequestMeta {
 
     async fn from_request(req: &'r Request<'_>) -> Outcome<Self, ()> {
         Outcome::Success(GitRequestMeta {
-            query_string: req
-                .uri()
-                .query()
-                .map(|q| q.as_str())
-                .unwrap_or("")
-                .into(),
+            query_string: req.uri().query().map(|q| q.as_str()).unwrap_or("").into(),
             content_type: req
                 .content_type()
                 .map(|ct| ct.to_string())

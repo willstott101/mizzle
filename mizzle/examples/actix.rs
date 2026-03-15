@@ -33,7 +33,10 @@ async fn git_handler(
     payload: web::Payload,
     config: web::Data<Config>,
 ) -> actix_web::HttpResponse {
-    let token = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
     if token != Some("Bearer secret") {
         return actix_web::HttpResponse::Unauthorized().body("unauthorized");
     }

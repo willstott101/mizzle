@@ -35,8 +35,7 @@ test_with_servers!(test_push, |start_server| {
     common::run_git(&repo_dir, ["push", "origin", "main"])?;
 
     // Verify the bare repo was updated.
-    let bare_head =
-        common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"])?;
+    let bare_head = common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"])?;
     assert_eq!(
         bare_head, pushed_commit,
         "bare repo main should point to the pushed commit"

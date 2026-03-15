@@ -7,12 +7,12 @@ use axum::{
     Router,
 };
 
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::info;
 use mizzle::servers::axum::serve;
 use mizzle::traits::{PushRef, RepoAccess};
 use simple_logger::SimpleLogger;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
 
 struct Access {
     repo_path: String,
@@ -33,8 +33,15 @@ impl RepoAccess for Access {
     }
 }
 
-async fn git_handler(State(config): State<Arc<Config>>, Path(path): Path<String>, req: Request) -> Response {
-    let token = req.headers().get("Authorization").and_then(|v| v.to_str().ok());
+async fn git_handler(
+    State(config): State<Arc<Config>>,
+    Path(path): Path<String>,
+    req: Request,
+) -> Response {
+    let token = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok());
     if token != Some("Bearer secret") {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }

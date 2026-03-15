@@ -55,7 +55,13 @@ async fn git_get(
     let access = Access {
         repo_path: config.repo_path.clone(),
     };
-    handle_git_request(access, &path.to_string_lossy(), meta, Box::pin(futures_lite::io::empty())).await
+    handle_git_request(
+        access,
+        &path.to_string_lossy(),
+        meta,
+        Box::pin(futures_lite::io::empty()),
+    )
+    .await
 }
 
 #[post("/<path..>", data = "<data>")]

@@ -29,7 +29,10 @@ futures-util = { version = "0.3", default-features = false, features = ["sink", 
 gix-hash = "0.22.1"
 
 [dev-dependencies]
-tempfile = "3.25.0"
+async-net = "2.0.0"
+
+[dependencies.tempfile]
+version = "3.25.0"
 async-net = "2.0.0"
 
 [features]

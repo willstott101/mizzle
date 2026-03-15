@@ -4,15 +4,17 @@ use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use log::error;
 use piper::Writer;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use crate::traits::PushKind;
 
-/// Determines the push kind using only the ref OIDs, without opening the odb.
+/// Classifies a ref update without touching the object database.  Used for
+/// the preliminary auth check (before the pack is written) so cheap denials
+/// never hit the disk.
 ///
-/// `Create` and `Delete` can be determined definitively.  For any other update
-/// the kind is optimistically reported as `FastForward`; call
-/// [`compute_push_kind`] after the pack has been written to get the real answer.
+/// Create and Delete are definitive.  FastForward is optimistic — once the
+/// pack is in the odb, [`compute_push_kind`] may upgrade it to ForcePush.
 pub fn preliminary_push_kind(update: &RefUpdate) -> PushKind {
     if update.old_oid.is_null() {
         PushKind::Create
@@ -115,22 +117,63 @@ pub async fn read_receive_request<T: AsyncRead + Unpin>(
     Ok((ref_updates, pack_data))
 }
 
-/// Writes the received pack to the repository's object store.
+/// The pack and index files written by [`write_pack`].
 ///
-/// Call this before [`compute_push_kind`] so that new objects are available
-/// for the fast-forward reachability check.  If auth is later denied, the
-/// objects will remain but be unreachable until the next GC.
-pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<()> {
+/// If auth is denied after the pack has been written, call [`WrittenPack::delete`]
+/// to remove them.  Undeleted packs leave orphan objects that are cleaned up
+/// by the next `git gc`.
+pub struct WrittenPack {
+    pub pack: PathBuf,
+    pub index: PathBuf,
+}
+
+impl WrittenPack {
+    pub fn delete(self) {
+        let _ = std::fs::remove_file(&self.index);
+        let _ = std::fs::remove_file(&self.pack);
+    }
+}
+
+/// Returns the number of objects in the pack, parsed from the pack header.
+/// Returns `None` if the data is not a valid pack header.
+fn pack_object_count(data: &[u8]) -> Option<u32> {
+    if data.len() >= 12 && data[0..4] == *b"PACK" {
+        Some(u32::from_be_bytes(data[8..12].try_into().unwrap()))
+    } else {
+        None
+    }
+}
+
+/// Writes the received pack to the repository's object store and returns the
+/// paths of the written files, or `None` if the pack contained no objects
+/// (all referenced commits were already in the odb).
+///
+/// The pack is first written to a temporary directory inside `objects/` (same
+/// filesystem), then atomically renamed into `objects/pack/`.  This lets the
+/// caller call [`compute_push_kind`] with the full odb and then delete the pack
+/// on auth failure rather than leaving orphaned objects behind forever.
+pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<Option<WrittenPack>> {
+    // Nothing to write if the pack has no objects — they're already in the odb.
+    if pack_object_count(pack_data).unwrap_or(0) == 0 {
+        return Ok(None);
+    }
+
     let repo = gix::open(repo_path)?;
     let pack_dir = repo.path().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
+
+    // Write into a temp dir in /tmp; use a cross-filesystem move when renaming.
+    let temp_dir = tempfile::Builder::new()
+        .prefix("mizzle_")
+        .tempdir()
+        .context("creating temp dir for pack")?;
 
     let mut progress = gix_features::progress::Discard;
     let interrupt = AtomicBool::new(false);
 
     gix_pack::Bundle::write_to_directory(
         &mut std::io::BufReader::new(pack_data),
-        Some(&pack_dir),
+        Some(temp_dir.path()),
         &mut progress,
         &interrupt,
         None::<gix::objs::find::Never>,
@@ -138,6 +181,40 @@ pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<()> {
     )
     .context("indexing received pack")?;
 
+    // Locate the .pack and .idx files written into the temp dir.
+    let mut pack_src = None;
+    let mut idx_src = None;
+    for entry in std::fs::read_dir(temp_dir.path()).context("reading temp dir")? {
+        let path = entry?.path();
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("pack") => pack_src = Some(path),
+            Some("idx") => idx_src = Some(path),
+            _ => {}
+        }
+    }
+    let pack_src = pack_src.context("no .pack file written")?;
+    let idx_src = idx_src.context("no .idx file written")?;
+
+    // Move into the real pack directory (copy+delete fallback for cross-fs moves).
+    let pack_dst = pack_dir.join(pack_src.file_name().unwrap());
+    let idx_dst = pack_dir.join(idx_src.file_name().unwrap());
+    move_file(&pack_src, &pack_dst).context("moving pack file")?;
+    move_file(&idx_src, &idx_dst).context("moving index file")?;
+
+    Ok(Some(WrittenPack {
+        pack: pack_dst,
+        index: idx_dst,
+    }))
+}
+
+/// Moves `src` to `dst`, falling back to copy+delete when they are on different
+/// filesystems (which would cause `rename` to fail with EXDEV).
+fn move_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+    std::fs::copy(src, dst).context("copying file cross-filesystem")?;
+    std::fs::remove_file(src).context("removing source after copy")?;
     Ok(())
 }
 

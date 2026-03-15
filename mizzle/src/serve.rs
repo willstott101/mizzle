@@ -105,9 +105,10 @@ where
 
         let (ref_updates, pack_data) = res_try!(receive::read_receive_request(body).await);
 
-        // Preliminary auth: classify Create/Delete definitively, treat other
-        // updates optimistically as FastForward.  Runs before writing the pack
-        // so obviously-denied pushes (e.g. read-only repos) are cheap to reject.
+        // Preliminary auth check before touching the disk.  Create and Delete
+        // are definitive; FastForward is optimistic (may be upgraded to
+        // ForcePush once the pack is in the odb).  This lets us reject cheap
+        // denials without writing anything.
         let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
             .iter()
             .map(|u| crate::traits::PushRef {
@@ -116,16 +117,12 @@ where
             })
             .collect();
         if let Err(msg) = access.authorize_push(&preliminary_refs) {
-            let rejected: Vec<_> = ref_updates
-                .iter()
-                .map(|u| (u.refname.clone(), msg.clone()))
-                .collect();
             let (reader, writer) = piper::pipe(4096);
             spawn(Box::pin(async move {
                 let mut w = writer;
                 text_to_write(b"unpack ok", &mut w).await.unwrap();
-                for (refname, msg) in rejected {
-                    let line = format!("ng {} {}", refname, msg);
+                for update in &ref_updates {
+                    let line = format!("ng {} {}", update.refname, msg);
                     text_to_write(line.as_bytes(), &mut w).await.unwrap();
                 }
                 flush_to_write(&mut w).await.unwrap();
@@ -138,13 +135,17 @@ where
             };
         }
 
-        // Write the pack so new objects are in the odb for kind computation.
-        // If auth is later denied the objects stay unreachable until the next GC.
-        if !pack_data.is_empty() {
-            res_try!(receive::write_pack(repo_path.as_ref(), &pack_data));
-        }
+        // Write the pack into objects/pack/ via a temp dir so the move is
+        // atomic.  We get back the file paths so we can delete them if the
+        // final auth check fails — rejected pushes won't leave orphaned objects.
+        let written_pack = if !pack_data.is_empty() {
+            res_try!(receive::write_pack(repo_path.as_ref(), &pack_data))
+        } else {
+            None
+        };
 
-        // Final auth: now we can distinguish FastForward from ForcePush.
+        // Now that the pack is in the odb we can classify every ref correctly,
+        // including distinguishing FastForward from ForcePush.
         let repo = res_try!(gix::open(repo_path.as_ref()));
         let odb = repo.objects;
         let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
@@ -155,10 +156,15 @@ where
             })
             .collect();
         let rejected: Vec<(String, String)> = match access.authorize_push(&push_refs) {
-            Err(msg) => ref_updates
-                .iter()
-                .map(|u| (u.refname.clone(), msg.clone()))
-                .collect(),
+            Err(msg) => {
+                if let Some(pack) = written_pack {
+                    pack.delete();
+                }
+                ref_updates
+                    .iter()
+                    .map(|u| (u.refname.clone(), msg.clone()))
+                    .collect()
+            }
             Ok(()) => Vec::new(),
         };
 

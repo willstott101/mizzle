@@ -78,10 +78,6 @@ pub async fn serve<A: RepoAccess + Send>(access: A, path: &str, req: Request) ->
         )
         .await
         .into_response(),
-        None => (
-            StatusCode::BAD_REQUEST,
-            "Path doesn't look like a git URL",
-        )
-            .into_response(),
+        None => (StatusCode::BAD_REQUEST, "Path doesn't look like a git URL").into_response(),
     }
 }

@@ -280,10 +280,7 @@ pub fn axum_server(config: Config) -> ServerHandle {
     let config = Arc::new(config);
 
     let app = Router::new()
-        .route(
-            "/{*key}",
-            get(axum_git_handler).post(axum_git_handler),
-        )
+        .route("/{*key}", get(axum_git_handler).post(axum_git_handler))
         .with_state(config);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -414,7 +411,13 @@ mod rocket_handlers {
         let mut buf = Vec::new();
         let _ = data.open(512.mebibytes()).read_to_end(&mut buf).await;
         let reader = Box::pin(futures_lite::io::Cursor::new(buf));
-        mr::handle_git_request(config.inner().clone(), &path.to_string_lossy(), meta, reader).await
+        mr::handle_git_request(
+            config.inner().clone(),
+            &path.to_string_lossy(),
+            meta,
+            reader,
+        )
+        .await
     }
 }
 
@@ -477,12 +480,10 @@ pub fn rocket_server(config: Config) -> ServerHandle {
 macro_rules! test_with_servers {
     ($name:ident, |$start:ident| $body:block) => {
         mod $name {
-            use super::*;
             use super::common;
+            use super::*;
 
-            fn run(
-                $start: impl Fn(common::Config) -> common::ServerHandle,
-            ) -> anyhow::Result<()> {
+            fn run($start: impl Fn(common::Config) -> common::ServerHandle) -> anyhow::Result<()> {
                 $body
             }
 
