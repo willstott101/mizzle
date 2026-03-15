@@ -258,14 +258,16 @@ pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
     (port, stopper)
 }
 
-pub fn axum_server(config: Config) -> (u16, Sender<()>) {
+pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(
+    config: C,
+) -> (u16, Sender<()>) {
     init_logging();
 
     let config = Arc::new(config);
 
     // build our application with a single route
     let app = Router::new()
-        .route("/{*key}", get(axum_handler).post(axum_handler))
+        .route("/{*key}", get(axum_handler::<C>).post(axum_handler::<C>))
         .with_state(config);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
