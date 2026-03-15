@@ -8,6 +8,21 @@ use std::sync::atomic::AtomicBool;
 
 use crate::traits::PushKind;
 
+/// Determines the push kind using only the ref OIDs, without opening the odb.
+///
+/// `Create` and `Delete` can be determined definitively.  For any other update
+/// the kind is optimistically reported as `FastForward`; call
+/// [`compute_push_kind`] after the pack has been written to get the real answer.
+pub fn preliminary_push_kind(update: &RefUpdate) -> PushKind {
+    if update.old_oid.is_null() {
+        PushKind::Create
+    } else if update.new_oid.is_null() {
+        PushKind::Delete
+    } else {
+        PushKind::FastForward
+    }
+}
+
 /// Determines how a ref update changes the repository.  Takes the object
 /// database so the fast-forward check can walk the commit graph — the caller
 /// never needs to open the repo separately.
@@ -100,30 +115,12 @@ pub async fn read_receive_request<T: AsyncRead + Unpin>(
     Ok((ref_updates, pack_data))
 }
 
-/// Writes the received pack to the repository, updates refs, and sends the
-/// receive-pack result (unpack ok + per-ref ok lines) to `writer`.
-pub async fn perform_receive(
-    repo_path: &str,
-    ref_updates: Vec<RefUpdate>,
-    pack_data: Vec<u8>,
-    mut writer: Writer,
-) -> Result<()> {
-    if !pack_data.is_empty() {
-        write_pack(repo_path, &pack_data).context("writing received pack")?;
-    }
-    update_refs(repo_path, &ref_updates).context("updating refs")?;
-
-    text_to_write(b"unpack ok", &mut writer).await?;
-    for update in &ref_updates {
-        let msg = format!("ok {}", update.refname);
-        text_to_write(msg.as_bytes(), &mut writer).await?;
-    }
-    flush_to_write(&mut writer).await?;
-
-    Ok(())
-}
-
-fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<()> {
+/// Writes the received pack to the repository's object store.
+///
+/// Call this before [`compute_push_kind`] so that new objects are available
+/// for the fast-forward reachability check.  If auth is later denied, the
+/// objects will remain but be unreachable until the next GC.
+pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<()> {
     let repo = gix::open(repo_path)?;
     let pack_dir = repo.path().join("objects").join("pack");
     std::fs::create_dir_all(&pack_dir)?;
@@ -140,6 +137,25 @@ fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<()> {
         Default::default(),
     )
     .context("indexing received pack")?;
+
+    Ok(())
+}
+
+/// Updates refs and sends the receive-pack result (unpack ok + per-ref ok lines)
+/// to `writer`.  The pack must already have been written via [`write_pack`].
+pub async fn update_refs_and_report(
+    repo_path: &str,
+    ref_updates: Vec<RefUpdate>,
+    mut writer: Writer,
+) -> Result<()> {
+    update_refs(repo_path, &ref_updates).context("updating refs")?;
+
+    text_to_write(b"unpack ok", &mut writer).await?;
+    for update in &ref_updates {
+        let msg = format!("ok {}", update.refname);
+        text_to_write(msg.as_bytes(), &mut writer).await?;
+    }
+    flush_to_write(&mut writer).await?;
 
     Ok(())
 }

@@ -105,9 +105,46 @@ where
 
         let (ref_updates, pack_data) = res_try!(receive::read_receive_request(body).await);
 
-        // Auth check: open the repo once, compute push kind for each ref,
-        // and ask the callbacks whether it's allowed.  This happens before
-        // we touch the packfile so a rejection is cheap.
+        // Preliminary auth: classify Create/Delete definitively, treat other
+        // updates optimistically as FastForward.  Runs before writing the pack
+        // so obviously-denied pushes (e.g. read-only repos) are cheap to reject.
+        let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
+            .iter()
+            .map(|u| crate::traits::PushRef {
+                refname: &u.refname,
+                kind: receive::preliminary_push_kind(u),
+            })
+            .collect();
+        if let Err(msg) = access.authorize_push(&preliminary_refs) {
+            let rejected: Vec<_> = ref_updates
+                .iter()
+                .map(|u| (u.refname.clone(), msg.clone()))
+                .collect();
+            let (reader, writer) = piper::pipe(4096);
+            spawn(Box::pin(async move {
+                let mut w = writer;
+                text_to_write(b"unpack ok", &mut w).await.unwrap();
+                for (refname, msg) in rejected {
+                    let line = format!("ng {} {}", refname, msg);
+                    text_to_write(line.as_bytes(), &mut w).await.unwrap();
+                }
+                flush_to_write(&mut w).await.unwrap();
+            }));
+            return GitResponse {
+                status_code: 200,
+                content_type: Some("application/x-git-receive-pack-result".to_string()),
+                reader: Some(reader),
+                body: None,
+            };
+        }
+
+        // Write the pack so new objects are in the odb for kind computation.
+        // If auth is later denied the objects stay unreachable until the next GC.
+        if !pack_data.is_empty() {
+            res_try!(receive::write_pack(repo_path.as_ref(), &pack_data));
+        }
+
+        // Final auth: now we can distinguish FastForward from ForcePush.
         let repo = res_try!(gix::open(repo_path.as_ref()));
         let odb = repo.objects;
         let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
@@ -117,14 +154,12 @@ where
                 kind: receive::compute_push_kind(odb.clone().into_inner(), u),
             })
             .collect();
-        let auth_result = access.authorize_push(&push_refs);
-        let rejected: Vec<(String, String)> = if let Err(msg) = auth_result {
-            ref_updates
+        let rejected: Vec<(String, String)> = match access.authorize_push(&push_refs) {
+            Err(msg) => ref_updates
                 .iter()
                 .map(|u| (u.refname.clone(), msg.clone()))
-                .collect()
-        } else {
-            Vec::new()
+                .collect(),
+            Ok(()) => Vec::new(),
         };
 
         let (reader, writer) = piper::pipe(4096);
@@ -141,7 +176,7 @@ where
             }));
         } else {
             spawn(Box::pin(async move {
-                receive::perform_receive(repo_path.as_ref(), ref_updates, pack_data, writer)
+                receive::update_refs_and_report(repo_path.as_ref(), ref_updates, writer)
                     .await
                     .unwrap();
             }));
