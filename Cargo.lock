@@ -2126,7 +2126,6 @@ dependencies = [
  "anyhow",
  "async-net 2.0.0",
  "axum",
- "faster-hex",
  "form_urlencoded",
  "futures-lite 2.6.1",
  "futures-util",

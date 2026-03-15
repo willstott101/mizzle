@@ -13,6 +13,7 @@ pub struct PackObjects {
     pub objects: Vec<ObjectId>,
     /// Every object reachable from the `have` tips. These are safe delta bases
     /// for thin-pack creation, because the client is guaranteed to have them.
+    #[allow(dead_code)]
     pub have_set: HashSet<ObjectId>,
 }
 
