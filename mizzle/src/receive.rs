@@ -253,60 +253,60 @@ fn update_refs(repo_path: &str, updates: &[RefUpdate]) -> Result<()> {
     Ok(())
 }
 
-/// Sends the receive-pack ref advertisement in response to
-/// `GET /info/refs?service=git-receive-pack`.
-pub async fn info_refs_receive_pack_task(repo_path: Box<str>, mut writer: Writer) {
+/// Gathers the refs to advertise for a receive-pack discovery request.
+/// Called before spawning the response task so errors can be returned as a
+/// proper HTTP 500 instead of a truncated stream.
+pub fn gather_receive_pack_refs(repo_path: &str) -> Result<Vec<(ObjectId, String)>> {
+    let repo = gix::open(repo_path)?;
+    let mut result = Vec::new();
+    for r in repo.references()?.all()? {
+        let mut r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let name = r.name().as_bstr().to_string();
+        // Only advertise concrete refs, not HEAD or other symrefs.
+        if !name.starts_with("refs/") {
+            continue;
+        }
+        if let Ok(id) = r.peel_to_id() {
+            result.push((id.detach(), name));
+        }
+    }
+    Ok(result)
+}
+
+/// Writes the receive-pack ref advertisement to `writer`.  Expects pre-gathered
+/// refs from [`gather_receive_pack_refs`].
+pub async fn info_refs_receive_pack_task(refs: Vec<(ObjectId, String)>, mut writer: Writer) {
     let caps = b"report-status delete-refs agent=mizzle/dev";
-
-    let refs_result: Result<Vec<(ObjectId, String)>> = (|| {
-        let repo = gix::open(repo_path.as_ref())?;
-        let mut result = Vec::new();
-        for r in repo.references()?.all()? {
-            let mut r = r.map_err(|e| anyhow::anyhow!("{e}"))?;
-            let name = r.name().as_bstr().to_string();
-            // Only advertise concrete refs, not HEAD or other symrefs.
-            if !name.starts_with("refs/") {
-                continue;
-            }
-            if let Ok(id) = r.peel_to_id() {
-                result.push((id.detach(), name));
-            }
-        }
-        Ok(result)
-    })();
-
-    match refs_result {
-        Err(e) => error!("receive-pack info/refs: {}", e),
-        Ok(refs) => {
-            if refs.is_empty() {
-                // Empty repo: advertise capabilities only.
-                let null_oid = "0000000000000000000000000000000000000000";
+    let result: Result<()> = async {
+        if refs.is_empty() {
+            // Empty repo: advertise capabilities only.
+            let null_oid = "0000000000000000000000000000000000000000";
+            let mut line = Vec::new();
+            line.extend_from_slice(null_oid.as_bytes());
+            line.extend_from_slice(b" capabilities^{}");
+            line.push(b'\0');
+            line.extend_from_slice(caps);
+            text_to_write(&line, &mut writer).await?;
+        } else {
+            let mut first = true;
+            for (oid, name) in &refs {
                 let mut line = Vec::new();
-                line.extend_from_slice(null_oid.as_bytes());
-                line.extend_from_slice(b" capabilities^{}");
-                line.push(b'\0');
-                line.extend_from_slice(caps);
-                text_to_write(&line, &mut writer)
-                    .await
-                    .expect("write caps line");
-            } else {
-                let mut first = true;
-                for (oid, name) in &refs {
-                    let mut line = Vec::new();
-                    line.extend_from_slice(oid.to_hex().to_string().as_bytes());
-                    line.push(b' ');
-                    line.extend_from_slice(name.as_bytes());
-                    if first {
-                        line.push(b'\0');
-                        line.extend_from_slice(caps);
-                        first = false;
-                    }
-                    text_to_write(&line, &mut writer)
-                        .await
-                        .expect("write ref line");
+                line.extend_from_slice(oid.to_hex().to_string().as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(name.as_bytes());
+                if first {
+                    line.push(b'\0');
+                    line.extend_from_slice(caps);
+                    first = false;
                 }
+                text_to_write(&line, &mut writer).await?;
             }
-            flush_to_write(&mut writer).await.expect("flush");
         }
+        flush_to_write(&mut writer).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        error!("receive-pack info/refs write error: {}", e);
     }
 }

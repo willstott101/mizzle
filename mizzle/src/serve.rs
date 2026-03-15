@@ -60,15 +60,17 @@ where
             .split('&')
             .any(|kv| kv == "service=git-receive-pack")
     {
+        let refs = res_try!(receive::gather_receive_pack_refs(repo_path.as_ref()));
         let (reader, writer) = piper::pipe(4096);
-        let rp = repo_path.clone();
         spawn(Box::pin(async move {
             let mut w = writer;
-            text_to_write(b"# service=git-receive-pack", &mut w)
+            if text_to_write(b"# service=git-receive-pack", &mut w)
                 .await
-                .expect("write");
-            flush_to_write(&mut w).await.expect("flush");
-            receive::info_refs_receive_pack_task(rp, w).await;
+                .is_ok()
+                && flush_to_write(&mut w).await.is_ok()
+            {
+                receive::info_refs_receive_pack_task(refs, w).await;
+            }
         }));
         return GitResponse {
             status_code: 200,
@@ -182,9 +184,11 @@ where
             }));
         } else {
             spawn(Box::pin(async move {
-                receive::update_refs_and_report(repo_path.as_ref(), ref_updates, writer)
-                    .await
-                    .unwrap();
+                if let Err(e) =
+                    receive::update_refs_and_report(repo_path.as_ref(), ref_updates, writer).await
+                {
+                    error!("update_refs_and_report error: {:#}", e);
+                }
             }));
         }
 
@@ -217,9 +221,9 @@ where
                 let repo = res_try!(gix::open(repo_path.as_ref())).into_sync();
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
-                    ls_refs::perform_listrefs(&repo, &args, writer)
-                        .await
-                        .unwrap();
+                    if let Err(e) = ls_refs::perform_listrefs(&repo, &args, writer).await {
+                        error!("perform_listrefs error: {:#}", e);
+                    }
                 }));
                 return GitResponse {
                     status_code: 200,
@@ -235,9 +239,9 @@ where
                 let repo = res_try!(gix::open(repo_path.as_ref()));
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
-                    fetch::perform_fetch(repo.objects, &args, writer)
-                        .await
-                        .unwrap();
+                    if let Err(e) = fetch::perform_fetch(repo.objects, &args, writer).await {
+                        error!("perform_fetch error: {:#}", e);
+                    }
                 }));
                 return GitResponse {
                     status_code: 200,

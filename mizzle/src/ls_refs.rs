@@ -107,21 +107,16 @@ pub async fn perform_listrefs(
 ) -> anyhow::Result<()> {
     match get_head_info(repo, args)? {
         Some(packetline) => {
-            text_to_write(packetline.as_bytes(), &mut writer)
-                .await
-                .expect("to write to output");
+            text_to_write(packetline.as_bytes(), &mut writer).await?;
         }
         None => {
             if args.unborn {
-                text_to_write(b"unborn HEAD", &mut writer)
-                    .await
-                    .expect("to write to output");
+                text_to_write(b"unborn HEAD", &mut writer).await?;
             }
         }
     }
 
     for reference in repo.refs.iter()?.all()? {
-        // TODO: packet-line style error handling
         let r = reference?;
 
         // Filter requested refs and avoid peeling them
@@ -150,16 +145,13 @@ pub async fn perform_listrefs(
                             format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(),
                             &mut writer,
                         )
-                        .await
-                        .expect("to write to output");
+                        .await?;
                         continue;
                     }
                 }
                 // Either this isn't an annotated tag, or we weren't asked to peel
                 // So we just return the oid directly
-                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer)
-                    .await
-                    .expect("to write to output");
+                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer).await?;
             }
             // This is a symbolic reference (such as HEAD)
             gix_ref::Target::Symbolic(symref_target) => {
@@ -171,19 +163,14 @@ pub async fn perform_listrefs(
                         format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(),
                         &mut writer,
                     )
-                    .await
-                    .expect("to write to output");
+                    .await?;
                 } else {
-                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer)
-                        .await
-                        .expect("to write to output");
+                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer).await?;
                 }
             }
         }
     }
 
-    flush_to_write(&mut writer)
-        .await
-        .expect("to write to output");
+    flush_to_write(&mut writer).await?;
     Ok(())
 }

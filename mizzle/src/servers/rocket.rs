@@ -92,21 +92,11 @@ pub async fn handle_git_request<A: RepoAccess + Send>(
     body: BoxBody,
 ) -> RocketGitResponse {
     if meta.git_protocol.as_ref() != "version=2" {
-        return RocketGitResponse(GitResponse {
-            status_code: 501,
-            content_type: None,
-            reader: None,
-            body: Some("Only Git Protocol 2 is supported".to_string()),
-        });
+        return RocketGitResponse::error(501, "Only Git Protocol 2 is supported");
     }
 
     let Some((_, service_path)) = path.rsplit_once(".git/") else {
-        return RocketGitResponse(GitResponse {
-            status_code: 400,
-            content_type: None,
-            reader: None,
-            body: Some("Path doesn't look like a git URL".to_string()),
-        });
+        return RocketGitResponse::error(400, "Path doesn't look like a git URL");
     };
 
     RocketGitResponse(
