@@ -1,18 +1,17 @@
 use axum::{
     body::Body,
-    extract::{Path, Request, State},
+    extract::Request,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use futures_util::TryStreamExt;
 use std::io;
-use std::sync::Arc;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
     serve::{serve_git_protocol_2, GitResponse},
-    traits::GitServerCallbacks,
+    traits::RepoAccess,
 };
 
 impl IntoResponse for GitResponse {
@@ -33,12 +32,10 @@ impl IntoResponse for GitResponse {
     }
 }
 
-// #[axum::debug_handler]
-pub async fn axum_handler<T: GitServerCallbacks + Send + Sync + 'static>(
-    State(config): State<Arc<T>>,
-    path: Path<String>,
-    req: Request,
-) -> Response {
+/// Serve a git request.  Call this from your own handler after performing
+/// whatever authentication you need.  `path` is the full URL path (e.g.
+/// `"myrepo.git/info/refs"`).
+pub async fn serve<A: RepoAccess + Send>(access: A, path: &str, req: Request) -> Response {
     let git_protocol = req
         .headers()
         .get("Git-Protocol")
@@ -46,18 +43,19 @@ pub async fn axum_handler<T: GitServerCallbacks + Send + Sync + 'static>(
         .unwrap_or("version=2");
 
     if git_protocol != "version=2" {
-        println!("Only Git Protocol 2 is supported");
         return (
             StatusCode::NOT_IMPLEMENTED,
-            format!("Only Git Protocol 2 is supported"),
+            "Only Git Protocol 2 is supported",
         )
             .into_response();
     }
 
-    let content_type = match req.headers().get(header::CONTENT_TYPE) {
-        Some(header) => header.to_str().unwrap().into(),
-        None => "".into(),
-    };
+    let content_type: Box<str> = req
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("")
+        .into();
 
     let query_string: Box<str> = req.uri().query().unwrap_or("").into();
 
@@ -65,33 +63,24 @@ pub async fn axum_handler<T: GitServerCallbacks + Send + Sync + 'static>(
         .into_body()
         .into_data_stream()
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
-    let reader = StreamReader::new(stream);
+    let reader = StreamReader::new(stream).compat();
 
-    let reader = reader.compat();
-
-    let result = path.rsplit_once(".git/");
-    match result {
-        Some((git_repo_path, service_path)) => {
-            let repo_path_owned: Box<str> = git_repo_path.into();
-            let protocol_path_owned: Box<str> = service_path.into();
-            let full_repo_path = config.auth(repo_path_owned.as_ref());
-            let res = serve_git_protocol_2(
-                |fut| {
-                    tokio::spawn(fut);
-                },
-                config.clone(),
-                full_repo_path,
-                protocol_path_owned,
-                query_string,
-                content_type,
-                reader,
-            )
-            .await;
-            res.into_response()
-        }
+    match path.rsplit_once(".git/") {
+        Some((_, service_path)) => serve_git_protocol_2(
+            |fut| {
+                tokio::spawn(fut);
+            },
+            access,
+            service_path.into(),
+            query_string,
+            content_type,
+            reader,
+        )
+        .await
+        .into_response(),
         None => (
             StatusCode::BAD_REQUEST,
-            format!("Path doesn't look like a git URL"),
+            "Path doesn't look like a git URL",
         )
             .into_response(),
     }

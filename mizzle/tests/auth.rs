@@ -2,40 +2,116 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 use tempfile::tempdir;
 
-use mizzle::traits::{GitServerCallbacks, PushRef};
+use mizzle::traits::{PushRef, RepoAccess};
 
-// A config whose auth() always denies by returning an empty path.
+// An access type that allows reads but rejects all pushes.
 #[derive(Clone)]
-struct DenyAuthConfig;
+struct DenyPushAccess {
+    repo_path: Box<str>,
+}
 
-impl GitServerCallbacks for DenyAuthConfig {
-    fn auth(&self, _repo_path: &str) -> Box<str> {
-        "".into()
+impl RepoAccess for DenyPushAccess {
+    fn repo_path(&self) -> &str {
+        &self.repo_path
+    }
+
+    fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
+        Err("permission denied".into())
     }
 }
 
-// A config that allows reads but rejects all pushes.
-#[derive(Clone)]
-struct DenyPushConfig {
-    bare_repo_path: PathBuf,
+/// Spin up an axum server whose handler always returns 403 before calling mizzle.
+#[cfg(feature = "axum")]
+fn deny_all_server() -> common::ServerHandle {
+    use axum::{http::StatusCode, routing::get, Router};
+
+    let app = Router::new().route(
+        "/{*key}",
+        get(|| async { (StatusCode::FORBIDDEN, "access denied") })
+            .post(|| async { (StatusCode::FORBIDDEN, "access denied") }),
+    );
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+        })
+        .unwrap()
+    });
+
+    common::ServerHandle::new(port, move || {
+        let _ = tx.send(());
+    })
 }
 
-impl GitServerCallbacks for DenyPushConfig {
-    fn auth(&self, _repo_path: &str) -> Box<str> {
-        self.bare_repo_path.to_str().unwrap().into()
+/// Spin up an axum server that uses DenyPushAccess — reads work, pushes are rejected.
+#[cfg(feature = "axum")]
+fn deny_push_server(bare_repo_path: PathBuf) -> common::ServerHandle {
+    use axum::{
+        extract::{Path, Request, State},
+        response::Response,
+        routing::get,
+        Router,
+    };
+    use std::sync::Arc;
+
+    async fn handler(
+        State(repo_path): State<Arc<String>>,
+        Path(path): Path<String>,
+        req: Request,
+    ) -> Response {
+        let access = DenyPushAccess {
+            repo_path: repo_path.as_str().into(),
+        };
+        mizzle::servers::axum::serve(access, &path, req).await
     }
 
-    fn authorize_push(&self, _repo_path: &str, _refs: &[PushRef<'_>]) -> Result<(), String> {
-        Err("permission denied".to_string())
-    }
+    let repo_path = Arc::new(bare_repo_path.to_str().unwrap().to_string());
+    let app = Router::new()
+        .route("/{*key}", get(handler).post(handler))
+        .with_state(repo_path);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+        })
+        .unwrap()
+    });
+
+    common::ServerHandle::new(port, move || {
+        let _ = tx.send(());
+    })
 }
 
+#[cfg(feature = "axum")]
 #[test]
 fn test_clone_denied() {
     let temprepo = common::temprepo().unwrap();
-    let server = common::axum_server(DenyAuthConfig);
+    let server = deny_all_server();
 
     let clone_dir = tempdir().unwrap();
     let result = common::run_git(
@@ -53,14 +129,13 @@ fn test_clone_denied() {
     drop(temprepo);
 }
 
+#[cfg(feature = "axum")]
 #[test]
 fn test_push_denied() {
     let temprepo = common::temprepo().unwrap();
-    let server = common::axum_server(DenyPushConfig {
-        bare_repo_path: temprepo.path().clone(),
-    });
+    let server = deny_push_server(temprepo.path().clone());
 
-    // Clone succeeds (auth allows reads).
+    // Clone succeeds (reads are allowed).
     let clone_dir = tempdir().unwrap();
     common::run_git(
         clone_dir.path(),

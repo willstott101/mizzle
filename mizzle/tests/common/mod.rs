@@ -2,22 +2,22 @@
 
 use anyhow::{anyhow, bail, Result};
 #[cfg(feature = "axum")]
+use axum::extract::{Path, Request, State};
+#[cfg(feature = "axum")]
+use axum::response::Response;
+#[cfg(feature = "axum")]
 use axum::routing::get;
 #[cfg(feature = "axum")]
 use axum::Router;
-#[cfg(feature = "axum")]
-use mizzle::servers::axum::axum_handler;
-#[cfg(feature = "trillium_smol")]
-use mizzle::servers::trillium::trillium_handler;
-use mizzle::traits::GitServerCallbacks;
+use mizzle::traits::RepoAccess;
 use simple_logger::SimpleLogger;
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Once};
 use std::{fs, thread};
 #[cfg(feature = "trillium_smol")]
-use trillium::State;
+use trillium::State as TrilliumState;
 
 use tempfile::{tempdir, TempDir};
 
@@ -53,7 +53,7 @@ const FIXED_TIME: &str = "1700000000 +0000";
 /// 2) Create commits + refs in the working repo
 /// 3) Initialize bare repo
 /// 4) Push refs into the bare repo (including custom refs) via `git push --mirror` + explicit pushes
-fn create_bare_repo_with_refs(bare_dir: &Path) -> Result<()> {
+fn create_bare_repo_with_refs(bare_dir: &FsPath) -> Result<()> {
     // Ensure target doesn't already exist (or is empty).
     if bare_dir.exists() {
         bail!(
@@ -154,7 +154,7 @@ fn create_bare_repo_with_refs(bare_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run_git<I, S>(cwd: &Path, args: I) -> Result<String>
+pub fn run_git<I, S>(cwd: &FsPath, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -190,7 +190,7 @@ where
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn _run_git<I, S>(cwd: &Path, args: I) -> Result<String>
+fn _run_git<I, S>(cwd: &FsPath, args: I) -> Result<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -228,9 +228,9 @@ pub struct Config {
     pub bare_repo_path: PathBuf,
 }
 
-impl GitServerCallbacks for Config {
-    fn auth(&self, _repo_path: &str) -> Box<str> {
-        self.bare_repo_path.to_str().unwrap().into()
+impl RepoAccess for Config {
+    fn repo_path(&self) -> &str {
+        self.bare_repo_path.to_str().unwrap()
     }
 }
 
@@ -251,42 +251,39 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    pub fn new(port: u16, stop: impl FnOnce() + 'static) -> Self {
+        ServerHandle {
+            port,
+            stop: Box::new(stop),
+        }
+    }
+
     pub fn stop(self) {
         (self.stop)();
     }
 }
 
-#[cfg(feature = "trillium_smol")]
-pub fn trillium_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
-    init_logging();
-
-    let stopper = trillium_smol::Stopper::new();
-
-    let listener = smol::block_on(async_net::TcpListener::bind("127.0.0.1:0")).unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let server = trillium_smol::config()
-        .with_stopper(stopper.clone())
-        .with_prebound_server(listener);
-
-    thread::spawn(move || {
-        server.run((State::new(config), trillium_handler::<C>));
-    });
-
-    ServerHandle {
-        port,
-        stop: Box::new(move || stopper.stop()),
-    }
+// Concrete axum handler for the test Config type.
+#[cfg(feature = "axum")]
+async fn axum_git_handler(
+    State(config): State<Arc<Config>>,
+    Path(path): Path<String>,
+    req: Request,
+) -> Response {
+    mizzle::servers::axum::serve((*config).clone(), &path, req).await
 }
 
 #[cfg(feature = "axum")]
-pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
+pub fn axum_server(config: Config) -> ServerHandle {
     init_logging();
 
     let config = Arc::new(config);
 
     let app = Router::new()
-        .route("/{*key}", get(axum_handler::<C>).post(axum_handler::<C>))
+        .route(
+            "/{*key}",
+            get(axum_git_handler).post(axum_git_handler),
+        )
         .with_state(config);
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -308,28 +305,62 @@ pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> 
         .unwrap()
     });
 
-    ServerHandle {
-        port,
-        stop: Box::new(move || { let _ = tx.send(()); }),
-    }
+    ServerHandle::new(port, move || {
+        let _ = tx.send(());
+    })
+}
+
+// Concrete trillium handler for the test Config type.
+#[cfg(feature = "trillium_smol")]
+async fn trillium_git_handler(conn: trillium::Conn) -> trillium::Conn {
+    let config = conn.state::<Config>().unwrap().clone();
+    mizzle::servers::trillium::serve(config, conn).await
+}
+
+#[cfg(feature = "trillium_smol")]
+pub fn trillium_server(config: Config) -> ServerHandle {
+    init_logging();
+
+    let stopper = trillium_smol::Stopper::new();
+
+    let listener = smol::block_on(async_net::TcpListener::bind("127.0.0.1:0")).unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let server = trillium_smol::config()
+        .with_stopper(stopper.clone())
+        .with_prebound_server(listener);
+
+    thread::spawn(move || {
+        server.run((TrilliumState::new(config), trillium_git_handler));
+    });
+
+    ServerHandle::new(port, move || stopper.stop())
 }
 
 #[cfg(feature = "actix")]
-pub fn actix_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
+async fn actix_git_handler(
+    req: actix_web::HttpRequest,
+    payload: actix_web::web::Payload,
+    config: actix_web::web::Data<Config>,
+) -> actix_web::HttpResponse {
+    mizzle::servers::actix::serve(config.get_ref().clone(), req, payload).await
+}
+
+#[cfg(feature = "actix")]
+pub fn actix_server(config: Config) -> ServerHandle {
     use actix_web::{web, App, HttpServer};
-    use mizzle::servers::actix::actix_handler;
 
     init_logging();
 
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
 
-    let data = web::Data::new(config);
+    let data = actix_web::web::Data::new(config);
     let server = HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
-            .route("/{tail:.*}", web::get().to(actix_handler::<C>))
-            .route("/{tail:.*}", web::post().to(actix_handler::<C>))
+            .route("/{tail:.*}", web::get().to(actix_git_handler))
+            .route("/{tail:.*}", web::post().to(actix_git_handler))
     })
     .listen(listener)
     .unwrap()
@@ -341,13 +372,10 @@ pub fn actix_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) ->
         rt.block_on(server).unwrap();
     });
 
-    ServerHandle {
-        port,
-        stop: Box::new(move || {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(actix_handle.stop(false));
-        }),
-    }
+    ServerHandle::new(port, move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(actix_handle.stop(false));
+    })
 }
 
 // Concrete rocket route handlers for the test Config type.
@@ -360,7 +388,6 @@ mod rocket_handlers {
     use rocket::data::ToByteUnit;
     use rocket::tokio::io::AsyncReadExt;
     use rocket::{get, post, Data, State};
-    use std::sync::Arc;
 
     #[get("/<path..>")]
     pub async fn git_get(
@@ -368,11 +395,10 @@ mod rocket_handlers {
         meta: mr::GitRequestMeta,
         config: &State<Config>,
     ) -> mr::RocketGitResponse {
-        let config = Arc::new(config.inner().clone());
         mr::handle_git_request(
+            config.inner().clone(),
             &path.to_string_lossy(),
             meta,
-            config,
             Box::pin(futures_lite::io::empty()),
         )
         .await
@@ -385,11 +411,10 @@ mod rocket_handlers {
         config: &State<Config>,
         data: Data<'_>,
     ) -> mr::RocketGitResponse {
-        let config = Arc::new(config.inner().clone());
         let mut buf = Vec::new();
         let _ = data.open(512.mebibytes()).read_to_end(&mut buf).await;
         let reader = Box::pin(futures_lite::io::Cursor::new(buf));
-        mr::handle_git_request(&path.to_string_lossy(), meta, config, reader).await
+        mr::handle_git_request(config.inner().clone(), &path.to_string_lossy(), meta, reader).await
     }
 }
 
@@ -434,13 +459,10 @@ pub fn rocket_server(config: Config) -> ServerHandle {
 
     let shutdown = ready_rx.recv().unwrap();
 
-    ServerHandle {
-        port,
-        stop: Box::new(move || shutdown.notify()),
-    }
+    ServerHandle::new(port, move || shutdown.notify())
 }
 
-/// Generates `::axum` and `::trillium` sub-tests from a single body.
+/// Generates sub-tests from a single body, one per supported server framework.
 /// The body receives a `start_server: impl Fn(Config) -> ServerHandle` closure.
 ///
 /// Usage:

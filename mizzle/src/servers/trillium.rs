@@ -2,7 +2,7 @@ use trillium::Conn;
 
 use crate::{
     serve::{serve_git_protocol_2, GitResponse},
-    traits::GitServerCallbacks,
+    traits::RepoAccess,
 };
 
 impl GitResponse {
@@ -22,52 +22,45 @@ impl GitResponse {
     }
 }
 
-pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(
-    mut conn: trillium::Conn,
-) -> Conn {
-    let config = conn.state::<T>().unwrap();
+/// Serve a git request.  Call this from your own handler after performing
+/// whatever authentication you need.
+pub async fn serve<A: RepoAccess + Send>(access: A, mut conn: Conn) -> Conn {
     if conn
         .request_headers()
         .get_str("Git-Protocol")
         .unwrap_or("version=2")
         != "version=2"
     {
-        println!("Only Git Protocol 2 is supported");
         return conn
             .with_status(trillium::Status::NotImplemented)
             .with_body("Only Git Protocol 2 is supported")
             .halt();
     }
 
-    let content_type = match conn
+    let content_type: Box<str> = conn
         .request_headers()
         .get_str(trillium::KnownHeaderName::ContentType)
-    {
-        Some(header) => header.into(),
-        None => "".into(),
-    };
+        .map(Into::into)
+        .unwrap_or_else(|| "".into());
 
-    let result = conn.path().rsplit_once(".git/");
-    match result {
-        Some((git_repo_path, service_path)) => {
-            let repo_path_owned: Box<str> = git_repo_path.into();
-            let protocol_path_owned: Box<str> = service_path.into();
-            let query_string: Box<str> = conn.querystring().into();
-            let full_repo_path = config.auth(repo_path_owned.as_ref());
-            let callbacks = std::sync::Arc::new(config.clone());
+    let query_string: Box<str> = conn.querystring().into();
+    let path = conn.path().to_string();
+
+    match path.rsplit_once(".git/") {
+        Some((_, service_path)) => {
+            let protocol_path: Box<str> = service_path.into();
+            let body = conn.request_body().await;
             let res = serve_git_protocol_2(
                 |fut| {
                     trillium_smol::spawn(fut);
                 },
-                callbacks,
-                full_repo_path,
-                protocol_path_owned,
+                access,
+                protocol_path,
                 query_string,
                 content_type,
-                conn.request_body().await,
+                body,
             )
             .await;
-
             res.with_conn(conn)
         }
         None => conn

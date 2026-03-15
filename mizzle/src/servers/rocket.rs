@@ -3,15 +3,25 @@ use rocket::request::{FromRequest, Outcome, Request};
 use rocket::response::{self, Responder, Response};
 use std::io::Cursor;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use crate::{
     serve::{serve_git_protocol_2, GitResponse},
-    traits::GitServerCallbacks,
+    traits::RepoAccess,
 };
 
 /// Drop-in `Responder` wrapper around `GitResponse`.
 pub struct RocketGitResponse(pub GitResponse);
+
+impl RocketGitResponse {
+    pub fn error(status_code: u16, message: impl Into<String>) -> Self {
+        RocketGitResponse(GitResponse {
+            status_code,
+            content_type: None,
+            reader: None,
+            body: Some(message.into()),
+        })
+    }
+}
 
 impl<'r> Responder<'r, 'static> for RocketGitResponse {
     fn respond_to(self, _req: &'r Request<'_>) -> response::Result<'static> {
@@ -75,14 +85,15 @@ impl<'r> FromRequest<'r> for GitRequestMeta {
 
 type BoxBody = Pin<Box<dyn futures_lite::AsyncRead + Send + Unpin>>;
 
-/// Core handler logic — call this from your concrete `#[get]` / `#[post]` routes.
+/// Core handler logic — call this from your concrete `#[get]` / `#[post]` routes
+/// after performing whatever authentication you need.
 ///
 /// For GET requests pass `futures_lite::io::empty()` (boxed) as `body`.
 /// For POST requests open the `Data` with your size limit and pass the reader.
-pub async fn handle_git_request<T: GitServerCallbacks + Send + Sync + 'static>(
+pub async fn handle_git_request<A: RepoAccess + Send>(
+    access: A,
     path: &str,
     meta: GitRequestMeta,
-    config: Arc<T>,
     body: BoxBody,
 ) -> RocketGitResponse {
     if meta.git_protocol.as_ref() != "version=2" {
@@ -94,7 +105,7 @@ pub async fn handle_git_request<T: GitServerCallbacks + Send + Sync + 'static>(
         });
     }
 
-    let Some((git_repo_path, service_path)) = path.rsplit_once(".git/") else {
+    let Some((_, service_path)) = path.rsplit_once(".git/") else {
         return RocketGitResponse(GitResponse {
             status_code: 400,
             content_type: None,
@@ -103,18 +114,13 @@ pub async fn handle_git_request<T: GitServerCallbacks + Send + Sync + 'static>(
         });
     };
 
-    let repo_path_owned: Box<str> = git_repo_path.into();
-    let protocol_path_owned: Box<str> = service_path.into();
-    let full_repo_path = config.auth(repo_path_owned.as_ref());
-
     RocketGitResponse(
         serve_git_protocol_2(
             |fut| {
                 tokio::spawn(fut);
             },
-            config,
-            full_repo_path,
-            protocol_path_owned,
+            access,
+            service_path.into(),
             meta.query_string,
             meta.content_type,
             body,

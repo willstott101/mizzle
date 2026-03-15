@@ -1,13 +1,12 @@
 use actix_web::{web, HttpRequest, HttpResponse};
 use futures_util::TryStreamExt;
 use std::io;
-use std::sync::Arc;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
     serve::{serve_git_protocol_2, GitResponse},
-    traits::GitServerCallbacks,
+    traits::RepoAccess,
 };
 
 impl GitResponse {
@@ -28,10 +27,12 @@ impl GitResponse {
     }
 }
 
-pub async fn actix_handler<T: GitServerCallbacks + Send + Sync + 'static>(
+/// Serve a git request.  Call this from your own handler after performing
+/// whatever authentication you need.
+pub async fn serve<A: RepoAccess + Send>(
+    access: A,
     req: HttpRequest,
     payload: web::Payload,
-    config: web::Data<T>,
 ) -> HttpResponse {
     let git_protocol = req
         .headers()
@@ -51,33 +52,24 @@ pub async fn actix_handler<T: GitServerCallbacks + Send + Sync + 'static>(
         .into();
 
     let query_string: Box<str> = req.query_string().into();
-
-    // Strip the leading '/' from the path.
     let path = req.path().trim_start_matches('/');
 
     let stream = payload.map_err(|e| io::Error::new(io::ErrorKind::Other, e));
-    let reader = StreamReader::new(stream).compat(); // tokio AsyncRead → futures AsyncRead
+    let reader = StreamReader::new(stream).compat();
 
     match path.rsplit_once(".git/") {
-        Some((git_repo_path, service_path)) => {
-            let repo_path_owned: Box<str> = git_repo_path.into();
-            let protocol_path_owned: Box<str> = service_path.into();
-            let full_repo_path = config.auth(repo_path_owned.as_ref());
-            let callbacks = Arc::new(config.get_ref().clone());
-            serve_git_protocol_2(
-                |fut| {
-                    tokio::spawn(fut);
-                },
-                callbacks,
-                full_repo_path,
-                protocol_path_owned,
-                query_string,
-                content_type,
-                reader,
-            )
-            .await
-            .into_http_response()
-        }
+        Some((_, service_path)) => serve_git_protocol_2(
+            |fut| {
+                tokio::spawn(fut);
+            },
+            access,
+            service_path.into(),
+            query_string,
+            content_type,
+            reader,
+        )
+        .await
+        .into_http_response(),
         None => HttpResponse::BadRequest().body("Path doesn't look like a git URL"),
     }
 }

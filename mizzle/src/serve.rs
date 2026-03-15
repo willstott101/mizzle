@@ -1,4 +1,4 @@
-use crate::traits::GitServerCallbacks;
+use crate::traits::RepoAccess;
 use crate::{fetch, ls_refs, receive};
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
@@ -9,7 +9,6 @@ use log::{error, info};
 use piper::{Reader, Writer};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 pub struct GitResponse {
     pub status_code: u16,
@@ -38,10 +37,9 @@ macro_rules! res_try {
 
 pub type SpawnFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
-pub async fn serve_git_protocol_2<T, C, S>(
+pub async fn serve_git_protocol_2<T, A, S>(
     spawn: S,
-    callbacks: Arc<C>,
-    repo_path: Box<str>,
+    access: A,
     protocol_path: Box<str>,
     query_string: Box<str>,
     content_type: Box<str>,
@@ -49,9 +47,11 @@ pub async fn serve_git_protocol_2<T, C, S>(
 ) -> GitResponse
 where
     T: AsyncRead + Unpin,
-    C: GitServerCallbacks + Send + Sync + 'static,
+    A: RepoAccess + Send,
     S: Fn(SpawnFut),
 {
+    let repo_path: Box<str> = access.repo_path().into();
+
     info!("GIT {} {}", repo_path, protocol_path);
 
     // Receive-pack discovery: GET /info/refs?service=git-receive-pack
@@ -61,13 +61,14 @@ where
             .any(|kv| kv == "service=git-receive-pack")
     {
         let (reader, writer) = piper::pipe(4096);
+        let rp = repo_path.clone();
         spawn(Box::pin(async move {
             let mut w = writer;
             text_to_write(b"# service=git-receive-pack", &mut w)
                 .await
                 .expect("write");
             flush_to_write(&mut w).await.expect("flush");
-            receive::info_refs_receive_pack_task(repo_path, w).await;
+            receive::info_refs_receive_pack_task(rp, w).await;
         }));
         return GitResponse {
             status_code: 200,
@@ -116,7 +117,7 @@ where
                 kind: receive::compute_push_kind(odb.clone().into_inner(), u),
             })
             .collect();
-        let auth_result = callbacks.authorize_push(repo_path.as_ref(), &push_refs);
+        let auth_result = access.authorize_push(&push_refs);
         let rejected: Vec<(String, String)> = if let Err(msg) = auth_result {
             ref_updates
                 .iter()
