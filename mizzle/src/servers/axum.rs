@@ -39,7 +39,13 @@ pub async fn axum_handler<T: GitServerCallbacks>(
     path: Path<String>,
     req: Request,
 ) -> Response {
-    if req.headers().get("Git-Protocol").unwrap().to_str().unwrap() != "version=2" {
+    let git_protocol = req
+        .headers()
+        .get("Git-Protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("version=2");
+
+    if git_protocol != "version=2" {
         println!("Only Git Protocol 2 is supported");
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -52,6 +58,8 @@ pub async fn axum_handler<T: GitServerCallbacks>(
         Some(header) => header.to_str().unwrap().into(),
         None => "".into(),
     };
+
+    let query_string: Box<str> = req.uri().query().unwrap_or("").into();
 
     let stream = req
         .into_body()
@@ -71,6 +79,7 @@ pub async fn axum_handler<T: GitServerCallbacks>(
                 MizzleRuntime::Tokio,
                 full_repo_path,
                 protocol_path_owned,
+                query_string,
                 content_type,
                 reader,
             )
