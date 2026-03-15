@@ -8,6 +8,15 @@ mizzle is a library for:
 
 mizzle thanks gitoxide, git, and rust
 
+## Design rules
+
+**Authorisers must never open the repository.**
+`GitServerCallbacks` methods receive all the information needed to make an
+authorisation decision as plain values — repo path, ref name, and a `PushKind`
+enum that encodes create/delete/fast-forward/force.  If an authoriser needs to
+inspect the object graph it is a bug in mizzle's callback interface, not in the
+authoriser.
+
 
 Things to fix in git docs:
 

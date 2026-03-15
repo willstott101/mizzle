@@ -54,8 +54,10 @@ pub async fn trillium_handler<T: GitServerCallbacks + Send + Sync + 'static>(
             let protocol_path_owned: Box<str> = service_path.into();
             let query_string: Box<str> = conn.querystring().into();
             let full_repo_path = config.auth(repo_path_owned.as_ref());
+            let callbacks = std::sync::Arc::new(config.clone());
             let res = serve_git_protocol_2(
                 MizzleRuntime::Smol,
+                callbacks,
                 full_repo_path,
                 protocol_path_owned,
                 query_string,

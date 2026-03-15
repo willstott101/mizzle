@@ -6,6 +6,31 @@ use log::error;
 use piper::Writer;
 use std::sync::atomic::AtomicBool;
 
+use crate::traits::PushKind;
+
+/// Determines how a ref update changes the repository.  Takes the object
+/// database so the fast-forward check can walk the commit graph — the caller
+/// never needs to open the repo separately.
+pub fn compute_push_kind(odb: impl gix::objs::Find + Clone, update: &RefUpdate) -> PushKind {
+    if update.old_oid.is_null() {
+        return PushKind::Create;
+    }
+    if update.new_oid.is_null() {
+        return PushKind::Delete;
+    }
+
+    // Fast-forward if old_oid is an ancestor of new_oid,
+    // i.e. old_oid appears in the history when walking back from new_oid.
+    let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb)
+        .any(|r| r.map(|info| info.id == update.old_oid).unwrap_or(false));
+
+    if is_ff {
+        PushKind::FastForward
+    } else {
+        PushKind::ForcePush
+    }
+}
+
 #[derive(Debug)]
 pub struct RefUpdate {
     pub old_oid: ObjectId,

@@ -34,7 +34,7 @@ impl IntoResponse for GitResponse {
 }
 
 // #[axum::debug_handler]
-pub async fn axum_handler<T: GitServerCallbacks>(
+pub async fn axum_handler<T: GitServerCallbacks + Send + Sync + 'static>(
     State(config): State<Arc<T>>,
     path: Path<String>,
     req: Request,
@@ -77,6 +77,7 @@ pub async fn axum_handler<T: GitServerCallbacks>(
             let full_repo_path = config.auth(repo_path_owned.as_ref());
             let res = serve_git_protocol_2(
                 MizzleRuntime::Tokio,
+                config.clone(),
                 full_repo_path,
                 protocol_path_owned,
                 query_string,

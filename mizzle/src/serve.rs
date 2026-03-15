@@ -1,4 +1,5 @@
 use crate::{fetch, ls_refs, receive};
+use crate::traits::GitServerCallbacks;
 use anyhow::{Context, Error, Result};
 use futures_lite::AsyncRead;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
@@ -6,6 +7,7 @@ use gix_packetline::async_io::StreamingPeekableIter;
 use gix_packetline::PacketLineRef;
 use log::{error, info};
 use piper::{Reader, Writer};
+use std::sync::Arc;
 use trillium_smol;
 
 pub struct GitResponse {
@@ -38,8 +40,9 @@ pub enum MizzleRuntime {
     Smol,
 }
 
-pub async fn serve_git_protocol_2<T: AsyncRead + Unpin>(
+pub async fn serve_git_protocol_2<T: AsyncRead + Unpin, C: GitServerCallbacks + Send + Sync + 'static>(
     runtime: MizzleRuntime,
+    callbacks: Arc<C>,
     repo_path: Box<str>,
     protocol_path: Box<str>,
     query_string: Box<str>,
@@ -124,33 +127,85 @@ pub async fn serve_git_protocol_2<T: AsyncRead + Unpin>(
 
         let (ref_updates, pack_data) =
             res_try!(receive::read_receive_request(body).await);
+
+        // Auth check: open the repo once, compute push kind for each ref,
+        // and ask the callbacks whether it's allowed.  This happens before
+        // we touch the packfile so a rejection is cheap.
+        let repo = res_try!(gix::open(repo_path.as_ref()));
+        let odb = repo.objects;
+        let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
+            .iter()
+            .map(|u| crate::traits::PushRef {
+                refname: &u.refname,
+                kind: receive::compute_push_kind(odb.clone().into_inner(), u),
+            })
+            .collect();
+        let auth_result = callbacks.authorize_push(repo_path.as_ref(), &push_refs);
+        let rejected: Vec<(String, String)> = if let Err(msg) = auth_result {
+            ref_updates
+                .iter()
+                .map(|u| (u.refname.clone(), msg.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         let (reader, writer) = piper::pipe(4096);
-        match runtime {
-            MizzleRuntime::Tokio => {
-                tokio::spawn(async move {
-                    receive::perform_receive(
-                        repo_path.as_ref(),
-                        ref_updates,
-                        pack_data,
-                        writer,
-                    )
-                    .await
-                    .unwrap();
-                });
+
+        if !rejected.is_empty() {
+            match runtime {
+                MizzleRuntime::Tokio => {
+                    tokio::spawn(async move {
+                        let mut w = writer;
+                        text_to_write(b"unpack ok", &mut w).await.unwrap();
+                        for (refname, msg) in rejected {
+                            let line = format!("ng {} {}", refname, msg);
+                            text_to_write(line.as_bytes(), &mut w).await.unwrap();
+                        }
+                        flush_to_write(&mut w).await.unwrap();
+                    });
+                }
+                MizzleRuntime::Smol => {
+                    trillium_smol::spawn(async move {
+                        let mut w = writer;
+                        text_to_write(b"unpack ok", &mut w).await.unwrap();
+                        for (refname, msg) in rejected {
+                            let line = format!("ng {} {}", refname, msg);
+                            text_to_write(line.as_bytes(), &mut w).await.unwrap();
+                        }
+                        flush_to_write(&mut w).await.unwrap();
+                    });
+                }
             }
-            MizzleRuntime::Smol => {
-                trillium_smol::spawn(async move {
-                    receive::perform_receive(
-                        repo_path.as_ref(),
-                        ref_updates,
-                        pack_data,
-                        writer,
-                    )
-                    .await
-                    .unwrap();
-                });
+        } else {
+            match runtime {
+                MizzleRuntime::Tokio => {
+                    tokio::spawn(async move {
+                        receive::perform_receive(
+                            repo_path.as_ref(),
+                            ref_updates,
+                            pack_data,
+                            writer,
+                        )
+                        .await
+                        .unwrap();
+                    });
+                }
+                MizzleRuntime::Smol => {
+                    trillium_smol::spawn(async move {
+                        receive::perform_receive(
+                            repo_path.as_ref(),
+                            ref_updates,
+                            pack_data,
+                            writer,
+                        )
+                        .await
+                        .unwrap();
+                    });
+                }
             }
         }
+
         return GitResponse {
             status_code: 200,
             content_type: Some("application/x-git-receive-pack-result".to_string()),
