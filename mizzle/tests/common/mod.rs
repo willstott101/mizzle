@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_macros, unused_imports)]
+
 use anyhow::{anyhow, bail, Result};
 use axum::routing::get;
 use axum::Router;
@@ -239,7 +241,18 @@ pub fn init_logging() {
     });
 }
 
-pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
+pub struct ServerHandle {
+    pub port: u16,
+    stop: Box<dyn FnOnce()>,
+}
+
+impl ServerHandle {
+    pub fn stop(self) {
+        (self.stop)();
+    }
+}
+
+pub fn trillium_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
     init_logging();
 
     let stopper = trillium_smol::Stopper::new();
@@ -252,18 +265,20 @@ pub fn trillium_server(config: Config) -> (u16, trillium_smol::Stopper) {
         .with_prebound_server(listener);
 
     thread::spawn(move || {
-        server.run((State::new(config), trillium_handler::<Config>));
+        server.run((State::new(config), trillium_handler::<C>));
     });
 
-    (port, stopper)
+    ServerHandle {
+        port,
+        stop: Box::new(move || stopper.stop()),
+    }
 }
 
-pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> (u16, Sender<()>) {
+pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
     init_logging();
 
     let config = Arc::new(config);
 
-    // build our application with a single route
     let app = Router::new()
         .route("/{*key}", get(axum_handler::<C>).post(axum_handler::<C>))
         .with_state(config);
@@ -287,5 +302,46 @@ pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> 
         .unwrap()
     });
 
-    (port, tx)
+    ServerHandle {
+        port,
+        stop: Box::new(move || { let _ = tx.send(()); }),
+    }
 }
+
+/// Generates `::axum` and `::trillium` sub-tests from a single body.
+/// The body receives a `start_server: impl Fn(Config) -> ServerHandle` closure.
+///
+/// Usage:
+/// ```
+/// test_with_servers!(my_test, |start_server| {
+///     let server = start_server(Config { ... });
+///     // ... test using server.port
+///     server.stop();
+///     Ok(())
+/// });
+/// ```
+macro_rules! test_with_servers {
+    ($name:ident, |$start:ident| $body:block) => {
+        mod $name {
+            use super::*;
+            use super::common;
+
+            fn run(
+                $start: impl Fn(common::Config) -> common::ServerHandle,
+            ) -> anyhow::Result<()> {
+                $body
+            }
+
+            #[test]
+            fn axum() -> anyhow::Result<()> {
+                run(|c| common::axum_server(c))
+            }
+
+            #[test]
+            fn trillium() -> anyhow::Result<()> {
+                run(|c| common::trillium_server(c))
+            }
+        }
+    };
+}
+pub(super) use test_with_servers;

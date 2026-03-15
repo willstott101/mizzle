@@ -1,56 +1,25 @@
 mod common;
 
-use anyhow::Result;
 use tempfile::tempdir;
 
-use crate::common::{axum_server, trillium_server, Config};
+use common::{test_with_servers, Config};
 
-#[test]
-fn test_clone_trillium() -> Result<()> {
+test_with_servers!(test_clone, |start_server| {
     let temprepo = common::temprepo()?;
-
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
+    let server = start_server(config);
 
-    let (port, stopper) = trillium_server(config);
-
-    let git_output_from_server = common::run_git(
+    let git_output = common::run_git(
         tempdir()?.path(),
         [
             "clone",
-            format!("http://localhost:{}/test.git", port).as_ref(),
+            format!("http://localhost:{}/test.git", server.port).as_ref(),
         ],
     )?;
-    println!("{}", git_output_from_server);
+    println!("{}", git_output);
 
-    stopper.stop();
-
+    server.stop();
     Ok(())
-}
-
-#[test]
-fn test_clone_axum() -> Result<()> {
-    let temprepo = common::temprepo()?;
-
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-
-    let (port, tx) = axum_server(config);
-
-    let cloned = tempdir()?;
-
-    let git_output_from_server = common::run_git(
-        cloned.path(),
-        [
-            "clone",
-            format!("http://localhost:{}/test.git", port).as_ref(),
-        ],
-    )?;
-    println!("{:?}", git_output_from_server);
-
-    let _ = tx.send(());
-
-    Ok(())
-}
+});

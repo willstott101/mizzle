@@ -6,10 +6,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use anyhow::Result;
 use tempfile::tempdir;
 
-use common::{axum_server, Config};
+use common::{axum_server, test_with_servers, Config};
 
 /// A TCP proxy that sits between the git client and the mizzle server, recording
 /// all server→client bytes for every connection.  Run git commands through
@@ -240,35 +239,29 @@ fn is_thin_pack(pack: &[u8]) -> anyhow::Result<bool> {
     Ok(ref_delta_count > 0 && full_blob_count == 0)
 }
 
-#[test]
-fn test_fetch_axum() -> Result<()> {
+test_with_servers!(test_fetch, |start_server| {
     let temprepo = common::temprepo()?;
-
     let config = Config {
         bare_repo_path: temprepo.path().clone(),
     };
-
-    let (port, tx) = axum_server(config);
+    let server = start_server(config);
 
     let cloned = tempdir()?;
 
-    // Clone from the axum server
     common::run_git(
         cloned.path(),
         [
             "clone",
             "--branch",
             "main",
-            format!("http://localhost:{}/test.git", port).as_ref(),
+            format!("http://localhost:{}/test.git", server.port).as_ref(),
         ],
     )?;
 
     let clone_dir = cloned.path().join("test");
     let main_before = common::run_git(clone_dir.as_path(), ["rev-parse", "origin/main"])?;
 
-    // Add a new commit to the bare repo so the client can fetch it. We push via the
-    // filesystem to the same bare repo the server serves—not through HTTP (server
-    // doesn't support push).
+    // Add a new commit to the bare repo so the client can fetch it.
     let server_work = tempdir()?;
     common::run_git(
         server_work.path(),
@@ -284,7 +277,6 @@ fn test_fetch_axum() -> Result<()> {
     // Fetch the new commit from the server (via HTTP)
     common::run_git(clone_dir.as_path(), ["fetch", "origin", "main"])?;
 
-    // Verify we got the new commit
     let main_after = common::run_git(clone_dir.as_path(), ["rev-parse", "origin/main"])?;
     assert_eq!(
         main_after, new_commit,
@@ -292,10 +284,9 @@ fn test_fetch_axum() -> Result<()> {
     );
     assert_ne!(main_before, main_after, "origin/main should have advanced");
 
-    let _ = tx.send(());
-
+    server.stop();
     Ok(())
-}
+});
 
 // Verifies that the server correctly honours the `thin-pack` fetch capability.
 //
@@ -345,9 +336,10 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     // Pack all existing server objects so delta chains are built.
     common::run_git(&server, ["repack", "-a", "-d"])?;
 
-    let (server_port, tx) = axum_server(Config {
+    let handle = axum_server(Config {
         bare_repo_path: server.clone(),
     });
+    let server_port = handle.port;
 
     // A sniffing proxy forwards all traffic to the server and records every
     // server→client response.  All git HTTP operations below go through it.
@@ -415,6 +407,6 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
          the real git client received"
     );
 
-    let _ = tx.send(());
+    handle.stop();
     Ok(())
 }

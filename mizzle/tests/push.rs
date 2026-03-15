@@ -1,20 +1,16 @@
 mod common;
 
-use anyhow::Result;
 use std::fs;
 use tempfile::tempdir;
 
-use common::{axum_server, Config};
+use common::{test_with_servers, Config};
 
-#[test]
-fn test_push_axum() -> Result<()> {
+test_with_servers!(test_push, |start_server| {
     let temprepo = common::temprepo()?;
-
     let config = Config {
         bare_repo_path: temprepo.path().clone(),
     };
-
-    let (port, tx) = axum_server(config);
+    let server = start_server(config);
 
     // Clone the repo from the server.
     let clone_dir = tempdir()?;
@@ -24,7 +20,7 @@ fn test_push_axum() -> Result<()> {
             "clone",
             "--branch",
             "main",
-            &format!("http://localhost:{}/test.git", port),
+            &format!("http://localhost:{}/test.git", server.port),
         ],
     )?;
     let repo_dir = clone_dir.path().join("test");
@@ -39,12 +35,13 @@ fn test_push_axum() -> Result<()> {
     common::run_git(&repo_dir, ["push", "origin", "main"])?;
 
     // Verify the bare repo was updated.
-    let bare_head = common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"])?;
+    let bare_head =
+        common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"])?;
     assert_eq!(
         bare_head, pushed_commit,
         "bare repo main should point to the pushed commit"
     );
 
-    let _ = tx.send(());
+    server.stop();
     Ok(())
-}
+});

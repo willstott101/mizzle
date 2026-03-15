@@ -8,7 +8,7 @@ use trillium_smol;
 struct Config;
 
 impl GitServerCallbacks for Config {
-    fn auth(&self, repo_path: &str) -> Box<str> {
+    fn auth(&self, _repo_path: &str) -> Box<str> {
         let repo_root = ".";
 
         // format!("{}/{}", repo_root, repo_path).into()

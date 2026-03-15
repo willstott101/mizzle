@@ -1,15 +1,8 @@
-use anyhow::{bail, Context, Error, Result};
-use futures_lite::AsyncRead;
-use log::info;
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 use trillium::Method;
-use trillium::{conn_try, Conn};
 use trillium_client::Client;
 use trillium_smol;
-use trillium_smol::ClientConfig;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
     SimpleLogger::new()
@@ -24,7 +17,7 @@ fn main() {
                 .with_default_pool();
 
         if conn
-            .headers()
+            .request_headers()
             .get_str("Git-Protocol")
             .unwrap_or("version=2")
             != "version=2"

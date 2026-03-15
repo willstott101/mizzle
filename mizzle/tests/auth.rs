@@ -35,7 +35,7 @@ impl GitServerCallbacks for DenyPushConfig {
 #[test]
 fn test_clone_denied() {
     let temprepo = common::temprepo().unwrap();
-    let (port, tx) = common::axum_server(DenyAuthConfig);
+    let server = common::axum_server(DenyAuthConfig);
 
     let clone_dir = tempdir().unwrap();
     let result = common::run_git(
@@ -44,19 +44,19 @@ fn test_clone_denied() {
             "clone",
             "--branch",
             "main",
-            &format!("http://localhost:{}/test.git", port),
+            &format!("http://localhost:{}/test.git", server.port),
         ],
     );
 
     assert!(result.is_err(), "clone should have been rejected");
-    let _ = tx.send(());
+    server.stop();
     drop(temprepo);
 }
 
 #[test]
 fn test_push_denied() {
     let temprepo = common::temprepo().unwrap();
-    let (port, tx) = common::axum_server(DenyPushConfig {
+    let server = common::axum_server(DenyPushConfig {
         bare_repo_path: temprepo.path().clone(),
     });
 
@@ -68,7 +68,7 @@ fn test_push_denied() {
             "clone",
             "--branch",
             "main",
-            &format!("http://localhost:{}/test.git", port),
+            &format!("http://localhost:{}/test.git", server.port),
         ],
     )
     .unwrap();
@@ -91,5 +91,5 @@ fn test_push_denied() {
         "bare repo should not have been updated"
     );
 
-    let _ = tx.send(());
+    server.stop();
 }
