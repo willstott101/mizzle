@@ -1,9 +1,13 @@
 #![allow(dead_code, unused_macros, unused_imports)]
 
 use anyhow::{anyhow, bail, Result};
+#[cfg(feature = "axum")]
 use axum::routing::get;
+#[cfg(feature = "axum")]
 use axum::Router;
+#[cfg(feature = "axum")]
 use mizzle::servers::axum::axum_handler;
+#[cfg(feature = "trillium_smol")]
 use mizzle::servers::trillium::trillium_handler;
 use mizzle::traits::GitServerCallbacks;
 use simple_logger::SimpleLogger;
@@ -12,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Once};
 use std::{fs, thread};
-use tokio::sync::oneshot::Sender;
+#[cfg(feature = "trillium_smol")]
 use trillium::State;
 
 use tempfile::{tempdir, TempDir};
@@ -252,6 +256,7 @@ impl ServerHandle {
     }
 }
 
+#[cfg(feature = "trillium_smol")]
 pub fn trillium_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
     init_logging();
 
@@ -274,6 +279,7 @@ pub fn trillium_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C)
     }
 }
 
+#[cfg(feature = "axum")]
 pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
     init_logging();
 
@@ -308,6 +314,132 @@ pub fn axum_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> 
     }
 }
 
+#[cfg(feature = "actix")]
+pub fn actix_server<C: GitServerCallbacks + Send + Sync + 'static>(config: C) -> ServerHandle {
+    use actix_web::{web, App, HttpServer};
+    use mizzle::servers::actix::actix_handler;
+
+    init_logging();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let data = web::Data::new(config);
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(data.clone())
+            .route("/{tail:.*}", web::get().to(actix_handler::<C>))
+            .route("/{tail:.*}", web::post().to(actix_handler::<C>))
+    })
+    .listen(listener)
+    .unwrap()
+    .run();
+
+    let actix_handle = server.handle();
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(server).unwrap();
+    });
+
+    ServerHandle {
+        port,
+        stop: Box::new(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(actix_handle.stop(false));
+        }),
+    }
+}
+
+// Concrete rocket route handlers for the test Config type.
+// rocket's #[get]/#[post] macros don't support generic functions, so we define
+// them here with a concrete type and call through to the generic library helper.
+#[cfg(feature = "rocket")]
+mod rocket_handlers {
+    use super::Config;
+    use mizzle::servers::rocket as mr;
+    use rocket::data::ToByteUnit;
+    use rocket::tokio::io::AsyncReadExt;
+    use rocket::{get, post, Data, State};
+    use std::sync::Arc;
+
+    #[get("/<path..>")]
+    pub async fn git_get(
+        path: std::path::PathBuf,
+        meta: mr::GitRequestMeta,
+        config: &State<Config>,
+    ) -> mr::RocketGitResponse {
+        let config = Arc::new(config.inner().clone());
+        mr::handle_git_request(
+            &path.to_string_lossy(),
+            meta,
+            config,
+            Box::pin(futures_lite::io::empty()),
+        )
+        .await
+    }
+
+    #[post("/<path..>", data = "<data>")]
+    pub async fn git_post(
+        path: std::path::PathBuf,
+        meta: mr::GitRequestMeta,
+        config: &State<Config>,
+        data: Data<'_>,
+    ) -> mr::RocketGitResponse {
+        let config = Arc::new(config.inner().clone());
+        let mut buf = Vec::new();
+        let _ = data.open(512.mebibytes()).read_to_end(&mut buf).await;
+        let reader = Box::pin(futures_lite::io::Cursor::new(buf));
+        mr::handle_git_request(&path.to_string_lossy(), meta, config, reader).await
+    }
+}
+
+// Note: rocket handlers can't be generic, so rocket_server only accepts the
+// concrete test Config. Auth tests that use custom config types stay axum-only.
+#[cfg(feature = "rocket")]
+pub fn rocket_server(config: Config) -> ServerHandle {
+    init_logging();
+
+    // Briefly bind to port 0 to find a free port, then release it for rocket.
+    let port = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<rocket::Shutdown>();
+
+    thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let rocket_config = rocket::Config {
+                port,
+                address: "127.0.0.1".parse().unwrap(),
+                log_level: rocket::config::LogLevel::Off,
+                ..rocket::Config::default()
+            };
+            let ignited = rocket::custom(rocket_config)
+                .manage(config)
+                .mount(
+                    "/",
+                    rocket::routes![rocket_handlers::git_get, rocket_handlers::git_post],
+                )
+                .ignite()
+                .await
+                .unwrap();
+
+            let shutdown = ignited.shutdown();
+            ready_tx.send(shutdown).unwrap();
+            let _ = ignited.launch().await;
+        });
+    });
+
+    let shutdown = ready_rx.recv().unwrap();
+
+    ServerHandle {
+        port,
+        stop: Box::new(move || shutdown.notify()),
+    }
+}
+
 /// Generates `::axum` and `::trillium` sub-tests from a single body.
 /// The body receives a `start_server: impl Fn(Config) -> ServerHandle` closure.
 ///
@@ -332,14 +464,28 @@ macro_rules! test_with_servers {
                 $body
             }
 
+            #[cfg(feature = "axum")]
             #[test]
             fn axum() -> anyhow::Result<()> {
                 run(|c| common::axum_server(c))
             }
 
+            #[cfg(feature = "trillium_smol")]
             #[test]
             fn trillium() -> anyhow::Result<()> {
                 run(|c| common::trillium_server(c))
+            }
+
+            #[cfg(feature = "actix")]
+            #[test]
+            fn actix() -> anyhow::Result<()> {
+                run(|c| common::actix_server(c))
+            }
+
+            #[cfg(feature = "rocket")]
+            #[test]
+            fn rocket() -> anyhow::Result<()> {
+                run(|c| common::rocket_server(c))
             }
         }
     };

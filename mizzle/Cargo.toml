@@ -21,6 +21,8 @@ smol = { version = "2.0", optional = true }
 piper = "0.2"
 anyhow = "1.0"
 axum = { version = "0.8.8", features = ["macros"], optional = true  }
+actix-web = { version = "4", optional = true }
+rocket = { version = "0.5", optional = true }
 tokio = { version = "1.49.0", features = ["full", "macros", "rt-multi-thread"], optional = true  }
 tokio-util = { version = "0.7.18", features = ["compat", "io"], optional = true  }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
@@ -31,10 +33,24 @@ tempfile = "3.25.0"
 async-net = "2.0.0"
 
 [features]
-default = ["trillium_smol", "axum"]
+default = ["axum", "actix"]
 axum = ["dep:axum", "dep:tokio", "dep:tokio-util"]
 trillium_smol = ["dep:trillium", "dep:trillium-smol", "dep:smol"]
+actix = ["dep:actix-web", "dep:tokio", "dep:tokio-util"]
+rocket = ["dep:rocket", "dep:tokio", "dep:tokio-util"]
 
 [[example]]
 name = "axum"
 required-features = ["axum"]
+
+[[example]]
+name = "trillium"
+required-features = ["trillium_smol"]
+
+[[example]]
+name = "actix"
+required-features = ["actix"]
+
+[[example]]
+name = "rocket"
+required-features = ["rocket"]
