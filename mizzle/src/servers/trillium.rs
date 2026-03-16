@@ -24,7 +24,7 @@ impl GitResponse {
 
 /// Serve a git request.  Call this from your own handler after performing
 /// whatever authentication you need.
-pub async fn serve<A: RepoAccess + Send>(access: A, mut conn: Conn) -> Conn {
+pub async fn serve<A: RepoAccess + Send + 'static>(access: A, mut conn: Conn) -> Conn {
     if conn
         .request_headers()
         .get_str("Git-Protocol")

@@ -33,11 +33,38 @@ pub trait RepoAccess {
     fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
         Ok(())
     }
+
+    /// Called after all refs have been successfully updated on a push.
+    /// Cannot abort — refs are already written.  Use this for CI triggering,
+    /// notifications, audit logging, etc.  Spawning your own async task here
+    /// is fine if you need non-blocking behaviour.
+    fn post_receive(&self, _refs: &[PushRef<'_>]) {}
+
+    /// Return `true` to have mizzle initialise a bare repository at
+    /// [`repo_path`] if none exists yet when the first push arrives.
+    fn auto_init(&self) -> bool {
+        false
+    }
 }
 
 /// Convenience impl for deny-all access objects that are never constructed.
 impl RepoAccess for Infallible {
     fn repo_path(&self) -> &str {
         match *self {}
+    }
+}
+
+impl<T: RepoAccess + ?Sized> RepoAccess for Box<T> {
+    fn repo_path(&self) -> &str {
+        (**self).repo_path()
+    }
+    fn authorize_push(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
+        (**self).authorize_push(refs)
+    }
+    fn post_receive(&self, refs: &[PushRef<'_>]) {
+        (**self).post_receive(refs)
+    }
+    fn auto_init(&self) -> bool {
+        (**self).auto_init()
     }
 }

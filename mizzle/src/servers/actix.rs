@@ -29,7 +29,7 @@ impl GitResponse {
 
 /// Serve a git request.  Call this from your own handler after performing
 /// whatever authentication you need.
-pub async fn serve<A: RepoAccess + Send>(
+pub async fn serve<A: RepoAccess + Send + 'static>(
     access: A,
     req: HttpRequest,
     payload: web::Payload,

@@ -35,7 +35,7 @@ impl IntoResponse for GitResponse {
 /// Serve a git request.  Call this from your own handler after performing
 /// whatever authentication you need.  `path` is the full URL path (e.g.
 /// `"myrepo.git/info/refs"`).
-pub async fn serve<A: RepoAccess + Send>(access: A, path: &str, req: Request) -> Response {
+pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: Request) -> Response {
     let git_protocol = req
         .headers()
         .get("Git-Protocol")

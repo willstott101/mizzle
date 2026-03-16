@@ -218,17 +218,28 @@ fn move_file(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Initialises a bare repository at `repo_path` if none exists yet.
+/// Called before the first push when [`crate::traits::RepoAccess::auto_init`]
+/// returns `true`.
+pub fn init_bare_if_missing(repo_path: &str) -> Result<()> {
+    let path = std::path::Path::new(repo_path);
+    if !path.exists() {
+        gix::init_bare(path).with_context(|| format!("initialising bare repo at {repo_path}"))?;
+    }
+    Ok(())
+}
+
 /// Updates refs and sends the receive-pack result (unpack ok + per-ref ok lines)
 /// to `writer`.  The pack must already have been written via [`write_pack`].
 pub async fn update_refs_and_report(
     repo_path: &str,
-    ref_updates: Vec<RefUpdate>,
+    ref_updates: &[RefUpdate],
     mut writer: Writer,
 ) -> Result<()> {
-    update_refs(repo_path, &ref_updates).context("updating refs")?;
+    update_refs(repo_path, ref_updates).context("updating refs")?;
 
     text_to_write(b"unpack ok", &mut writer).await?;
-    for update in &ref_updates {
+    for update in ref_updates {
         let msg = format!("ok {}", update.refname);
         text_to_write(msg.as_bytes(), &mut writer).await?;
     }

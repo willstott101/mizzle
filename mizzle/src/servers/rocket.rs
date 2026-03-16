@@ -85,7 +85,7 @@ type BoxBody = Pin<Box<dyn futures_lite::AsyncRead + Send + Unpin>>;
 ///
 /// For GET requests pass `futures_lite::io::empty()` (boxed) as `body`.
 /// For POST requests open the `Data` with your size limit and pass the reader.
-pub async fn handle_git_request<A: RepoAccess + Send>(
+pub async fn handle_git_request<A: RepoAccess + Send + 'static>(
     access: A,
     path: &str,
     meta: GitRequestMeta,

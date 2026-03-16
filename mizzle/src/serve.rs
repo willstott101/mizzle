@@ -47,7 +47,7 @@ pub async fn serve_git_protocol_2<T, A, S>(
 ) -> GitResponse
 where
     T: AsyncRead + Unpin,
-    A: RepoAccess + Send,
+    A: RepoAccess + Send + 'static,
     S: Fn(SpawnFut),
 {
     let repo_path: Box<str> = access.repo_path().into();
@@ -60,6 +60,9 @@ where
             .split('&')
             .any(|kv| kv == "service=git-receive-pack")
     {
+        if access.auto_init() {
+            res_try!(receive::init_bare_if_missing(repo_path.as_ref()));
+        }
         let refs = res_try!(receive::gather_receive_pack_refs(repo_path.as_ref()));
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(async move {
@@ -190,11 +193,27 @@ where
                 }
             }));
         } else {
+            // Capture the (name, kind) pairs so post_receive can be called
+            // inside the spawn with owned data.
+            let owned_kinds: Vec<(String, crate::traits::PushKind)> = push_refs
+                .iter()
+                .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
+                .collect();
             spawn(Box::pin(async move {
-                if let Err(e) =
-                    receive::update_refs_and_report(repo_path.as_ref(), ref_updates, writer).await
+                match receive::update_refs_and_report(repo_path.as_ref(), &ref_updates, writer)
+                    .await
                 {
-                    error!("update_refs_and_report error: {:#}", e);
+                    Ok(()) => {
+                        let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
+                            .iter()
+                            .map(|(name, kind)| crate::traits::PushRef {
+                                refname: name.as_str(),
+                                kind: kind.clone(),
+                            })
+                            .collect();
+                        access.post_receive(&post_refs);
+                    }
+                    Err(e) => error!("update_refs_and_report error: {:#}", e),
                 }
             }));
         }
