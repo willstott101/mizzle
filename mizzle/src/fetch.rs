@@ -12,7 +12,10 @@ pub struct FetchArgs {
     /// Indicates to the server an object which the client wants to
     /// retrieve.  Wants can be anything and are not limited to
     /// advertised objects.
-    want: Vec<ObjectId>,
+    pub want: Vec<ObjectId>,
+    /// Ref names the client wants resolved and included, as an
+    /// alternative to specifying object IDs directly (ref-in-want).
+    pub want_refs: Vec<String>,
     /// Indicates to the server an object which the client has locally.
     /// This allows the server to make a packfile which only contains
     /// the objects that the client needs. Multiple 'have' lines can be
@@ -42,6 +45,9 @@ pub struct FetchArgs {
     /// to its base by position in pack rather than by an oid.  That is,
     /// they can read OBJ_OFS_DELTA (aka type 6) in a packfile.
     ofs_delta: bool,
+    /// Client will explicitly send `done`; server must not declare
+    /// `ready` on its own (wait-for-done).
+    pub wait_for_done: bool,
 }
 
 pub async fn read_fetch_args<T>(
@@ -56,12 +62,14 @@ where
     skip_till_delimiter(parser).await?; // TODO: Is this info we're skipping ever useful?
     let mut args = FetchArgs {
         want: Vec::new(),
+        want_refs: Vec::new(),
         have: Vec::new(),
         done: false,
         thin_pack: false,
         no_progress: false,
         include_tag: false,
         ofs_delta: false,
+        wait_for_done: false,
     };
     loop {
         let line = parser
@@ -73,24 +81,23 @@ where
             PacketLineRef::Delimiter => anyhow::bail!("unexpected delimiter"),
             PacketLineRef::Data(d) => {
                 let arg = d.strip_suffix(b"\n").unwrap_or(d);
-                match arg.strip_prefix(b"want ") {
-                    Some(oid) => args.want.push(ObjectId::from_hex(oid)?),
-                    None => {
-                        match arg.strip_prefix(b"have ") {
-                            Some(oid) => args.have.push(ObjectId::from_hex(oid)?),
-                            None => {
-                                match arg {
-                                    b"done" => args.done = true,
-                                    b"thin-pack" => args.thin_pack = true,
-                                    b"no-progress" => args.no_progress = true,
-                                    b"include-tag" => args.include_tag = true,
-                                    b"ofs-delta" => args.ofs_delta = true,
-                                    _ => anyhow::bail!("unrecognised fetch argument"),
-                                };
-                            }
-                        };
+                if let Some(oid) = arg.strip_prefix(b"want ") {
+                    args.want.push(ObjectId::from_hex(oid)?);
+                } else if let Some(oid) = arg.strip_prefix(b"have ") {
+                    args.have.push(ObjectId::from_hex(oid)?);
+                } else if let Some(refname) = arg.strip_prefix(b"want-ref ") {
+                    args.want_refs.push(String::from_utf8(refname.to_vec())?);
+                } else {
+                    match arg {
+                        b"done" => args.done = true,
+                        b"thin-pack" => args.thin_pack = true,
+                        b"no-progress" => args.no_progress = true,
+                        b"include-tag" => args.include_tag = true,
+                        b"ofs-delta" => args.ofs_delta = true,
+                        b"wait-for-done" => args.wait_for_done = true,
+                        _ => anyhow::bail!("unrecognised fetch argument"),
                     }
-                };
+                }
             }
         }
     }

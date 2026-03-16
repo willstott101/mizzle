@@ -260,9 +260,17 @@ where
             }
             Command::Empty => (),
             Command::Fetch => {
-                let args = res_try!(fetch::read_fetch_args(&mut parser).await);
-                info!("FETCH: {:?}", args);
+                let mut args = res_try!(fetch::read_fetch_args(&mut parser).await);
                 let repo = res_try!(gix::open(repo_path.as_ref()));
+                // Resolve any want-ref names to OIDs and add to wants.
+                for refname in &args.want_refs {
+                    if let Ok(mut r) = repo.find_reference(refname.as_str()) {
+                        if let Ok(id) = r.peel_to_id() {
+                            args.want.push(id.detach());
+                        }
+                    }
+                }
+                info!("FETCH: {:?}", args);
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
                     if let Err(e) = fetch::perform_fetch(repo.objects, &args, writer).await {
@@ -304,7 +312,7 @@ async fn info_refs_task(mut writer: Writer) {
     text_to_write(b"ls-refs=unborn", &mut writer)
         .await
         .expect("to write to output");
-    text_to_write(b"fetch", &mut writer)
+    text_to_write(b"fetch=ref-in-want wait-for-done", &mut writer)
         .await
         .expect("to write to output");
 
