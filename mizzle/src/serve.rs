@@ -211,7 +211,7 @@ where
                                 kind: kind.clone(),
                             })
                             .collect();
-                        access.post_receive(&post_refs);
+                        access.post_receive(&post_refs).await;
                     }
                     Err(e) => error!("update_refs_and_report error: {:#}", e),
                 }
