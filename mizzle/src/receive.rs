@@ -321,3 +321,21 @@ pub async fn info_refs_receive_pack_task(refs: Vec<(ObjectId, String)>, mut writ
         error!("receive-pack info/refs write error: {}", e);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_init_bare_if_missing_creates_empty_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("test.git");
+        assert!(!repo_path.exists());
+        init_bare_if_missing(repo_path.to_str().unwrap()).unwrap();
+        assert!(repo_path.exists());
+        let repo = gix::open(&repo_path).unwrap();
+        let refs: Vec<_> = repo.references().unwrap().all().unwrap().collect();
+        assert!(refs.is_empty(), "freshly init'd repo should have no refs");
+        // Calling again is a no-op (already exists)
+        init_bare_if_missing(repo_path.to_str().unwrap()).unwrap();
+    }
+}

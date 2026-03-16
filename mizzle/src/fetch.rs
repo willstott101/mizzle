@@ -208,9 +208,79 @@ pub async fn perform_fetch(
     }
 
     // TODO: Support shallow clones
-    // TODO: Support ref-in-want
     // TODO: Support packfile-uris (probably only useful for other backends)
-    // TODO: Support wait-for-done
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix_packetline::async_io::StreamingPeekableIter;
+
+    fn pkt_line(data: &[u8]) -> Vec<u8> {
+        let len = data.len() + 4;
+        let mut out = format!("{:04x}", len).into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    const PKT_DELIMITER: &[u8] = b"0001";
+    const PKT_FLUSH: &[u8] = b"0000";
+
+    #[test]
+    fn test_want_ref_parsed() {
+        futures_lite::future::block_on(async {
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"want-ref refs/heads/main\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let args = read_fetch_args(&mut parser).await.unwrap();
+
+            assert_eq!(args.want_refs, vec!["refs/heads/main".to_string()]);
+            assert!(args.want.is_empty());
+            assert!(!args.wait_for_done);
+        });
+    }
+
+    #[test]
+    fn test_wait_for_done_parsed() {
+        futures_lite::future::block_on(async {
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"wait-for-done\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let args = read_fetch_args(&mut parser).await.unwrap();
+
+            assert!(args.wait_for_done);
+        });
+    }
+
+    #[test]
+    fn test_want_ref_and_wait_for_done_together() {
+        futures_lite::future::block_on(async {
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"want-ref refs/heads/main\n"));
+            input.extend(pkt_line(b"want-ref refs/heads/dev\n"));
+            input.extend(pkt_line(b"wait-for-done\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let args = read_fetch_args(&mut parser).await.unwrap();
+
+            assert_eq!(
+                args.want_refs,
+                vec!["refs/heads/main".to_string(), "refs/heads/dev".to_string()]
+            );
+            assert!(args.wait_for_done);
+        });
+    }
 }
