@@ -29,7 +29,7 @@ authoriser.
 - [x] `wait-for-done`
 
 
-Things to fix in git docs:
+## Things to fix in git docs
 
 	S: 200 OK
 	S: <Some headers>
