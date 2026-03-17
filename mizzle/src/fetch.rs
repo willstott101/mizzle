@@ -109,7 +109,6 @@ pub async fn perform_fetch(
     args: &FetchArgs,
     mut writer: piper::Writer,
 ) -> anyhow::Result<()> {
-    let ready = false;
     let mut acks: Vec<ObjectId> = Vec::new();
 
     // output = acknowledgements flush-pkt |
@@ -118,35 +117,36 @@ pub async fn perform_fetch(
     //   packfile flush-pkt
 
     if !args.done {
-        // TODO: Calculate acks and readiness
         for id in args.have.iter() {
             if handle.clone().into_inner().exists(id) {
                 acks.push(id.clone());
             }
         }
 
+        // The server is ready to build a pack when it has at least one
+        // common object with the client — unless the client asked for
+        // wait-for-done, in which case the server must not declare
+        // readiness on its own.
+        let ready = !acks.is_empty() && !args.wait_for_done;
+
         text_to_write(b"acknowledgments", &mut writer).await?;
-        if !ready {
-            if acks.is_empty() {
-                text_to_write(b"NAK", &mut writer).await?;
-            } else {
-                for ack in acks {
-                    text_to_write(format!("ACK {}", ack).as_bytes(), &mut writer).await?;
-                }
+        if acks.is_empty() {
+            text_to_write(b"NAK", &mut writer).await?;
+        } else {
+            for ack in &acks {
+                text_to_write(format!("ACK {}", ack).as_bytes(), &mut writer).await?;
             }
+        }
+        if !ready {
             flush_to_write(&mut writer).await?;
             return Ok(());
         }
         text_to_write(b"ready", &mut writer).await?;
         delim_to_write(&mut writer).await?;
-    } else {
-        // TODO: Start building packfile
-        // See gitoxide-core/pack/create
-        // Uses
-        // gix_pack::data::output::count::objects
-        // gix_pack::data::output::entry::iter_from_counts
+        // Fall through to build packfile below.
+    }
 
-        // TODO: Allow for interuption on disconnect
+    {
         let should_interrupt = AtomicBool::new(false);
 
         let progress = gix_features::progress::Discard {};
@@ -217,6 +217,8 @@ pub async fn perform_fetch(
 mod tests {
     use super::*;
     use gix_packetline::async_io::StreamingPeekableIter;
+    use std::{fs, path::Path, process::Command};
+    use tempfile::tempdir;
 
     fn pkt_line(data: &[u8]) -> Vec<u8> {
         let len = data.len() + 4;
@@ -227,6 +229,83 @@ mod tests {
 
     const PKT_DELIMITER: &[u8] = b"0001";
     const PKT_FLUSH: &[u8] = b"0000";
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "T")
+            .env("GIT_AUTHOR_EMAIL", "t@t.com")
+            .env("GIT_AUTHOR_DATE", "1700000000 +0000")
+            .env("GIT_COMMITTER_NAME", "T")
+            .env("GIT_COMMITTER_EMAIL", "t@t.com")
+            .env("GIT_COMMITTER_DATE", "1700000000 +0000")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed:\n{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn rev_parse(cwd: &Path, rev: &str) -> ObjectId {
+        ObjectId::from_hex(git(cwd, &["rev-parse", rev]).as_bytes()).unwrap()
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-b", "main"]);
+        git(dir, &["config", "user.name", "T"]);
+        git(dir, &["config", "user.email", "t@t.com"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+    }
+
+    /// Read all pkt-line output from a Writer into a Vec of parsed lines.
+    /// Returns (lines, raw_bytes) where lines are decoded text strings.
+    fn collect_pkt_output(reader: piper::Reader) -> Vec<u8> {
+        use futures_lite::AsyncReadExt;
+        futures_lite::future::block_on(async {
+            let mut buf = Vec::new();
+            futures_lite::pin!(reader);
+            reader.read_to_end(&mut buf).await.unwrap();
+            buf
+        })
+    }
+
+    /// Parse pkt-line encoded data and return the text lines (without framing).
+    fn parse_pkt_lines(data: &[u8]) -> Vec<String> {
+        let mut pos = 0;
+        let mut lines = Vec::new();
+        while pos + 4 <= data.len() {
+            let len_hex = std::str::from_utf8(&data[pos..pos + 4]).unwrap();
+            let len = usize::from_str_radix(len_hex, 16).unwrap();
+            if len == 0 {
+                lines.push("<flush>".to_string());
+                pos += 4;
+                continue;
+            }
+            if len == 1 {
+                lines.push("<delim>".to_string());
+                pos += 4;
+                continue;
+            }
+            if pos + len > data.len() {
+                break;
+            }
+            let payload = &data[pos + 4..pos + len];
+            // Skip sideband channel bytes
+            if !payload.is_empty() && (payload[0] == 1 || payload[0] == 2 || payload[0] == 3) {
+                lines.push(format!("<band-{}>", payload[0]));
+            } else {
+                let s = String::from_utf8_lossy(payload);
+                lines.push(s.trim_end_matches('\n').to_string());
+            }
+            pos += len;
+        }
+        lines
+    }
 
     #[test]
     fn test_want_ref_parsed() {
@@ -282,5 +361,123 @@ mod tests {
             );
             assert!(args.wait_for_done);
         });
+    }
+
+    /// When the client sends haves that the server knows (without done),
+    /// the server should respond with ACKs + "ready" and include a packfile,
+    /// rather than requiring an extra round-trip.
+    #[test]
+    fn negotiation_sends_ready_when_haves_are_known() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let c1 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        let handle = gix::open(p).unwrap().objects;
+        let args = FetchArgs {
+            want: vec![c2],
+            want_refs: Vec::new(),
+            have: vec![c1],
+            done: false,
+            thin_pack: false,
+            no_progress: true,
+            include_tag: false,
+            ofs_delta: false,
+            wait_for_done: false,
+        };
+
+        let (reader, writer) = piper::pipe(65536);
+        futures_lite::future::block_on(async {
+            perform_fetch(handle, &args, writer).await.unwrap();
+        });
+
+        let raw = collect_pkt_output(reader);
+        let lines = parse_pkt_lines(&raw);
+
+        assert!(
+            lines.contains(&"acknowledgments".to_string()),
+            "expected acknowledgments section, got: {:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("ACK ")),
+            "expected ACK for known have, got: {:?}",
+            lines
+        );
+        assert!(
+            lines.contains(&"ready".to_string()),
+            "expected ready signal when haves are known, got: {:?}",
+            lines
+        );
+        assert!(
+            lines.contains(&"packfile".to_string()),
+            "expected packfile section after ready, got: {:?}",
+            lines
+        );
+    }
+
+    /// When wait-for-done is set and done is NOT sent, the server must NOT
+    /// send ready or a packfile — even if it knows all the haves.
+    #[test]
+    fn negotiation_no_ready_with_wait_for_done() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let c1 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        let handle = gix::open(p).unwrap().objects;
+        let args = FetchArgs {
+            want: vec![c2],
+            want_refs: Vec::new(),
+            have: vec![c1],
+            done: false,
+            thin_pack: false,
+            no_progress: true,
+            include_tag: false,
+            ofs_delta: false,
+            wait_for_done: true,
+        };
+
+        let (reader, writer) = piper::pipe(65536);
+        futures_lite::future::block_on(async {
+            perform_fetch(handle, &args, writer).await.unwrap();
+        });
+
+        let raw = collect_pkt_output(reader);
+        let lines = parse_pkt_lines(&raw);
+
+        assert!(
+            lines.iter().any(|l| l.starts_with("ACK ")),
+            "expected ACK lines, got: {:?}",
+            lines
+        );
+        assert!(
+            !lines.contains(&"ready".to_string()),
+            "server must NOT send ready when wait-for-done is set, got: {:?}",
+            lines
+        );
+        assert!(
+            !lines.contains(&"packfile".to_string()),
+            "server must NOT send packfile without done when wait-for-done is set, got: {:?}",
+            lines
+        );
     }
 }
