@@ -4,6 +4,41 @@ use tempfile::tempdir;
 
 use common::{test_with_servers, Config};
 
+test_with_servers!(test_clone_protocol_v1, |start_server| {
+    let temprepo = common::temprepo()?;
+    let config = Config {
+        bare_repo_path: temprepo.path(),
+    };
+    let server = start_server(config);
+
+    let clone_dir = tempdir()?;
+    // -c protocol.version=0 forces the client to use the old dumb HTTP
+    // discovery path (GET /info/refs?service=git-upload-pack) with no
+    // Git-Protocol header, which exercises our v1 upload-pack handler.
+    common::run_git(
+        clone_dir.path(),
+        [
+            "-c",
+            "protocol.version=0",
+            "clone",
+            "--branch",
+            "main",
+            format!("http://localhost:{}/test.git", server.port).as_ref(),
+        ],
+    )?;
+
+    let repo_dir = clone_dir.path().join("test");
+    let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
+    assert!(
+        log.lines().count() >= 2,
+        "v1 clone should have at least 2 commits, got:\n{}",
+        log
+    );
+
+    server.stop();
+    Ok(())
+});
+
 test_with_servers!(test_clone, |start_server| {
     let temprepo = common::temprepo()?;
     let config = Config {

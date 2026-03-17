@@ -130,8 +130,75 @@ where
     Ok(args)
 }
 
-pub async fn perform_fetch(
+/// Build a packfile from the given want/have sets, returning the raw pack bytes
+/// and the list of shallow boundary commits.
+fn build_pack_bytes(
     mut handle: gix::OdbHandle,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    deepen: Option<u32>,
+    filter: Option<&crate::pack::Filter>,
+    thin_pack: bool,
+) -> anyhow::Result<(Vec<u8>, Vec<ObjectId>)> {
+    handle.prevent_pack_unload();
+    handle.ignore_replacements = true;
+
+    let should_interrupt = AtomicBool::new(false);
+    let progress = gix_features::progress::Discard {};
+
+    let pack_objects = crate::pack::objects_for_fetch_filtered(
+        handle.clone().into_inner(),
+        want,
+        have,
+        deepen,
+        filter,
+    )?;
+
+    let shallow = pack_objects.shallow.clone();
+
+    let (counts, _) = gix_pack::data::output::count::objects(
+        handle.clone().into_inner(),
+        Box::new(pack_objects.objects.into_iter().map(Ok)),
+        &progress,
+        &should_interrupt,
+        gix_pack::data::output::count::objects::Options {
+            thread_limit: None,
+            chunk_size: 16,
+            input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
+        },
+    )?;
+    let counts: Vec<_> = counts.into_iter().collect();
+    let num_objects = counts.len();
+
+    let mut in_order_entries =
+        InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
+            counts,
+            handle.into_inner(),
+            Box::new(progress),
+            gix_pack::data::output::entry::iter_from_counts::Options {
+                thread_limit: None,
+                mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+                allow_thin_pack: thin_pack,
+                chunk_size: 16,
+                version: Default::default(),
+            },
+        ));
+
+    let mut buf: Vec<u8> = vec![];
+    let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
+        in_order_entries.by_ref(),
+        &mut buf,
+        num_objects as u32,
+        Default::default(),
+        gix_hash::Kind::default(),
+    );
+    pack_iter.try_for_each(|_| Ok::<_, anyhow::Error>(()))?;
+
+    Ok((buf, shallow))
+}
+
+pub async fn perform_fetch(
+    handle: gix::OdbHandle,
     args: &FetchArgs,
     mut writer: piper::Writer,
 ) -> anyhow::Result<()> {
@@ -172,89 +239,145 @@ pub async fn perform_fetch(
         // Fall through to build packfile below.
     }
 
-    {
-        let should_interrupt = AtomicBool::new(false);
+    let filter = args
+        .filter
+        .as_deref()
+        .map(crate::pack::Filter::parse)
+        .transpose()?;
+    let (pack_bytes, shallow) = build_pack_bytes(
+        handle, &args.want, &args.have, args.deepen, filter.as_ref(), args.thin_pack,
+    )?;
 
-        let progress = gix_features::progress::Discard {};
-
-        handle.prevent_pack_unload();
-        handle.ignore_replacements = true;
-
-        let filter = args
-            .filter
-            .as_deref()
-            .map(crate::pack::Filter::parse)
-            .transpose()?;
-        let pack_objects = crate::pack::objects_for_fetch_filtered(
-            handle.clone().into_inner(),
-            &args.want,
-            &args.have,
-            args.deepen,
-            filter.as_ref(),
-        )?;
-
-        // shallow-info section: tell the client which commits are shallow
-        // boundaries so it knows not to expect their parents.
-        if !pack_objects.shallow.is_empty() {
-            text_to_write(b"shallow-info", &mut writer).await?;
-            for id in &pack_objects.shallow {
-                text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
-            }
-            delim_to_write(&mut writer).await?;
+    // shallow-info section: tell the client which commits are shallow
+    // boundaries so it knows not to expect their parents.
+    if !shallow.is_empty() {
+        text_to_write(b"shallow-info", &mut writer).await?;
+        for id in &shallow {
+            text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
         }
-
-        let (counts, _) = gix_pack::data::output::count::objects(
-            handle.clone().into_inner(),
-            Box::new(pack_objects.objects.into_iter().map(|id| Ok(id))),
-            &progress,
-            &should_interrupt,
-            gix_pack::data::output::count::objects::Options {
-                thread_limit: None,
-                chunk_size: 16,
-                input_object_expansion:
-                    gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
-            },
-        )?;
-        let counts: Vec<_> = counts.into_iter().collect();
-
-        let num_objects = counts.len();
-
-        let mut in_order_entries = InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
-            counts,
-            handle.into_inner(),
-            Box::new(progress),
-            gix_pack::data::output::entry::iter_from_counts::Options {
-                thread_limit: None, // Use all cores
-                mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
-                allow_thin_pack: args.thin_pack,
-                chunk_size: 16,
-                version: Default::default(),
-            },
-        ));
-
-        let mut buf: Vec<u8> = vec![];
-
-        let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
-            in_order_entries.by_ref(),
-            &mut buf,
-            num_objects as u32,
-            Default::default(),
-            gix_hash::Kind::default(),
-        );
-
-        pack_iter.try_for_each(|_| Ok::<_, anyhow::Error>(()))?;
-
-        text_to_write(b"packfile", &mut writer).await?;
-
-        for chunk in buf.chunks(65516 - 16) {
-            band_to_write(Channel::Data, chunk, &mut writer).await?;
-        }
-
-        flush_to_write(&mut writer).await?;
+        delim_to_write(&mut writer).await?;
     }
 
-    // TODO: Support shallow clones
-    // TODO: Support packfile-uris (probably only useful for other backends)
+    text_to_write(b"packfile", &mut writer).await?;
+    for chunk in pack_bytes.chunks(65516 - 16) {
+        band_to_write(Channel::Data, chunk, &mut writer).await?;
+    }
+    flush_to_write(&mut writer).await?;
+
+    Ok(())
+}
+
+/// Parse a protocol v1 upload-pack POST body.
+///
+/// Format (stateless HTTP):
+/// ```text
+/// PKT-LINE(want <oid> [NUL <capabilities>]\n)
+/// PKT-LINE(want <oid>\n)*
+/// PKT-LINE(have <oid>\n)*
+/// flush (0000)
+/// PKT-LINE(done\n)
+/// ```
+pub async fn read_fetch_args_v1<T>(body: T) -> anyhow::Result<FetchArgs>
+where
+    T: futures_lite::AsyncRead + Unpin,
+{
+    let mut parser = gix_packetline::async_io::StreamingPeekableIter::new(body, &[], false);
+    let mut args = FetchArgs {
+        want: Vec::new(),
+        want_refs: Vec::new(),
+        have: Vec::new(),
+        done: false,
+        thin_pack: false,
+        no_progress: false,
+        include_tag: false,
+        ofs_delta: false,
+        wait_for_done: false,
+        deepen: None,
+        filter: None,
+    };
+
+    loop {
+        let line = parser
+            .read_line()
+            .await
+            .context("unexpected eof in v1 request body")???;
+        match line {
+            PacketLineRef::Flush => break,
+            PacketLineRef::Data(d) => {
+                let data = d.strip_suffix(b"\n").unwrap_or(d);
+                if let Some(rest) = data.strip_prefix(b"want ") {
+                    // The first want line carries space-separated capabilities
+                    // after the OID; subsequent want lines carry just the OID.
+                    let (oid_bytes, caps_opt) = match rest.iter().position(|&b| b == b' ') {
+                        Some(pos) => (&rest[..pos], Some(&rest[pos + 1..])),
+                        None => (rest, None),
+                    };
+                    args.want.push(ObjectId::from_hex(oid_bytes)?);
+                    if let Some(caps) = caps_opt {
+                        for cap in caps.split(|&b| b == b' ') {
+                            match cap {
+                                b"ofs-delta" => args.ofs_delta = true,
+                                b"thin-pack" => args.thin_pack = true,
+                                b"no-progress" => args.no_progress = true,
+                                b"include-tag" => args.include_tag = true,
+                                _ => {}
+                            }
+                        }
+                    }
+                } else if let Some(rest) = data.strip_prefix(b"have ") {
+                    args.have.push(ObjectId::from_hex(rest)?);
+                } else if let Some(depth) = data.strip_prefix(b"deepen ") {
+                    let n = std::str::from_utf8(depth)?
+                        .parse::<u32>()
+                        .map_err(|e| anyhow::anyhow!("invalid deepen value: {e}"))?;
+                    anyhow::ensure!(n != 0, "deepen 0 is not valid");
+                    args.deepen = Some(n);
+                } else if let Some(spec) = data.strip_prefix(b"filter ") {
+                    args.filter = Some(String::from_utf8(spec.to_vec())?);
+                }
+                // Unknown lines (shallow, agent, etc.) are silently ignored.
+            }
+            _ => {}
+        }
+    }
+
+    // After flush, check for `done`.
+    if let Some(Ok(Ok(PacketLineRef::Data(d)))) = parser.read_line().await {
+        if d.strip_suffix(b"\n").unwrap_or(d) == b"done" {
+            args.done = true;
+        }
+    }
+
+    Ok(args)
+}
+
+/// Send a protocol v1 upload-pack response: `NAK` followed by sideband pack data.
+///
+/// The pack content is still optimised against the client's `have` set even
+/// though we don't send per-object `ACK` lines (we don't advertise multi_ack).
+pub async fn perform_fetch_v1(
+    handle: gix::OdbHandle,
+    args: &FetchArgs,
+    mut writer: piper::Writer,
+) -> anyhow::Result<()> {
+    let filter = args
+        .filter
+        .as_deref()
+        .map(crate::pack::Filter::parse)
+        .transpose()?;
+    let (pack_bytes, shallow) = build_pack_bytes(
+        handle, &args.want, &args.have, args.deepen, filter.as_ref(), args.thin_pack,
+    )?;
+
+    // In v1, shallow boundaries are sent before the NAK.
+    for id in &shallow {
+        text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
+    }
+    text_to_write(b"NAK", &mut writer).await?;
+    for chunk in pack_bytes.chunks(65516 - 16) {
+        band_to_write(Channel::Data, chunk, &mut writer).await?;
+    }
+    flush_to_write(&mut writer).await?;
 
     Ok(())
 }

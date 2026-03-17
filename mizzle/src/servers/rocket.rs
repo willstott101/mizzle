@@ -5,7 +5,7 @@ use std::io::Cursor;
 use std::pin::Pin;
 
 use crate::{
-    serve::{serve_git_protocol_2, GitResponse},
+    serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse},
     traits::RepoAccess,
 };
 
@@ -72,7 +72,7 @@ impl<'r> FromRequest<'r> for GitRequestMeta {
             git_protocol: req
                 .headers()
                 .get_one("Git-Protocol")
-                .unwrap_or("version=2")
+                .unwrap_or("version=1")
                 .into(),
         })
     }
@@ -91,25 +91,33 @@ pub async fn handle_git_request<A: RepoAccess + Send + 'static>(
     meta: GitRequestMeta,
     body: BoxBody,
 ) -> RocketGitResponse {
-    if meta.git_protocol.as_ref() != "version=2" {
-        return RocketGitResponse::error(501, "Only Git Protocol 2 is supported");
-    }
-
     let Some((_, service_path)) = path.rsplit_once(".git/") else {
         return RocketGitResponse::error(400, "Path doesn't look like a git URL");
     };
 
-    RocketGitResponse(
-        serve_git_protocol_2(
-            |fut| {
-                tokio::spawn(fut);
-            },
-            access,
-            service_path.into(),
-            meta.query_string,
-            meta.content_type,
-            body,
+    if meta.git_protocol.as_ref() == "version=2" {
+        RocketGitResponse(
+            serve_git_protocol_2(
+                |fut| { tokio::spawn(fut); },
+                access,
+                service_path.into(),
+                meta.query_string,
+                meta.content_type,
+                body,
+            )
+            .await,
         )
-        .await,
-    )
+    } else {
+        RocketGitResponse(
+            serve_git_protocol_1(
+                |fut| { tokio::spawn(fut); },
+                access,
+                service_path.into(),
+                meta.query_string,
+                meta.content_type,
+                body,
+            )
+            .await,
+        )
+    }
 }

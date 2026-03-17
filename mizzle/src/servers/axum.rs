@@ -10,7 +10,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    serve::{serve_git_protocol_2, GitResponse},
+    serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse},
     traits::RepoAccess,
 };
 
@@ -40,15 +40,8 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: R
         .headers()
         .get("Git-Protocol")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("version=2");
-
-    if git_protocol != "version=2" {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "Only Git Protocol 2 is supported",
-        )
-            .into_response();
-    }
+        .unwrap_or("version=1")
+        .to_string();
 
     let content_type: Box<str> = req
         .headers()
@@ -65,11 +58,13 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: R
         .map_err(|err| io::Error::new(io::ErrorKind::Other, err));
     let reader = StreamReader::new(stream).compat();
 
-    match path.rsplit_once(".git/") {
-        Some((_, service_path)) => serve_git_protocol_2(
-            |fut| {
-                tokio::spawn(fut);
-            },
+    let Some((_, service_path)) = path.rsplit_once(".git/") else {
+        return (StatusCode::BAD_REQUEST, "Path doesn't look like a git URL").into_response();
+    };
+
+    if git_protocol.as_str() == "version=2" {
+        serve_git_protocol_2(
+            |fut| { tokio::spawn(fut); },
             access,
             service_path.into(),
             query_string,
@@ -77,7 +72,17 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: R
             reader,
         )
         .await
-        .into_response(),
-        None => (StatusCode::BAD_REQUEST, "Path doesn't look like a git URL").into_response(),
+        .into_response()
+    } else {
+        serve_git_protocol_1(
+            |fut| { tokio::spawn(fut); },
+            access,
+            service_path.into(),
+            query_string,
+            content_type,
+            reader,
+        )
+        .await
+        .into_response()
     }
 }

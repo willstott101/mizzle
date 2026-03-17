@@ -20,7 +20,7 @@ authoriser.
 ## TODO
 
 - [x] Shallow clone (`--depth N`) — essential for CI/CD workloads
-- [ ] Protocol v1 support — compatibility with older git clients and tooling that doesn't send `Git-Protocol: version=2`
+- [x] Protocol v1 support — compatibility with older git clients and tooling that doesn't send `Git-Protocol: version=2`
 - [x] Fetch negotiation — proper ACK/NAK handling so incremental fetches send minimal packs rather than always recomputing from scratch
 - [x] Server-side hooks — `post_receive` callback on `RepoAccess` called after refs are updated
 - [x] Repository auto-init — `auto_init()` on `RepoAccess`; mizzle calls `git init --bare` on first push if the path doesn't exist

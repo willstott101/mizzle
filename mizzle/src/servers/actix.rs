@@ -5,7 +5,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    serve::{serve_git_protocol_2, GitResponse},
+    serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse},
     traits::RepoAccess,
 };
 
@@ -38,11 +38,7 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
         .headers()
         .get("Git-Protocol")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("version=2");
-
-    if git_protocol != "version=2" {
-        return HttpResponse::NotImplemented().body("Only Git Protocol 2 is supported");
-    }
+        .unwrap_or("version=1");
 
     let content_type: Box<str> = req
         .headers()
@@ -57,11 +53,13 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
     let stream = payload.map_err(|e| io::Error::new(io::ErrorKind::Other, e));
     let reader = StreamReader::new(stream).compat();
 
-    match path.rsplit_once(".git/") {
-        Some((_, service_path)) => serve_git_protocol_2(
-            |fut| {
-                tokio::spawn(fut);
-            },
+    let Some((_, service_path)) = path.rsplit_once(".git/") else {
+        return HttpResponse::BadRequest().body("Path doesn't look like a git URL");
+    };
+
+    if git_protocol == "version=2" {
+        serve_git_protocol_2(
+            |fut| { tokio::spawn(fut); },
             access,
             service_path.into(),
             query_string,
@@ -69,7 +67,17 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
             reader,
         )
         .await
-        .into_http_response(),
-        None => HttpResponse::BadRequest().body("Path doesn't look like a git URL"),
+        .into_http_response()
+    } else {
+        serve_git_protocol_1(
+            |fut| { tokio::spawn(fut); },
+            access,
+            service_path.into(),
+            query_string,
+            content_type,
+            reader,
+        )
+        .await
+        .into_http_response()
     }
 }
