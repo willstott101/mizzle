@@ -312,7 +312,7 @@ async fn info_refs_task(mut writer: Writer) {
     text_to_write(b"ls-refs=unborn", &mut writer)
         .await
         .expect("to write to output");
-    text_to_write(b"fetch=ref-in-want wait-for-done shallow", &mut writer)
+    text_to_write(b"fetch=ref-in-want wait-for-done shallow filter", &mut writer)
         .await
         .expect("to write to output");
 

@@ -6,6 +6,26 @@ use gix::bstr::BStr;
 use gix::traverse::tree::{visit::Action, Visit};
 use gix::{objs::Find, ObjectId};
 
+/// Partial clone filter specification.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Filter {
+    /// `blob:none` — omit all blobs.
+    BlobNone,
+    /// `tree:0` — omit all trees (and blobs); only commits are included.
+    TreeNone,
+}
+
+impl Filter {
+    /// Parse a filter spec string as sent by the git client.
+    pub fn parse(spec: &str) -> anyhow::Result<Self> {
+        match spec {
+            "blob:none" => Ok(Filter::BlobNone),
+            "tree:0" => Ok(Filter::TreeNone),
+            _ => Err(anyhow!("unsupported filter: {spec}")),
+        }
+    }
+}
+
 /// The result of [`objects_for_fetch`].
 pub struct PackObjects {
     /// Objects to include in the pack: every commit, tree, and blob reachable
@@ -25,15 +45,6 @@ pub struct PackObjects {
 /// every object reachable from any commit in `want` that is not also reachable
 /// from any commit in `have`.
 ///
-/// Unlike a commit-graph hide + `TreeContents` expansion, this performs full
-/// object-level deduplication. Trees and blobs shared across the want/have
-/// boundary are excluded, producing a minimal pack. The tree-skip optimisation
-/// means that when a tree root is already known the entire subtree beneath it
-/// is skipped without further descent.
-///
-/// The returned [`PackObjects::have_set`] can be used by the caller to
-/// implement thin-pack creation, where delta bases are drawn from objects the
-/// client already holds.
 /// Collects all object IDs (commits, trees, blobs) needed to pack for a fetch:
 /// every object reachable from any commit in `want` that is not also reachable
 /// from any commit in `have`.
@@ -41,28 +52,63 @@ pub struct PackObjects {
 /// When `deepen` is `Some(n)`, only commits within `n` levels of the want tips
 /// are included; commits at the depth boundary are recorded in
 /// [`PackObjects::shallow`].
-pub fn objects_for_fetch_with_depth(
+///
+/// When `filter` is provided, objects matching the filter are omitted from the
+/// pack (partial clone).
+pub fn objects_for_fetch_filtered(
     odb: impl Find + Clone,
     want: &[ObjectId],
     have: &[ObjectId],
     deepen: Option<u32>,
+    filter: Option<&Filter>,
 ) -> anyhow::Result<PackObjects> {
     let have_set = build_have_set(odb.clone(), have)?;
 
+    // Separate wanted OIDs by type: commits go through graph traversal,
+    // non-commits (blobs/trees requested directly, e.g. lazy fetch after
+    // partial clone) are included as-is.
+    let mut commit_wants = Vec::new();
+    let mut direct_objects: HashSet<ObjectId> = HashSet::new();
+    let mut type_buf = Vec::new();
+    for &id in want {
+        match odb.try_find(&id, &mut type_buf) {
+            Ok(Some(obj)) => match obj.kind {
+                gix::object::Kind::Commit => commit_wants.push(id),
+                _ => {
+                    direct_objects.insert(id);
+                }
+            },
+            _ => commit_wants.push(id), // let traversal report the error
+        }
+    }
+
     let mut shallow = Vec::new();
     let want_commits: Vec<ObjectId> = if let Some(depth) = deepen {
-        // Depth-limited BFS from want tips.  Commits at the boundary
-        // (depth == limit) are included but their parents are not.
-        depth_limited_commits(odb.clone(), want, have, depth, &mut shallow)?
-    } else {
-        gix::traverse::commit::Simple::new(want.iter().copied(), odb.clone())
+        depth_limited_commits(odb.clone(), &commit_wants, have, depth, &mut shallow)?
+    } else if !commit_wants.is_empty() {
+        gix::traverse::commit::Simple::new(commit_wants.into_iter(), odb.clone())
             .hide(have.iter().copied())?
             .map(|r| r.map(|info| info.id))
             .collect::<Result<_, _>>()
             .map_err(|e| anyhow!("commit traversal: {e}"))?
+    } else {
+        Vec::new()
     };
 
-    let mut objects: HashSet<ObjectId> = HashSet::new();
+    // tree:0 — only commits, no trees or blobs.
+    if filter == Some(&Filter::TreeNone) {
+        let mut objects: Vec<ObjectId> = want_commits;
+        objects.extend(direct_objects);
+        return Ok(PackObjects {
+            objects,
+            have_set,
+            shallow,
+        });
+    }
+
+    let skip_blobs = filter == Some(&Filter::BlobNone);
+
+    let mut objects: HashSet<ObjectId> = direct_objects;
     let mut state = gix::traverse::tree::breadthfirst::State::default();
     let mut commit_buf = Vec::new();
     let mut tree_buf = Vec::new();
@@ -94,6 +140,7 @@ pub fn objects_for_fetch_with_depth(
             let mut visitor = WantVisitor {
                 have_set: &have_set,
                 result: &mut objects,
+                skip_blobs,
             };
             gix::traverse::tree::breadthfirst(root, &mut state, odb.clone(), &mut visitor)
                 .map_err(|e| anyhow!("tree walk: {e}"))?;
@@ -249,6 +296,7 @@ impl Visit for HaveVisitor<'_> {
 struct WantVisitor<'a> {
     have_set: &'a HashSet<ObjectId>,
     result: &'a mut HashSet<ObjectId>,
+    skip_blobs: bool,
 }
 
 impl Visit for WantVisitor<'_> {
@@ -268,6 +316,9 @@ impl Visit for WantVisitor<'_> {
     }
 
     fn visit_nontree(&mut self, entry: &gix::objs::tree::EntryRef<'_>) -> Action {
+        if self.skip_blobs {
+            return ControlFlow::Continue(false);
+        }
         let id = entry.oid.to_owned();
         if !self.have_set.contains(&id) {
             self.result.insert(id);
@@ -355,7 +406,7 @@ mod tests {
         git(p, &["commit", "-m", "init"]);
 
         let tip = rev_parse(p, "HEAD");
-        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[tip], &[], None)
+        let result: HashSet<_> = objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, None)
             .unwrap()
             .objects
             .into_iter()
@@ -385,7 +436,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
         let hello_blob = rev_parse(p, "HEAD:hello.txt");
 
-        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
+        let result: HashSet<_> = objects_for_fetch_filtered(open_odb(p), &[c2], &[c1], None, None)
             .unwrap()
             .objects
             .into_iter()
@@ -424,7 +475,7 @@ mod tests {
         git(p, &["commit", "-m", "C2"]);
         let c2 = rev_parse(p, "HEAD");
 
-        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
+        let result: HashSet<_> = objects_for_fetch_filtered(open_odb(p), &[c2], &[c1], None, None)
             .unwrap()
             .objects
             .into_iter()
@@ -453,7 +504,7 @@ mod tests {
         git(p, &["commit", "-m", "C1"]);
         let c1 = rev_parse(p, "HEAD");
 
-        let result = objects_for_fetch_with_depth(open_odb(p), &[c1], &[c1], None).unwrap();
+        let result = objects_for_fetch_filtered(open_odb(p), &[c1], &[c1], None, None).unwrap();
         assert!(result.objects.is_empty());
     }
 
@@ -497,7 +548,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
         let new_blob = rev_parse(p, "HEAD:new.txt");
 
-        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
+        let result: HashSet<_> = objects_for_fetch_filtered(open_odb(p), &[c2], &[c1], None, None)
             .unwrap()
             .objects
             .into_iter()
@@ -535,7 +586,7 @@ mod tests {
         git(p, &["commit", "-m", "C3"]);
         let c3 = rev_parse(p, "HEAD");
 
-        let result = objects_for_fetch_with_depth(open_odb(p), &[c3], &[], Some(1)).unwrap();
+        let result = objects_for_fetch_filtered(open_odb(p), &[c3], &[], Some(1), None).unwrap();
         let commits: HashSet<_> = result
             .objects
             .iter()
@@ -571,7 +622,7 @@ mod tests {
         git(p, &["commit", "-m", "C3"]);
         let c3 = rev_parse(p, "HEAD");
 
-        let result = objects_for_fetch_with_depth(open_odb(p), &[c3], &[], Some(2)).unwrap();
+        let result = objects_for_fetch_filtered(open_odb(p), &[c3], &[], Some(2), None).unwrap();
         let commits: HashSet<_> = result
             .objects
             .iter()
@@ -601,9 +652,82 @@ mod tests {
         git(p, &["commit", "-m", "C2"]);
         let c2 = rev_parse(p, "HEAD");
 
-        let result = objects_for_fetch_with_depth(open_odb(p), &[c2], &[], None).unwrap();
+        let result = objects_for_fetch_filtered(open_odb(p), &[c2], &[], None, None).unwrap();
         assert!(result.shallow.is_empty(), "no depth limit means no shallow commits");
         // Should have both commits plus trees and blobs
         assert!(result.objects.len() >= 4, "should have commits + trees + blobs");
+    }
+
+    // ── partial clone filters ───────────────────────────────────────────────
+
+    /// blob:none filter should include commits and trees but no blobs.
+    #[test]
+    fn filter_blob_none_excludes_blobs() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let tip = rev_parse(p, "HEAD");
+        let blob = rev_parse(p, "HEAD:a.txt");
+        let tree = rev_parse(p, "HEAD^{tree}");
+
+        let result =
+            objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, Some(&Filter::BlobNone))
+                .unwrap();
+        let objs: HashSet<_> = result.objects.into_iter().collect();
+
+        assert!(objs.contains(&tip), "commit should be included");
+        assert!(objs.contains(&tree), "tree should be included");
+        assert!(!objs.contains(&blob), "blob should be excluded with blob:none");
+    }
+
+    /// tree:0 filter should include only commits, no trees or blobs.
+    #[test]
+    fn filter_tree_none_excludes_trees_and_blobs() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let tip = rev_parse(p, "HEAD");
+        let blob = rev_parse(p, "HEAD:a.txt");
+        let tree = rev_parse(p, "HEAD^{tree}");
+
+        let result =
+            objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, Some(&Filter::TreeNone))
+                .unwrap();
+        let objs: HashSet<_> = result.objects.into_iter().collect();
+
+        assert!(objs.contains(&tip), "commit should be included");
+        assert!(!objs.contains(&tree), "tree should be excluded with tree:0");
+        assert!(!objs.contains(&blob), "blob should be excluded with tree:0");
+    }
+
+    /// No filter should include commits, trees, and blobs (baseline).
+    #[test]
+    fn filter_none_includes_all() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let tip = rev_parse(p, "HEAD");
+        let blob = rev_parse(p, "HEAD:a.txt");
+        let tree = rev_parse(p, "HEAD^{tree}");
+
+        let result =
+            objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, None).unwrap();
+        let objs: HashSet<_> = result.objects.into_iter().collect();
+
+        assert!(objs.contains(&tip), "commit should be included");
+        assert!(objs.contains(&tree), "tree should be included");
+        assert!(objs.contains(&blob), "blob should be included without a filter");
     }
 }

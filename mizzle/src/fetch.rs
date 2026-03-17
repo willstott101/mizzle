@@ -51,6 +51,9 @@ pub struct FetchArgs {
     /// Requests that the shallow clone/fetch should be cut at a specific
     /// depth, relative to the requested want tips.
     pub deepen: Option<u32>,
+    /// Partial clone filter specification. When set, the server omits
+    /// objects matching the filter from the packfile.
+    pub filter: Option<String>,
 }
 
 pub async fn read_fetch_args<T>(
@@ -74,6 +77,7 @@ where
         ofs_delta: false,
         wait_for_done: false,
         deepen: None,
+        filter: None,
     };
     loop {
         let line = parser
@@ -99,6 +103,8 @@ where
                         anyhow::bail!("deepen 0 is not valid");
                     }
                     args.deepen = Some(n);
+                } else if let Some(spec) = arg.strip_prefix(b"filter ") {
+                    args.filter = Some(String::from_utf8(spec.to_vec())?);
                 } else if arg.starts_with(b"deepen-since ")
                     || arg.starts_with(b"deepen-not ")
                     || arg.starts_with(b"deepen-relative")
@@ -174,11 +180,17 @@ pub async fn perform_fetch(
         handle.prevent_pack_unload();
         handle.ignore_replacements = true;
 
-        let pack_objects = crate::pack::objects_for_fetch_with_depth(
+        let filter = args
+            .filter
+            .as_deref()
+            .map(crate::pack::Filter::parse)
+            .transpose()?;
+        let pack_objects = crate::pack::objects_for_fetch_filtered(
             handle.clone().into_inner(),
             &args.want,
             &args.have,
             args.deepen,
+            filter.as_ref(),
         )?;
 
         // shallow-info section: tell the client which commits are shallow
@@ -428,6 +440,7 @@ mod tests {
             ofs_delta: false,
             wait_for_done: false,
             deepen: None,
+            filter: None,
         };
 
         let (reader, writer) = piper::pipe(65536);
@@ -490,6 +503,7 @@ mod tests {
             ofs_delta: false,
             wait_for_done: true,
             deepen: None,
+            filter: None,
         };
 
         let (reader, writer) = piper::pipe(65536);
@@ -568,6 +582,7 @@ mod tests {
             ofs_delta: false,
             wait_for_done: false,
             deepen: Some(1),
+            filter: None,
         };
 
         let (reader, writer) = piper::pipe(65536);
@@ -594,5 +609,22 @@ mod tests {
             "expected packfile section, got: {:?}",
             lines
         );
+    }
+
+    #[test]
+    fn test_filter_parsed() {
+        futures_lite::future::block_on(async {
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"filter blob:none\n"));
+            input.extend(pkt_line(b"done\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let args = read_fetch_args(&mut parser).await.unwrap();
+
+            assert_eq!(args.filter, Some("blob:none".to_string()));
+        });
     }
 }

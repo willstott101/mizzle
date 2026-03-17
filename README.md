@@ -24,7 +24,7 @@ authoriser.
 - [x] Fetch negotiation — proper ACK/NAK handling so incremental fetches send minimal packs rather than always recomputing from scratch
 - [x] Server-side hooks — `post_receive` callback on `RepoAccess` called after refs are updated
 - [x] Repository auto-init — `auto_init()` on `RepoAccess`; mizzle calls `git init --bare` on first push if the path doesn't exist
-- [ ] Partial clone filters (`--filter=blob:none`, `--filter=tree:0`)
+- [x] Partial clone filters (`--filter=blob:none`, `--filter=tree:0`)
 - [x] Ref-in-want
 - [x] `wait-for-done`
 
