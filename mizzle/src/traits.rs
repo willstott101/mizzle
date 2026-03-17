@@ -27,15 +27,39 @@ pub struct PushRef<'a> {
 /// Boxed future returned by [`RepoAccess::post_receive`].
 pub type PostReceiveFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
-/// Returned by your auth implementation.  Carries the resolved filesystem path
-/// and any per-request state needed for push checks.
+/// Per-request authorisation handle.
+///
+/// # Design contract
+///
+/// **Construction is where expensive work happens.**  Your framework resolves
+/// the authenticated user, loads their permissions, evaluates branch-protection
+/// rules, and stores the results in the `RepoAccess` value before handing it to
+/// mizzle.  By the time mizzle holds a `RepoAccess`, every subsequent call on
+/// it must be reducible to cheap value comparisons against data already in
+/// memory — no database queries, no HTTP calls, no file I/O.
+///
+/// This is intentional: it means auth adds no per-operation latency inside the
+/// hot path, and it keeps authorisation logic entirely in your code rather than
+/// spread across callbacks and hooks.
+///
+/// **Authorisers must never open the repository.**  [`authorize_push`] receives
+/// all the information needed to make a decision as plain values — ref name and
+/// a [`PushKind`] enum computed by mizzle.  The internal structure of the object
+/// graph is not visible to authorisers, and that is a feature: branch-protection
+/// rules, glob patterns, team membership, and any other policy are your concern,
+/// not mizzle's.  If an authoriser needs to inspect the object graph it is a bug
+/// in mizzle's callback interface, not in the authoriser.
+///
+/// [`authorize_push`]: RepoAccess::authorize_push
 pub trait RepoAccess {
     /// Filesystem path of the repository to serve.
     fn repo_path(&self) -> &str;
 
-    /// Called once per push with all requested ref updates, after push kinds
-    /// have been computed.  Return `Err(reason)` to reject the entire push;
-    /// `reason` is sent back to the client.
+    /// Called once per push with all requested ref updates, after mizzle has
+    /// computed the [`PushKind`] for each ref.  Return `Err(reason)` to reject
+    /// the entire push; `reason` is forwarded to the client.
+    ///
+    /// This must be cheap — see the [design contract](RepoAccess#design-contract).
     fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
         Ok(())
     }
