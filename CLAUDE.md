@@ -1,0 +1,1 @@
+Use `cargo fmt` before comitting.
