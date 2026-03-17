@@ -59,7 +59,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
 
     if git_protocol == "version=2" {
         serve_git_protocol_2(
-            |fut| { tokio::spawn(fut); },
+            |fut| {
+                tokio::spawn(fut);
+            },
             access,
             service_path.into(),
             query_string,
@@ -70,7 +72,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
         .into_http_response()
     } else {
         serve_git_protocol_1(
-            |fut| { tokio::spawn(fut); },
+            |fut| {
+                tokio::spawn(fut);
+            },
             access,
             service_path.into(),
             query_string,

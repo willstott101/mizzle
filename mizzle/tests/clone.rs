@@ -171,10 +171,7 @@ test_with_servers!(test_partial_clone_tree_none, |start_server| {
     );
 
     // Verify by checking that git recognizes it as a partial clone.
-    let is_partial = common::run_git(
-        &repo_dir,
-        ["config", "--get", "remote.origin.promisor"],
-    )?;
+    let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
     assert_eq!(is_partial, "true", "should be a promisor/partial clone");
 
     server.stop();
@@ -210,10 +207,7 @@ test_with_servers!(test_partial_clone_blob_none, |start_server| {
     );
 
     // Verify by checking that git recognizes it as a partial clone.
-    let is_partial = common::run_git(
-        &repo_dir,
-        ["config", "--get", "remote.origin.promisor"],
-    )?;
+    let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
     assert_eq!(is_partial, "true", "should be a promisor/partial clone");
 
     server.stop();

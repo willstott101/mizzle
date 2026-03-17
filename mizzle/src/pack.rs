@@ -595,9 +595,19 @@ mod tests {
             .collect();
 
         assert!(commits.contains(&c3), "tip commit should be included");
-        assert!(!commits.contains(&c2), "parent commit should be excluded at depth 1");
-        assert!(!commits.contains(&c1), "grandparent commit should be excluded at depth 1");
-        assert_eq!(result.shallow, vec![c3], "tip should be the shallow boundary");
+        assert!(
+            !commits.contains(&c2),
+            "parent commit should be excluded at depth 1"
+        );
+        assert!(
+            !commits.contains(&c1),
+            "grandparent commit should be excluded at depth 1"
+        );
+        assert_eq!(
+            result.shallow,
+            vec![c3],
+            "tip should be the shallow boundary"
+        );
     }
 
     /// depth=2 should include the tip and its immediate parent.
@@ -631,9 +641,19 @@ mod tests {
             .collect();
 
         assert!(commits.contains(&c3), "tip should be included");
-        assert!(commits.contains(&c2), "parent should be included at depth 2");
-        assert!(!commits.contains(&c1), "grandparent should be excluded at depth 2");
-        assert_eq!(result.shallow, vec![c2], "parent should be the shallow boundary");
+        assert!(
+            commits.contains(&c2),
+            "parent should be included at depth 2"
+        );
+        assert!(
+            !commits.contains(&c1),
+            "grandparent should be excluded at depth 2"
+        );
+        assert_eq!(
+            result.shallow,
+            vec![c2],
+            "parent should be the shallow boundary"
+        );
     }
 
     /// No depth limit (None) should return all commits as before, with no shallow entries.
@@ -653,9 +673,15 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
 
         let result = objects_for_fetch_filtered(open_odb(p), &[c2], &[], None, None).unwrap();
-        assert!(result.shallow.is_empty(), "no depth limit means no shallow commits");
+        assert!(
+            result.shallow.is_empty(),
+            "no depth limit means no shallow commits"
+        );
         // Should have both commits plus trees and blobs
-        assert!(result.objects.len() >= 4, "should have commits + trees + blobs");
+        assert!(
+            result.objects.len() >= 4,
+            "should have commits + trees + blobs"
+        );
     }
 
     // ── partial clone filters ───────────────────────────────────────────────
@@ -681,7 +707,10 @@ mod tests {
 
         assert!(objs.contains(&tip), "commit should be included");
         assert!(objs.contains(&tree), "tree should be included");
-        assert!(!objs.contains(&blob), "blob should be excluded with blob:none");
+        assert!(
+            !objs.contains(&blob),
+            "blob should be excluded with blob:none"
+        );
     }
 
     /// tree:0 filter should include only commits, no trees or blobs.
@@ -722,12 +751,14 @@ mod tests {
         let blob = rev_parse(p, "HEAD:a.txt");
         let tree = rev_parse(p, "HEAD^{tree}");
 
-        let result =
-            objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, None).unwrap();
+        let result = objects_for_fetch_filtered(open_odb(p), &[tip], &[], None, None).unwrap();
         let objs: HashSet<_> = result.objects.into_iter().collect();
 
         assert!(objs.contains(&tip), "commit should be included");
         assert!(objs.contains(&tree), "tree should be included");
-        assert!(objs.contains(&blob), "blob should be included without a filter");
+        assert!(
+            objs.contains(&blob),
+            "blob should be included without a filter"
+        );
     }
 }

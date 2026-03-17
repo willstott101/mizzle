@@ -170,19 +170,18 @@ fn build_pack_bytes(
     let counts: Vec<_> = counts.into_iter().collect();
     let num_objects = counts.len();
 
-    let mut in_order_entries =
-        InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
-            counts,
-            handle.into_inner(),
-            Box::new(progress),
-            gix_pack::data::output::entry::iter_from_counts::Options {
-                thread_limit: None,
-                mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
-                allow_thin_pack: thin_pack,
-                chunk_size: 16,
-                version: Default::default(),
-            },
-        ));
+    let mut in_order_entries = InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
+        counts,
+        handle.into_inner(),
+        Box::new(progress),
+        gix_pack::data::output::entry::iter_from_counts::Options {
+            thread_limit: None,
+            mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+            allow_thin_pack: thin_pack,
+            chunk_size: 16,
+            version: Default::default(),
+        },
+    ));
 
     let mut buf: Vec<u8> = vec![];
     let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
@@ -245,7 +244,12 @@ pub async fn perform_fetch(
         .map(crate::pack::Filter::parse)
         .transpose()?;
     let (pack_bytes, shallow) = build_pack_bytes(
-        handle, &args.want, &args.have, args.deepen, filter.as_ref(), args.thin_pack,
+        handle,
+        &args.want,
+        &args.have,
+        args.deepen,
+        filter.as_ref(),
+        args.thin_pack,
     )?;
 
     // shallow-info section: tell the client which commits are shallow
@@ -366,7 +370,12 @@ pub async fn perform_fetch_v1(
         .map(crate::pack::Filter::parse)
         .transpose()?;
     let (pack_bytes, shallow) = build_pack_bytes(
-        handle, &args.want, &args.have, args.deepen, filter.as_ref(), args.thin_pack,
+        handle,
+        &args.want,
+        &args.have,
+        args.deepen,
+        filter.as_ref(),
+        args.thin_pack,
     )?;
 
     // In v1, shallow boundaries are sent before the NAK.

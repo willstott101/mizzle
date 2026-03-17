@@ -51,7 +51,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, mut conn: Conn) ->
 
     let res = if git_protocol == "version=2" {
         serve_git_protocol_2(
-            |fut| { trillium_smol::spawn(fut); },
+            |fut| {
+                trillium_smol::spawn(fut);
+            },
             access,
             protocol_path,
             query_string,
@@ -61,7 +63,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, mut conn: Conn) ->
         .await
     } else {
         serve_git_protocol_1(
-            |fut| { trillium_smol::spawn(fut); },
+            |fut| {
+                trillium_smol::spawn(fut);
+            },
             access,
             protocol_path,
             query_string,

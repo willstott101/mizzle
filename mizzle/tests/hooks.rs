@@ -101,7 +101,9 @@ where
     thread::spawn(move || {
         rt.block_on(async {
             axum::serve(listener, app)
-                .with_graceful_shutdown(async { rx.await.ok(); })
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
                 .await
         })
         .unwrap()
@@ -217,7 +219,9 @@ fn test_post_receive_called_after_push() {
     common::run_git(&repo_dir, ["push", "origin", "main"]).unwrap();
 
     let guard = received.lock().unwrap();
-    let data = guard.as_ref().expect("post_receive should have been called");
+    let data = guard
+        .as_ref()
+        .expect("post_receive should have been called");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].0, "refs/heads/main");
     assert_eq!(data[0].1, PushKind::FastForward);

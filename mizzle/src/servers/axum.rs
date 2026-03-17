@@ -35,7 +35,11 @@ impl IntoResponse for GitResponse {
 /// Serve a git request.  Call this from your own handler after performing
 /// whatever authentication you need.  `path` is the full URL path (e.g.
 /// `"myrepo.git/info/refs"`).
-pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: Request) -> Response {
+pub async fn serve<A: RepoAccess + Send + 'static>(
+    access: A,
+    path: &str,
+    req: Request,
+) -> Response {
     let git_protocol = req
         .headers()
         .get("Git-Protocol")
@@ -64,7 +68,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: R
 
     if git_protocol.as_str() == "version=2" {
         serve_git_protocol_2(
-            |fut| { tokio::spawn(fut); },
+            |fut| {
+                tokio::spawn(fut);
+            },
             access,
             service_path.into(),
             query_string,
@@ -75,7 +81,9 @@ pub async fn serve<A: RepoAccess + Send + 'static>(access: A, path: &str, req: R
         .into_response()
     } else {
         serve_git_protocol_1(
-            |fut| { tokio::spawn(fut); },
+            |fut| {
+                tokio::spawn(fut);
+            },
             access,
             service_path.into(),
             query_string,

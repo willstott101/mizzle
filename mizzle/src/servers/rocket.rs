@@ -98,7 +98,9 @@ pub async fn handle_git_request<A: RepoAccess + Send + 'static>(
     if meta.git_protocol.as_ref() == "version=2" {
         RocketGitResponse(
             serve_git_protocol_2(
-                |fut| { tokio::spawn(fut); },
+                |fut| {
+                    tokio::spawn(fut);
+                },
                 access,
                 service_path.into(),
                 meta.query_string,
@@ -110,7 +112,9 @@ pub async fn handle_git_request<A: RepoAccess + Send + 'static>(
     } else {
         RocketGitResponse(
             serve_git_protocol_1(
-                |fut| { tokio::spawn(fut); },
+                |fut| {
+                    tokio::spawn(fut);
+                },
                 access,
                 service_path.into(),
                 meta.query_string,
