@@ -58,17 +58,43 @@ gitoxide is always in the middle:
 
 Push-kind classification always uses gitoxide regardless of which storage backend is in use, because the received objects must be locally available before the graph can be walked. This means `FsGitCli` still uses gitoxide for classification — it hands off to the git CLI only for the authoritative pack indexing and ref update step.
 
+### Auth–storage coupling
+
+`RepoAccess` is not a pure auth object — it is a *resolved request context*: by the time mizzle holds one, the caller has already looked up the user, identified the repository, and loaded all permission state. The repo identifier therefore belongs on `RepoAccess`, not on the storage backend.
+
+The identifier is an associated type so that auth and storage stay orthogonal while the type system enforces they speak the same language:
+
+```rust
+trait RepoAccess {
+    type RepoHandle;
+    fn repo_handle(&self) -> &Self::RepoHandle;
+    // authorize_push, post_receive, auto_init …
+}
+
+trait StorageBackend {
+    type RepoHandle;
+    fn list_refs(&self, repo: &Self::RepoHandle) -> …;
+    // read_object, write_objects, update_refs …
+}
+```
+
+The serve entry-point carries the constraint `B: StorageBackend<RepoHandle = A::RepoHandle>`. Pairing a mismatched auth and backend is a compile error.
+
+`RepoAccess` is constructed per-request by the caller. The storage backend is a shared singleton (connection pool, cluster client, etc.). The handle simply flows from the per-request auth object into the shared backend's methods — the asymmetry is intentional and expected.
+
+For filesystem backends `RepoHandle = PathBuf` and the change is trivial. For a SQL backend `RepoHandle` might be a `(OwnerId, RepoId)` pair or a UUID — whatever the database uses as its primary key. Auth resolves the HTTP path and credentials into that value; every storage method receives it.
+
 ### Storage backends
 
 Two trait levels, for two kinds of backend:
 
 **Thin storage trait** — for backends where gitoxide does the protocol work and the backend just stores and retrieves objects and refs:
-- `list_refs()`
-- `read_object(oid)`
-- `has_object(oid)`
-- `write_objects(iter)`
-- `update_refs(updates)`
-- `init()`
+- `list_refs(repo)`
+- `read_object(repo, oid)`
+- `has_object(repo, oid)`
+- `write_objects(repo, iter)`
+- `update_refs(repo, updates)`
+- `init(repo)`
 
 **Full-bypass backend trait** — for backends that want to handle the storage step themselves after auth passes. These can call into `mizzle-proto` (see below) for any protocol primitives they want to reuse, but are not forced through the gitoxide protocol layer.
 
