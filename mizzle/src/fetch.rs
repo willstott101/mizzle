@@ -48,6 +48,9 @@ pub struct FetchArgs {
     /// Client will explicitly send `done`; server must not declare
     /// `ready` on its own (wait-for-done).
     pub wait_for_done: bool,
+    /// Requests that the shallow clone/fetch should be cut at a specific
+    /// depth, relative to the requested want tips.
+    pub deepen: Option<u32>,
 }
 
 pub async fn read_fetch_args<T>(
@@ -70,6 +73,7 @@ where
         include_tag: false,
         ofs_delta: false,
         wait_for_done: false,
+        deepen: None,
     };
     loop {
         let line = parser
@@ -87,6 +91,22 @@ where
                     args.have.push(ObjectId::from_hex(oid)?);
                 } else if let Some(refname) = arg.strip_prefix(b"want-ref ") {
                     args.want_refs.push(String::from_utf8(refname.to_vec())?);
+                } else if let Some(depth) = arg.strip_prefix(b"deepen ") {
+                    let n = std::str::from_utf8(depth)?
+                        .parse::<u32>()
+                        .map_err(|e| anyhow::anyhow!("invalid deepen value: {e}"))?;
+                    if n == 0 {
+                        anyhow::bail!("deepen 0 is not valid");
+                    }
+                    args.deepen = Some(n);
+                } else if arg.starts_with(b"deepen-since ")
+                    || arg.starts_with(b"deepen-not ")
+                    || arg.starts_with(b"deepen-relative")
+                {
+                    anyhow::bail!(
+                        "unsupported fetch argument: {}",
+                        String::from_utf8_lossy(arg)
+                    );
                 } else {
                     match arg {
                         b"done" => args.done = true,
@@ -154,8 +174,22 @@ pub async fn perform_fetch(
         handle.prevent_pack_unload();
         handle.ignore_replacements = true;
 
-        let pack_objects =
-            crate::pack::objects_for_fetch(handle.clone().into_inner(), &args.want, &args.have)?;
+        let pack_objects = crate::pack::objects_for_fetch_with_depth(
+            handle.clone().into_inner(),
+            &args.want,
+            &args.have,
+            args.deepen,
+        )?;
+
+        // shallow-info section: tell the client which commits are shallow
+        // boundaries so it knows not to expect their parents.
+        if !pack_objects.shallow.is_empty() {
+            text_to_write(b"shallow-info", &mut writer).await?;
+            for id in &pack_objects.shallow {
+                text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
+            }
+            delim_to_write(&mut writer).await?;
+        }
 
         let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
@@ -393,6 +427,7 @@ mod tests {
             include_tag: false,
             ofs_delta: false,
             wait_for_done: false,
+            deepen: None,
         };
 
         let (reader, writer) = piper::pipe(65536);
@@ -454,6 +489,7 @@ mod tests {
             include_tag: false,
             ofs_delta: false,
             wait_for_done: true,
+            deepen: None,
         };
 
         let (reader, writer) = piper::pipe(65536);
@@ -477,6 +513,85 @@ mod tests {
         assert!(
             !lines.contains(&"packfile".to_string()),
             "server must NOT send packfile without done when wait-for-done is set, got: {:?}",
+            lines
+        );
+    }
+
+    #[test]
+    fn test_deepen_parsed() {
+        futures_lite::future::block_on(async {
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"deepen 3\n"));
+            input.extend(pkt_line(b"done\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let args = read_fetch_args(&mut parser).await.unwrap();
+
+            assert_eq!(args.deepen, Some(3));
+            assert!(args.done);
+        });
+    }
+
+    /// A shallow clone with --depth 1 should only include the tip commit
+    /// and its trees/blobs, not any parent commits.
+    #[test]
+    fn shallow_fetch_depth_1_includes_only_tip() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+
+        fs::write(p.join("c.txt"), "c\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C3"]);
+        let c3 = rev_parse(p, "HEAD");
+
+        let handle = gix::open(p).unwrap().objects;
+        let args = FetchArgs {
+            want: vec![c3],
+            want_refs: Vec::new(),
+            have: Vec::new(),
+            done: true,
+            thin_pack: false,
+            no_progress: true,
+            include_tag: false,
+            ofs_delta: false,
+            wait_for_done: false,
+            deepen: Some(1),
+        };
+
+        let (reader, writer) = piper::pipe(65536);
+        futures_lite::future::block_on(async {
+            perform_fetch(handle, &args, writer).await.unwrap();
+        });
+
+        let raw = collect_pkt_output(reader);
+        let lines = parse_pkt_lines(&raw);
+
+        // Should have shallow-info with the tip commit as the shallow boundary
+        assert!(
+            lines.contains(&"shallow-info".to_string()),
+            "expected shallow-info section, got: {:?}",
+            lines
+        );
+        assert!(
+            lines.iter().any(|l| l == &format!("shallow {}", c3)),
+            "expected shallow boundary at C3, got: {:?}",
+            lines
+        );
+        assert!(
+            lines.contains(&"packfile".to_string()),
+            "expected packfile section, got: {:?}",
             lines
         );
     }

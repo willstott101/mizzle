@@ -15,6 +15,10 @@ pub struct PackObjects {
     /// for thin-pack creation, because the client is guaranteed to have them.
     #[allow(dead_code)]
     pub have_set: HashSet<ObjectId>,
+    /// Commits at the depth boundary of a shallow clone. These commits are
+    /// included in the pack but their parents are NOT. Empty when no depth
+    /// limit is applied.
+    pub shallow: Vec<ObjectId>,
 }
 
 /// Collects all object IDs (commits, trees, blobs) needed to pack for a fetch:
@@ -30,19 +34,33 @@ pub struct PackObjects {
 /// The returned [`PackObjects::have_set`] can be used by the caller to
 /// implement thin-pack creation, where delta bases are drawn from objects the
 /// client already holds.
-pub fn objects_for_fetch(
+/// Collects all object IDs (commits, trees, blobs) needed to pack for a fetch:
+/// every object reachable from any commit in `want` that is not also reachable
+/// from any commit in `have`.
+///
+/// When `deepen` is `Some(n)`, only commits within `n` levels of the want tips
+/// are included; commits at the depth boundary are recorded in
+/// [`PackObjects::shallow`].
+pub fn objects_for_fetch_with_depth(
     odb: impl Find + Clone,
     want: &[ObjectId],
     have: &[ObjectId],
+    deepen: Option<u32>,
 ) -> anyhow::Result<PackObjects> {
     let have_set = build_have_set(odb.clone(), have)?;
 
-    let want_commits: Vec<ObjectId> =
+    let mut shallow = Vec::new();
+    let want_commits: Vec<ObjectId> = if let Some(depth) = deepen {
+        // Depth-limited BFS from want tips.  Commits at the boundary
+        // (depth == limit) are included but their parents are not.
+        depth_limited_commits(odb.clone(), want, have, depth, &mut shallow)?
+    } else {
         gix::traverse::commit::Simple::new(want.iter().copied(), odb.clone())
             .hide(have.iter().copied())?
             .map(|r| r.map(|info| info.id))
             .collect::<Result<_, _>>()
-            .map_err(|e| anyhow!("commit traversal: {e}"))?;
+            .map_err(|e| anyhow!("commit traversal: {e}"))?
+    };
 
     let mut objects: HashSet<ObjectId> = HashSet::new();
     let mut state = gix::traverse::tree::breadthfirst::State::default();
@@ -85,7 +103,67 @@ pub fn objects_for_fetch(
     Ok(PackObjects {
         objects: objects.into_iter().collect(),
         have_set,
+        shallow,
     })
+}
+
+/// BFS commit traversal limited to `depth` levels from the want tips.
+/// Commits at the boundary are recorded in `shallow_out`.
+fn depth_limited_commits(
+    odb: impl Find + Clone,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    depth: u32,
+    shallow_out: &mut Vec<ObjectId>,
+) -> anyhow::Result<Vec<ObjectId>> {
+    use std::collections::VecDeque;
+
+    let have_set: HashSet<ObjectId> = have.iter().copied().collect();
+    let mut visited: HashSet<ObjectId> = HashSet::new();
+    let mut result = Vec::new();
+    // (commit_id, current_depth) — depth 1 = the want tip itself
+    let mut queue: VecDeque<(ObjectId, u32)> = VecDeque::new();
+
+    for &id in want {
+        if visited.insert(id) {
+            queue.push_back((id, 1));
+        }
+    }
+
+    let mut buf = Vec::new();
+
+    while let Some((commit_id, current_depth)) = queue.pop_front() {
+        if have_set.contains(&commit_id) {
+            continue;
+        }
+
+        result.push(commit_id);
+
+        // At the depth boundary: include this commit but not its parents.
+        if current_depth >= depth {
+            shallow_out.push(commit_id);
+            continue;
+        }
+
+        // Walk parents.  obj.data borrows from buf; collecting parent_ids
+        // into an owned Vec before the next iteration (which reuses buf) is
+        // required to avoid a dangling borrow.
+        let obj = odb
+            .try_find(&commit_id, &mut buf)
+            .map_err(|e| anyhow!("find commit {commit_id}: {e}"))?
+            .ok_or_else(|| anyhow!("commit {commit_id} not found"))?;
+        let parents: Vec<ObjectId> = gix::objs::CommitRefIter::from_bytes(obj.data)
+            .parent_ids()
+            .collect();
+
+        for parent_id in parents {
+            if visited.insert(parent_id) {
+                queue.push_back((parent_id, current_depth + 1));
+            }
+        }
+    }
+
+    Ok(result)
 }
 
 /// Builds a set of all object IDs reachable from the `have` commits. Used to
@@ -277,7 +355,7 @@ mod tests {
         git(p, &["commit", "-m", "init"]);
 
         let tip = rev_parse(p, "HEAD");
-        let result: HashSet<_> = objects_for_fetch(open_odb(p), &[tip], &[])
+        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[tip], &[], None)
             .unwrap()
             .objects
             .into_iter()
@@ -307,7 +385,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
         let hello_blob = rev_parse(p, "HEAD:hello.txt");
 
-        let result: HashSet<_> = objects_for_fetch(open_odb(p), &[c2], &[c1])
+        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
             .unwrap()
             .objects
             .into_iter()
@@ -346,7 +424,7 @@ mod tests {
         git(p, &["commit", "-m", "C2"]);
         let c2 = rev_parse(p, "HEAD");
 
-        let result: HashSet<_> = objects_for_fetch(open_odb(p), &[c2], &[c1])
+        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
             .unwrap()
             .objects
             .into_iter()
@@ -375,7 +453,7 @@ mod tests {
         git(p, &["commit", "-m", "C1"]);
         let c1 = rev_parse(p, "HEAD");
 
-        let result = objects_for_fetch(open_odb(p), &[c1], &[c1]).unwrap();
+        let result = objects_for_fetch_with_depth(open_odb(p), &[c1], &[c1], None).unwrap();
         assert!(result.objects.is_empty());
     }
 
@@ -419,7 +497,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
         let new_blob = rev_parse(p, "HEAD:new.txt");
 
-        let result: HashSet<_> = objects_for_fetch(open_odb(p), &[c2], &[c1])
+        let result: HashSet<_> = objects_for_fetch_with_depth(open_odb(p), &[c2], &[c1], None)
             .unwrap()
             .objects
             .into_iter()
@@ -430,5 +508,102 @@ mod tests {
             !result.contains(&shared_blob),
             "blob known via have branch must be excluded"
         );
+    }
+
+    // ── shallow / depth-limited ─────────────────────────────────────────────
+
+    /// depth=1 should only include the tip commit (C3), not C2 or C1.
+    /// C3 should appear in the shallow list.
+    #[test]
+    fn depth_1_returns_only_tip_commit() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let c1 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("c.txt"), "c\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C3"]);
+        let c3 = rev_parse(p, "HEAD");
+
+        let result = objects_for_fetch_with_depth(open_odb(p), &[c3], &[], Some(1)).unwrap();
+        let commits: HashSet<_> = result
+            .objects
+            .iter()
+            .filter(|id| **id == c1 || **id == c2 || **id == c3)
+            .copied()
+            .collect();
+
+        assert!(commits.contains(&c3), "tip commit should be included");
+        assert!(!commits.contains(&c2), "parent commit should be excluded at depth 1");
+        assert!(!commits.contains(&c1), "grandparent commit should be excluded at depth 1");
+        assert_eq!(result.shallow, vec![c3], "tip should be the shallow boundary");
+    }
+
+    /// depth=2 should include the tip and its immediate parent.
+    #[test]
+    fn depth_2_returns_tip_and_parent() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let c1 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("c.txt"), "c\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C3"]);
+        let c3 = rev_parse(p, "HEAD");
+
+        let result = objects_for_fetch_with_depth(open_odb(p), &[c3], &[], Some(2)).unwrap();
+        let commits: HashSet<_> = result
+            .objects
+            .iter()
+            .filter(|id| **id == c1 || **id == c2 || **id == c3)
+            .copied()
+            .collect();
+
+        assert!(commits.contains(&c3), "tip should be included");
+        assert!(commits.contains(&c2), "parent should be included at depth 2");
+        assert!(!commits.contains(&c1), "grandparent should be excluded at depth 2");
+        assert_eq!(result.shallow, vec![c2], "parent should be the shallow boundary");
+    }
+
+    /// No depth limit (None) should return all commits as before, with no shallow entries.
+    #[test]
+    fn no_depth_returns_all_commits() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        let result = objects_for_fetch_with_depth(open_odb(p), &[c2], &[], None).unwrap();
+        assert!(result.shallow.is_empty(), "no depth limit means no shallow commits");
+        // Should have both commits plus trees and blobs
+        assert!(result.objects.len() >= 4, "should have commits + trees + blobs");
     }
 }
