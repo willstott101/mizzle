@@ -1,0 +1,11 @@
+[package]
+name = "mizzle-proto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gix-packetline = { version = "0.21", features = ["async-io"] }
+gix-hash = "0.22.1"
+anyhow = "1.0"
+futures-lite = "2.6"
+log = "0.4"

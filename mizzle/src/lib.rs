@@ -5,4 +5,3 @@ mod receive;
 pub mod serve;
 pub mod servers;
 pub mod traits;
-mod utils;
