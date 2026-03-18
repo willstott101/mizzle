@@ -5,7 +5,7 @@ use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use gix_packetline::async_io::StreamingPeekableIter;
 use log::{error, info};
-use mizzle_proto::command::{read_command, Command};
+use crate::command::{read_command, Command};
 use piper::{Reader, Writer};
 use std::future::Future;
 use std::pin::Pin;

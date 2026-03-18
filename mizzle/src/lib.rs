@@ -1,3 +1,4 @@
+mod command;
 mod fetch;
 mod ls_refs;
 mod pack;
