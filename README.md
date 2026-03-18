@@ -1,7 +1,5 @@
 # mizzle
 
-> *git is a graph database implemented as flat files and blob storage on top of a block device.*
-
 Most software forges couple git hosting tightly to a specific storage model — bare repositories on a filesystem, managed by shelling out to git CLI plumbing. This works fine at small scale but creates hard limits: you can't query history in SQL, you can't shard repos across object storage, you can't run multiple writers without careful locking, and you can't swap in a faster implementation without rewriting the whole server.
 
 **mizzle** is a Rust library for building git servers with clean boundaries between the wire protocol, authentication, and storage. Its goal is to make it possible to explore entirely new ways of hosting git — and to make comparing them easy.
@@ -21,23 +19,23 @@ This unlocks things that are difficult or impossible with forge software today:
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│                    Transport                         │
+│                    Transport                        │
 │         (HTTP smart protocol v1/v2, SSH, git://)    │
 └─────────────────────┬───────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
-│                  Auth layer                          │
+│                  Auth layer                         │
 │   pluggable: OIDC, SSH key, token, anonymous, ...   │
 └─────────────────────┬───────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
-│               Repository trait                       │
-│   list_refs · fetch_pack · receive_pack · hooks      │
-└──────────────────┬──────────────┬────────────────────┘
+│               Repository trait                      │
+│   list_refs · fetch_pack · receive_pack · hooks     │
+└──────────────────┬──────────────┬───────────────────┘
                    │              │
       ┌────────────▼────────┐  ┌──▼──────────────────────┐
-      │   Filesystem / NFS  │  │   Novel backends         │
-      │  (bare git repos)   │  │   (SQL, object store...) │
+      │   Filesystem / NFS  │  │  Novel backends         │
+      │  (bare git repos)   │  │  (SQL, object store...) │
       └─────────────────────┘  └─────────────────────────┘
 ```
 
@@ -89,6 +87,7 @@ Planned:
 - [ ] SQL backend (proof of concept)
 - [ ] Cross-backend integration test harness
 - [ ] Fuzzing against the protocol layer
+- [ ] API Layer for non-git repo interaction
 
 ## Notes on the git protocol spec
 
