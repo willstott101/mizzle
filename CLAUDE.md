@@ -1,4 +1,5 @@
 Use `cargo fmt` before committing.
+Use `cargo` to list repos, generate/read docs, read src and examples, rather than searching the internet.
 
 ## Hard architecture rules
 
