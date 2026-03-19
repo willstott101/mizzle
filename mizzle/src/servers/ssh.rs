@@ -78,7 +78,11 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
                 tokio::time::sleep(EXEC_TIMEOUT).await;
                 error!("SSH client did not send exec request within deadline, disconnecting");
                 let _ = handle
-                    .disconnect(russh::Disconnect::ByApplication, "timeout".into(), "".into())
+                    .disconnect(
+                        russh::Disconnect::ByApplication,
+                        "no git command received within deadline".into(),
+                        "en".into(),
+                    )
                     .await;
             }));
         }
@@ -126,10 +130,18 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
             Some(a) => a,
             None => {
                 error!("SSH auth rejected for user={} repo={}", user, repo_path);
-                let channel = self.channels.remove(&channel_id);
-                if let Some(ch) = channel {
-                    let _ = ch.close().await;
-                }
+                let handle = session.handle();
+                let msg = format!(
+                    "ERROR: permission denied for '{}' on '{}'\n",
+                    user, repo_path,
+                );
+                // ext=1 is stderr in the SSH protocol.
+                let _ = handle
+                    .extended_data(channel_id, 1, msg.into_bytes())
+                    .await;
+                let _ = handle.exit_status_request(channel_id, 1).await;
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.close(channel_id).await;
                 return Ok(());
             }
         };

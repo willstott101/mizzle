@@ -296,9 +296,10 @@ fn test_ssh_auth_rejected() -> Result<()> {
         ],
     );
 
+    let err = result.expect_err("clone should have failed with rejected auth");
     assert!(
-        result.is_err(),
-        "clone should have failed with rejected auth"
+        err.to_string().contains("permission denied"),
+        "client should see permission denied message, got: {err}"
     );
 
     server.stop();
