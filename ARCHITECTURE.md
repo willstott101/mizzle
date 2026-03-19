@@ -9,7 +9,7 @@ This document covers the reasoning behind mizzle's design, the planned layer str
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Transport                                                    │
-│  HTTP smart protocol v1/v2 · SSH · git://                    │
+│  HTTP smart protocol v1/v2 · SSH                             │
 │  Thin per-framework integration crates (Axum, Actix, ...)    │
 └──────────────────────────────┬───────────────────────────────┘
                                │
@@ -37,7 +37,7 @@ This document covers the reasoning behind mizzle's design, the planned layer str
 Thin integration crates map each web framework's request/response types to mizzle's internal `GitRequest` / `GitResponse` types. No framework is required — you can drive mizzle from a raw TCP stream if you want.
 
 Currently implemented: Axum, Actix-web, Rocket, Trillium.
-Planned: SSH (russh), git://.
+Planned: SSH (russh).
 
 ### Auth — `RepoAccess`
 
@@ -208,10 +208,6 @@ The cross-backend harness from Phase 4 immediately validates correctness and sur
 ### Phase 7 — SSH transport
 
 russh. Auth trait extension needed for SSH key fingerprints vs. HTTP tokens.
-
-### Phase 8 — git:// transport
-
-Simpler than SSH (no encryption, no auth). Useful for local/trusted network scenarios.
 
 ---
 

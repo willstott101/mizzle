@@ -20,7 +20,7 @@ This unlocks things that are difficult or impossible with forge software today:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Transport                        │
-│         (HTTP smart protocol v1/v2, SSH, git://)    │
+│         (HTTP smart protocol v1/v2, SSH)             │
 └─────────────────────┬───────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
@@ -82,7 +82,6 @@ Protocol support (gitoxide backend, HTTP transport):
 Planned:
 
 - [ ] SSH transport
-- [ ] git:// transport
 - [ ] FS + git CLI backend (baseline for correctness comparison)
 - [ ] SQL backend (proof of concept)
 - [ ] Cross-backend integration test harness
