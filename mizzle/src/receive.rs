@@ -1,8 +1,7 @@
 use anyhow::{Context, Result};
+use futures_lite::AsyncWrite;
 use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
-use log::error;
-use piper::Writer;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
@@ -142,16 +141,16 @@ pub fn init_bare_if_missing(repo_path: &str) -> Result<()> {
 pub async fn update_refs_and_report(
     repo_path: &str,
     ref_updates: &[RefUpdate],
-    mut writer: Writer,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
     update_refs(repo_path, ref_updates).context("updating refs")?;
 
-    text_to_write(b"unpack ok", &mut writer).await?;
+    text_to_write(b"unpack ok", &mut *writer).await?;
     for update in ref_updates {
         let msg = format!("ok {}", update.refname);
-        text_to_write(msg.as_bytes(), &mut writer).await?;
+        text_to_write(msg.as_bytes(), &mut *writer).await?;
     }
-    flush_to_write(&mut writer).await?;
+    flush_to_write(&mut *writer).await?;
 
     Ok(())
 }
@@ -194,40 +193,37 @@ pub fn gather_receive_pack_refs(repo_path: &str) -> Result<Vec<(ObjectId, String
 
 /// Writes the receive-pack ref advertisement to `writer`.  Expects pre-gathered
 /// refs from [`gather_receive_pack_refs`].
-pub async fn info_refs_receive_pack_task(refs: Vec<(ObjectId, String)>, mut writer: Writer) {
+pub async fn info_refs_receive_pack_task(
+    refs: Vec<(ObjectId, String)>,
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> Result<()> {
     let caps = b"report-status delete-refs agent=mizzle/dev";
-    let result: Result<()> = async {
-        if refs.is_empty() {
-            // Empty repo: advertise capabilities only.
-            let null_oid = "0000000000000000000000000000000000000000";
+    if refs.is_empty() {
+        // Empty repo: advertise capabilities only.
+        let null_oid = "0000000000000000000000000000000000000000";
+        let mut line = Vec::new();
+        line.extend_from_slice(null_oid.as_bytes());
+        line.extend_from_slice(b" capabilities^{}");
+        line.push(b'\0');
+        line.extend_from_slice(caps);
+        text_to_write(&line, &mut *writer).await?;
+    } else {
+        let mut first = true;
+        for (oid, name) in &refs {
             let mut line = Vec::new();
-            line.extend_from_slice(null_oid.as_bytes());
-            line.extend_from_slice(b" capabilities^{}");
-            line.push(b'\0');
-            line.extend_from_slice(caps);
-            text_to_write(&line, &mut writer).await?;
-        } else {
-            let mut first = true;
-            for (oid, name) in &refs {
-                let mut line = Vec::new();
-                line.extend_from_slice(oid.to_hex().to_string().as_bytes());
-                line.push(b' ');
-                line.extend_from_slice(name.as_bytes());
-                if first {
-                    line.push(b'\0');
-                    line.extend_from_slice(caps);
-                    first = false;
-                }
-                text_to_write(&line, &mut writer).await?;
+            line.extend_from_slice(oid.to_hex().to_string().as_bytes());
+            line.push(b' ');
+            line.extend_from_slice(name.as_bytes());
+            if first {
+                line.push(b'\0');
+                line.extend_from_slice(caps);
+                first = false;
             }
+            text_to_write(&line, &mut *writer).await?;
         }
-        flush_to_write(&mut writer).await?;
-        Ok(())
     }
-    .await;
-    if let Err(e) = result {
-        error!("receive-pack info/refs write error: {}", e);
-    }
+    flush_to_write(&mut *writer).await?;
+    Ok(())
 }
 
 #[cfg(test)]

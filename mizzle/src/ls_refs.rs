@@ -1,3 +1,4 @@
+use futures_lite::AsyncWrite;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use gix_ref::file::ReferenceExt;
 
@@ -32,15 +33,15 @@ fn get_head_info(
 pub async fn perform_listrefs(
     repo: &gix::ThreadSafeRepository,
     args: &ListRefsArgs,
-    mut writer: piper::Writer,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
     match get_head_info(repo, args)? {
         Some(packetline) => {
-            text_to_write(packetline.as_bytes(), &mut writer).await?;
+            text_to_write(packetline.as_bytes(), &mut *writer).await?;
         }
         None => {
             if args.unborn {
-                text_to_write(b"unborn HEAD", &mut writer).await?;
+                text_to_write(b"unborn HEAD", &mut *writer).await?;
             }
         }
     }
@@ -72,7 +73,7 @@ pub async fn perform_listrefs(
                         // Output the anotated tag's oid & name but also the underlying commit's oid
                         text_to_write(
                             format!("{} {} peeled:{}", oid, r.name, peeled).as_bytes(),
-                            &mut writer,
+                            &mut *writer,
                         )
                         .await?;
                         continue;
@@ -80,7 +81,7 @@ pub async fn perform_listrefs(
                 }
                 // Either this isn't an annotated tag, or we weren't asked to peel
                 // So we just return the oid directly
-                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut writer).await?;
+                text_to_write(format!("{} {}", oid, r.name).as_bytes(), &mut *writer).await?;
             }
             // This is a symbolic reference (such as HEAD)
             gix_ref::Target::Symbolic(symref_target) => {
@@ -90,16 +91,17 @@ pub async fn perform_listrefs(
                 if args.symrefs {
                     text_to_write(
                         format!("{} {} symref-target:{}", peeled, r.name, symref_target).as_bytes(),
-                        &mut writer,
+                        &mut *writer,
                     )
                     .await?;
                 } else {
-                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut writer).await?;
+                    text_to_write(format!("{} {}", peeled, r.name).as_bytes(), &mut *writer)
+                        .await?;
                 }
             }
         }
     }
 
-    flush_to_write(&mut writer).await?;
+    flush_to_write(&mut *writer).await?;
     Ok(())
 }

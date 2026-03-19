@@ -4,5 +4,7 @@ pub mod actix;
 pub mod axum;
 #[cfg(feature = "rocket")]
 pub mod rocket;
+#[cfg(feature = "ssh")]
+pub mod ssh;
 #[cfg(feature = "trillium_smol")]
 pub mod trillium;

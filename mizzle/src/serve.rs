@@ -1,11 +1,11 @@
+use crate::command::{read_command, Command};
 use crate::traits::RepoAccess;
 use crate::{fetch, ls_refs, receive};
-use futures_lite::AsyncRead;
+use futures_lite::{AsyncRead, AsyncWrite};
 use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use gix_packetline::async_io::StreamingPeekableIter;
 use log::{error, info};
-use crate::command::{read_command, Command};
 use piper::{Reader, Writer};
 use std::future::Future;
 use std::pin::Pin;
@@ -50,12 +50,15 @@ fn recv_pack_info_refs<A: RepoAccess + Send + 'static>(
     let (reader, writer) = piper::pipe(4096);
     spawn(Box::pin(async move {
         let mut w = writer;
-        if text_to_write(b"# service=git-receive-pack", &mut w)
-            .await
-            .is_ok()
-            && flush_to_write(&mut w).await.is_ok()
-        {
-            receive::info_refs_receive_pack_task(refs, w).await;
+        let result: anyhow::Result<()> = async {
+            text_to_write(b"# service=git-receive-pack", &mut w).await?;
+            flush_to_write(&mut w).await?;
+            receive::info_refs_receive_pack_task(refs, &mut w).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            error!("recv_pack_info_refs write error: {:#}", e);
         }
     }));
     GitResponse {
@@ -159,7 +162,8 @@ where
             .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
             .collect();
         spawn(Box::pin(async move {
-            match receive::update_refs_and_report(repo_path.as_ref(), &ref_updates, writer).await {
+            let mut w = writer;
+            match receive::update_refs_and_report(repo_path.as_ref(), &ref_updates, &mut w).await {
                 Ok(()) => {
                     let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
                         .iter()
@@ -204,33 +208,42 @@ fn gather_upload_pack_v1_refs(repo_path: &str) -> anyhow::Result<Vec<(ObjectId, 
     Ok(head)
 }
 
-async fn info_refs_upload_pack_v1_task(refs: Vec<(ObjectId, String)>, mut writer: Writer) {
+/// Writes the v1 upload-pack ref advertisement (refs + capabilities + flush).
+/// Does NOT write the HTTP preamble (`# service=git-upload-pack` + flush).
+pub async fn upload_pack_v1_refs(
+    refs: &[(ObjectId, String)],
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
     let caps = b"side-band-64k ofs-delta shallow filter agent=mizzle/dev";
+    if refs.is_empty() {
+        let mut line = b"0000000000000000000000000000000000000000 capabilities^{}".to_vec();
+        line.push(0);
+        line.extend_from_slice(caps);
+        text_to_write(&line, &mut *writer).await?;
+    } else {
+        let mut first = true;
+        for (oid, name) in refs {
+            let mut line = Vec::new();
+            line.extend_from_slice(oid.to_hex().to_string().as_bytes());
+            line.push(b' ');
+            line.extend_from_slice(name.as_bytes());
+            if first {
+                line.push(0);
+                line.extend_from_slice(caps);
+                first = false;
+            }
+            text_to_write(&line, &mut *writer).await?;
+        }
+    }
+    flush_to_write(&mut *writer).await?;
+    Ok(())
+}
+
+async fn info_refs_upload_pack_v1_task(refs: Vec<(ObjectId, String)>, mut writer: Writer) {
     let result: anyhow::Result<()> = async {
         text_to_write(b"# service=git-upload-pack", &mut writer).await?;
         flush_to_write(&mut writer).await?;
-        if refs.is_empty() {
-            // Empty repo: capabilities line with null OID.
-            let mut line = b"0000000000000000000000000000000000000000 capabilities^{}".to_vec();
-            line.push(0);
-            line.extend_from_slice(caps);
-            text_to_write(&line, &mut writer).await?;
-        } else {
-            let mut first = true;
-            for (oid, name) in &refs {
-                let mut line = Vec::new();
-                line.extend_from_slice(oid.to_hex().to_string().as_bytes());
-                line.push(b' ');
-                line.extend_from_slice(name.as_bytes());
-                if first {
-                    line.push(0);
-                    line.extend_from_slice(caps);
-                    first = false;
-                }
-                text_to_write(&line, &mut writer).await?;
-            }
-        }
-        flush_to_write(&mut writer).await?;
+        upload_pack_v1_refs(&refs, &mut writer).await?;
         Ok(())
     }
     .await;
@@ -326,7 +339,8 @@ where
         }
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(async move {
-            if let Err(e) = fetch::perform_fetch_v1(repo.objects, &args, writer).await {
+            let mut w = writer;
+            if let Err(e) = fetch::perform_fetch_v1(repo.objects, &args, &mut w).await {
                 error!("perform_fetch_v1 error: {:#}", e);
             }
         }));
@@ -420,7 +434,8 @@ where
                 let repo = res_try!(gix::open(repo_path.as_ref())).into_sync();
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
-                    if let Err(e) = ls_refs::perform_listrefs(&repo, &args, writer).await {
+                    let mut w = writer;
+                    if let Err(e) = ls_refs::perform_listrefs(&repo, &args, &mut w).await {
                         error!("perform_listrefs error: {:#}", e);
                     }
                 }));
@@ -446,7 +461,8 @@ where
                 info!("FETCH: {:?}", args);
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
-                    if let Err(e) = fetch::perform_fetch(repo.objects, &args, writer).await {
+                    let mut w = writer;
+                    if let Err(e) = fetch::perform_fetch(repo.objects, &args, &mut w).await {
                         error!("perform_fetch error: {:#}", e);
                     }
                 }));
@@ -468,31 +484,195 @@ where
     }
 }
 
-async fn info_refs_task(mut writer: Writer) {
-    text_to_write(b"# service=git-upload-pack", &mut writer)
-        .await
-        .expect("to write to output");
-    flush_to_write(&mut writer)
-        .await
-        .expect("to write to output");
-
-    text_to_write(b"version 2", &mut writer)
-        .await
-        .expect("to write to output");
-    text_to_write(b"agent=mizzle/dev", &mut writer)
-        .await
-        .expect("to write to output");
-    text_to_write(b"ls-refs=unborn", &mut writer)
-        .await
-        .expect("to write to output");
+/// Writes the v2 capability advertisement (version 2, agent, ls-refs, fetch).
+/// Does NOT write the HTTP preamble (`# service=git-upload-pack` + flush).
+pub async fn capability_advertisement_v2(
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    text_to_write(b"version 2", &mut *writer).await?;
+    text_to_write(b"agent=mizzle/dev", &mut *writer).await?;
+    text_to_write(b"ls-refs=unborn", &mut *writer).await?;
     text_to_write(
         b"fetch=ref-in-want wait-for-done shallow filter",
-        &mut writer,
+        &mut *writer,
     )
-    .await
-    .expect("to write to output");
+    .await?;
+    flush_to_write(&mut *writer).await?;
+    Ok(())
+}
 
-    flush_to_write(&mut writer)
-        .await
-        .expect("to write to output");
+async fn info_refs_task(mut writer: Writer) {
+    let result: anyhow::Result<()> = async {
+        text_to_write(b"# service=git-upload-pack", &mut writer).await?;
+        flush_to_write(&mut writer).await?;
+        capability_advertisement_v2(&mut writer).await?;
+        Ok(())
+    }
+    .await;
+    if let Err(e) = result {
+        error!("info_refs_task error: {:#}", e);
+    }
+}
+
+/// Serve an upload-pack session over separate read/write halves.
+///
+/// This is the core logic used by the SSH transport. The caller is responsible
+/// for providing the read and write sides and for any post-protocol cleanup
+/// (e.g. sending SSH exit-status).
+pub async fn serve_upload_pack<R, W, A>(
+    access: A,
+    reader: R,
+    writer: &mut W,
+    version: u32,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    A: RepoAccess + Send + 'static,
+{
+    let repo_path: Box<str> = access.repo_path().into();
+
+    if access.auto_init() {
+        receive::init_bare_if_missing(repo_path.as_ref())?;
+    }
+
+    if version >= 2 {
+        info!("upload-pack v2 {}", repo_path);
+        capability_advertisement_v2(writer).await?;
+
+        let mut parser = StreamingPeekableIter::new(reader, &[], false);
+        loop {
+            let command = match read_command(&mut parser).await {
+                Ok(cmd) => cmd,
+                Err(_) => break, // EOF — client disconnected after final command
+            };
+            match command {
+                Command::ListRefs => {
+                    let args = ls_refs::read_lsrefs_args(&mut parser).await?;
+                    let repo = gix::open(repo_path.as_ref())?.into_sync();
+                    ls_refs::perform_listrefs(&repo, &args, writer).await?;
+                }
+                Command::Fetch => {
+                    let mut args = fetch::read_fetch_args(&mut parser).await?;
+                    let repo = gix::open(repo_path.as_ref())?;
+                    for refname in &args.want_refs {
+                        if let Ok(mut r) = repo.find_reference(refname.as_str()) {
+                            if let Ok(id) = r.peel_to_id() {
+                                args.want.push(id.detach());
+                            }
+                        }
+                    }
+                    info!("FETCH: {:?}", args);
+                    fetch::perform_fetch(repo.objects, &args, writer).await?;
+                }
+                Command::Empty => break,
+            }
+        }
+    } else {
+        info!("upload-pack v1 {}", repo_path);
+        let refs = gather_upload_pack_v1_refs(repo_path.as_ref())?;
+        upload_pack_v1_refs(&refs, writer).await?;
+
+        let mut args = fetch::read_fetch_args_v1(reader).await?;
+        let repo = gix::open(repo_path.as_ref())?;
+        for refname in &args.want_refs {
+            if let Ok(mut r) = repo.find_reference(refname.as_str()) {
+                if let Ok(id) = r.peel_to_id() {
+                    args.want.push(id.detach());
+                }
+            }
+        }
+        fetch::perform_fetch_v1(repo.objects, &args, writer).await?;
+    }
+
+    Ok(())
+}
+
+/// Serve a receive-pack session over separate read/write halves.
+///
+/// This is the core logic used by the SSH transport. The caller is responsible
+/// for providing the read and write sides and for any post-protocol cleanup
+/// (e.g. sending SSH exit-status).
+pub async fn serve_receive_pack<R, W, A>(access: A, reader: R, writer: &mut W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    A: RepoAccess + Send + 'static,
+{
+    let repo_path: Box<str> = access.repo_path().into();
+    info!("receive-pack {}", repo_path);
+
+    if access.auto_init() {
+        receive::init_bare_if_missing(repo_path.as_ref())?;
+    }
+
+    // Advertise refs (no HTTP preamble).
+    let refs = receive::gather_receive_pack_refs(repo_path.as_ref())?;
+    receive::info_refs_receive_pack_task(refs, writer).await?;
+
+    // Read the full receive request (client sends EOF after pack data).
+    let (ref_updates, pack_data) = receive::read_receive_request(reader).await?;
+
+    // Preliminary auth check.
+    let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
+        .iter()
+        .map(|u| crate::traits::PushRef {
+            refname: &u.refname,
+            kind: receive::preliminary_push_kind(u),
+        })
+        .collect();
+    if let Err(msg) = access.authorize_push(&preliminary_refs) {
+        text_to_write(b"unpack ok", &mut *writer).await?;
+        for update in &ref_updates {
+            let line = format!("ng {} {}", update.refname, msg);
+            text_to_write(line.as_bytes(), &mut *writer).await?;
+        }
+        flush_to_write(&mut *writer).await?;
+        return Ok(());
+    }
+
+    let written_pack = if !pack_data.is_empty() {
+        receive::write_pack(repo_path.as_ref(), &pack_data)?
+    } else {
+        None
+    };
+
+    let repo = gix::open(repo_path.as_ref())?;
+    let odb = repo.objects;
+    let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
+        .iter()
+        .map(|u| crate::traits::PushRef {
+            refname: &u.refname,
+            kind: receive::compute_push_kind(odb.clone().into_inner(), u),
+        })
+        .collect();
+    if let Err(msg) = access.authorize_push(&push_refs) {
+        if let Some(pack) = written_pack {
+            pack.delete();
+        }
+        text_to_write(b"unpack ok", &mut *writer).await?;
+        for update in &ref_updates {
+            let line = format!("ng {} {}", update.refname, msg);
+            text_to_write(line.as_bytes(), &mut *writer).await?;
+        }
+        flush_to_write(&mut *writer).await?;
+        return Ok(());
+    }
+
+    receive::update_refs_and_report(repo_path.as_ref(), &ref_updates, writer).await?;
+
+    let owned_kinds: Vec<(String, crate::traits::PushKind)> = push_refs
+        .iter()
+        .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
+        .collect();
+    let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
+        .iter()
+        .map(|(name, kind)| crate::traits::PushRef {
+            refname: name.as_str(),
+            kind: kind.clone(),
+        })
+        .collect();
+    access.post_receive(&post_refs).await;
+
+    Ok(())
 }

@@ -1,4 +1,5 @@
 use core::sync::atomic::AtomicBool;
+use futures_lite::AsyncWrite;
 use gix::{objs::Exists, parallel::InOrderIter, ObjectId};
 use gix_packetline::{
     async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
@@ -76,7 +77,7 @@ fn build_pack_bytes(
 pub async fn perform_fetch(
     handle: gix::OdbHandle,
     args: &FetchArgs,
-    mut writer: piper::Writer,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
     let mut acks: Vec<ObjectId> = Vec::new();
 
@@ -98,20 +99,20 @@ pub async fn perform_fetch(
         // readiness on its own.
         let ready = !acks.is_empty() && !args.wait_for_done;
 
-        text_to_write(b"acknowledgments", &mut writer).await?;
+        text_to_write(b"acknowledgments", &mut *writer).await?;
         if acks.is_empty() {
-            text_to_write(b"NAK", &mut writer).await?;
+            text_to_write(b"NAK", &mut *writer).await?;
         } else {
             for ack in &acks {
-                text_to_write(format!("ACK {}", ack).as_bytes(), &mut writer).await?;
+                text_to_write(format!("ACK {}", ack).as_bytes(), &mut *writer).await?;
             }
         }
         if !ready {
-            flush_to_write(&mut writer).await?;
+            flush_to_write(&mut *writer).await?;
             return Ok(());
         }
-        text_to_write(b"ready", &mut writer).await?;
-        delim_to_write(&mut writer).await?;
+        text_to_write(b"ready", &mut *writer).await?;
+        delim_to_write(&mut *writer).await?;
         // Fall through to build packfile below.
     }
 
@@ -132,18 +133,18 @@ pub async fn perform_fetch(
     // shallow-info section: tell the client which commits are shallow
     // boundaries so it knows not to expect their parents.
     if !shallow.is_empty() {
-        text_to_write(b"shallow-info", &mut writer).await?;
+        text_to_write(b"shallow-info", &mut *writer).await?;
         for id in &shallow {
-            text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
+            text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
         }
-        delim_to_write(&mut writer).await?;
+        delim_to_write(&mut *writer).await?;
     }
 
-    text_to_write(b"packfile", &mut writer).await?;
+    text_to_write(b"packfile", &mut *writer).await?;
     for chunk in pack_bytes.chunks(65516 - 16) {
-        band_to_write(Channel::Data, chunk, &mut writer).await?;
+        band_to_write(Channel::Data, chunk, &mut *writer).await?;
     }
-    flush_to_write(&mut writer).await?;
+    flush_to_write(&mut *writer).await?;
 
     Ok(())
 }
@@ -155,7 +156,7 @@ pub async fn perform_fetch(
 pub async fn perform_fetch_v1(
     handle: gix::OdbHandle,
     args: &FetchArgs,
-    mut writer: piper::Writer,
+    writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
     let filter = args
         .filter
@@ -173,13 +174,13 @@ pub async fn perform_fetch_v1(
 
     // In v1, shallow boundaries are sent before the NAK.
     for id in &shallow {
-        text_to_write(format!("shallow {}", id).as_bytes(), &mut writer).await?;
+        text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
     }
-    text_to_write(b"NAK", &mut writer).await?;
+    text_to_write(b"NAK", &mut *writer).await?;
     for chunk in pack_bytes.chunks(65516 - 16) {
-        band_to_write(Channel::Data, chunk, &mut writer).await?;
+        band_to_write(Channel::Data, chunk, &mut *writer).await?;
     }
-    flush_to_write(&mut writer).await?;
+    flush_to_write(&mut *writer).await?;
 
     Ok(())
 }
@@ -302,10 +303,11 @@ mod tests {
             filter: None,
         };
 
-        let (reader, writer) = piper::pipe(65536);
+        let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, writer).await.unwrap();
+            perform_fetch(handle, &args, &mut writer).await.unwrap();
         });
+        drop(writer);
 
         let raw = collect_pkt_output(reader);
         let lines = parse_pkt_lines(&raw);
@@ -365,10 +367,11 @@ mod tests {
             filter: None,
         };
 
-        let (reader, writer) = piper::pipe(65536);
+        let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, writer).await.unwrap();
+            perform_fetch(handle, &args, &mut writer).await.unwrap();
         });
+        drop(writer);
 
         let raw = collect_pkt_output(reader);
         let lines = parse_pkt_lines(&raw);
@@ -426,10 +429,11 @@ mod tests {
             filter: None,
         };
 
-        let (reader, writer) = piper::pipe(65536);
+        let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, writer).await.unwrap();
+            perform_fetch(handle, &args, &mut writer).await.unwrap();
         });
+        drop(writer);
 
         let raw = collect_pkt_output(reader);
         let lines = parse_pkt_lines(&raw);
