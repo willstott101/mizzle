@@ -80,7 +80,7 @@ where
     T: AsyncRead + Unpin,
     A: RepoAccess + Send + 'static,
 {
-    let (ref_updates, pack_data) = res_try!(receive::read_receive_request(body).await);
+    let (ref_updates, body) = res_try!(receive::read_receive_request(body).await);
 
     // Preliminary auth check before touching the disk.
     let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
@@ -109,8 +109,10 @@ where
         };
     }
 
-    let written_pack = if !pack_data.is_empty() {
-        res_try!(receive::write_pack(repo_path.as_ref(), &pack_data))
+    // Stage pack data to a temp file (streamed, not buffered in memory).
+    let staged = res_try!(receive::stage_pack(body).await);
+    let written_pack = if let Some(ref staged) = staged {
+        res_try!(receive::write_pack(repo_path.as_ref(), staged.path()))
     } else {
         None
     };
@@ -610,8 +612,8 @@ where
     let refs = receive::gather_receive_pack_refs(repo_path.as_ref())?;
     receive::info_refs_receive_pack_task(refs, writer).await?;
 
-    // Read the full receive request (client sends EOF after pack data).
-    let (ref_updates, pack_data) = receive::read_receive_request(reader).await?;
+    // Read the ref update commands (the reader is left positioned at the pack).
+    let (ref_updates, reader) = receive::read_receive_request(reader).await?;
 
     // Preliminary auth check.
     let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
@@ -631,8 +633,10 @@ where
         return Ok(());
     }
 
-    let written_pack = if !pack_data.is_empty() {
-        receive::write_pack(repo_path.as_ref(), &pack_data)?
+    // Stage pack data to a temp file (streamed, not buffered in memory).
+    let staged = receive::stage_pack(reader).await?;
+    let written_pack = if let Some(ref staged) = staged {
+        receive::write_pack(repo_path.as_ref(), staged.path())?
     } else {
         None
     };

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use futures_lite::AsyncWrite;
+use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite};
 use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use std::path::PathBuf;
@@ -51,6 +51,42 @@ impl WrittenPack {
     }
 }
 
+/// Streams pack data from an async reader to a temporary file, without
+/// buffering the entire pack in memory.  Returns the temp file (auto-deleted
+/// on drop), or `None` if no data was received.
+pub async fn stage_pack<R: AsyncRead + Unpin>(
+    mut reader: R,
+) -> Result<Option<tempfile::NamedTempFile>> {
+    let temp = tempfile::Builder::new()
+        .prefix("mizzle_pack_")
+        .tempfile()
+        .context("creating temp file for pack staging")?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    // Write synchronously — the temp file is local disk backed by page cache,
+    // so individual writes won't block the executor meaningfully.
+    let mut file = temp
+        .as_file()
+        .try_clone()
+        .context("cloning temp file handle")?;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        total += n as u64;
+        std::io::Write::write_all(&mut file, &buf[..n])
+            .context("writing pack data to temp file")?;
+    }
+
+    if total == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(temp))
+}
+
 /// Writes the received pack to the repository's object store and returns the
 /// paths of the written files, or `None` if the pack contained no objects
 /// (all referenced commits were already in the odb).
@@ -59,11 +95,22 @@ impl WrittenPack {
 /// filesystem), then atomically renamed into `objects/pack/`.  This lets the
 /// caller call [`compute_push_kind`] with the full odb and then delete the pack
 /// on auth failure rather than leaving orphaned objects behind forever.
-pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<Option<WrittenPack>> {
-    // Nothing to write if the pack has no objects — they're already in the odb.
-    if pack_object_count(pack_data).unwrap_or(0) == 0 {
+///
+/// `staged_pack` is the path to a file containing the raw pack data, typically
+/// created by [`stage_pack`].
+pub fn write_pack(repo_path: &str, staged_pack: &std::path::Path) -> Result<Option<WrittenPack>> {
+    use std::io::{Read, Seek};
+
+    let mut file = std::fs::File::open(staged_pack).context("opening staged pack")?;
+
+    // Read the header to check the object count.
+    let mut header = [0u8; 12];
+    let n = file.read(&mut header).context("reading pack header")?;
+    if pack_object_count(&header[..n]).unwrap_or(0) == 0 {
         return Ok(None);
     }
+    file.seek(std::io::SeekFrom::Start(0))
+        .context("seeking staged pack to start")?;
 
     let repo = gix::open(repo_path)?;
     let pack_dir = repo.path().join("objects").join("pack");
@@ -79,7 +126,7 @@ pub fn write_pack(repo_path: &str, pack_data: &[u8]) -> Result<Option<WrittenPac
     let interrupt = AtomicBool::new(false);
 
     gix_pack::Bundle::write_to_directory(
-        &mut std::io::BufReader::new(pack_data),
+        &mut std::io::BufReader::new(file),
         Some(temp_dir.path()),
         &mut progress,
         &interrupt,

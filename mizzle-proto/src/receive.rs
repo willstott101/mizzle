@@ -27,37 +27,34 @@ pub struct RefUpdate {
     pub refname: String,
 }
 
-/// Parses a receive-pack request body: pkt-line ref-update commands (ending
-/// with a flush packet) followed by a raw packfile.
+/// Parses the pkt-line ref-update commands from a receive-pack request body,
+/// reading incrementally without buffering the trailing packfile.  Returns the
+/// parsed ref updates and the reader positioned at the start of the pack data.
 pub async fn read_receive_request<T: AsyncRead + Unpin>(
     mut body: T,
-) -> Result<(Vec<RefUpdate>, Vec<u8>)> {
-    // Buffer everything; the pack is raw binary after the pkt-line section.
-    let mut all_bytes = Vec::new();
-    body.read_to_end(&mut all_bytes).await?;
-
-    let mut pos = 0;
+) -> Result<(Vec<RefUpdate>, T)> {
     let mut ref_updates = Vec::new();
     let mut first_line = true;
+    let mut len_buf = [0u8; 4];
 
     loop {
-        if pos + 4 > all_bytes.len() {
-            break;
-        }
-        let len_str = std::str::from_utf8(&all_bytes[pos..pos + 4])?;
+        body.read_exact(&mut len_buf).await?;
+        let len_str = std::str::from_utf8(&len_buf)?;
         let len = usize::from_str_radix(len_str, 16)?;
 
         if len == 0 {
             // flush packet — end of ref-update section
-            pos += 4;
             break;
         }
-        if len < 4 || pos + len > all_bytes.len() {
-            break;
+        if len < 4 {
+            anyhow::bail!("invalid pkt-line length: {len}");
         }
 
-        let data = &all_bytes[pos + 4..pos + len];
-        let data = data.strip_suffix(b"\n").unwrap_or(data);
+        let payload_len = len - 4;
+        let mut data = vec![0u8; payload_len];
+        body.read_exact(&mut data).await?;
+
+        let data = data.strip_suffix(b"\n").unwrap_or(&data);
 
         // Strip capabilities (everything after NUL) from the first line.
         let line = if first_line {
@@ -81,12 +78,9 @@ pub async fn read_receive_request<T: AsyncRead + Unpin>(
                 refname,
             });
         }
-
-        pos += len;
     }
 
-    let pack_data = all_bytes[pos..].to_vec();
-    Ok((ref_updates, pack_data))
+    Ok((ref_updates, body))
 }
 
 /// Returns the number of objects in the pack, parsed from the pack header.

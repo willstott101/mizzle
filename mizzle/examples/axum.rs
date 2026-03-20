@@ -1,7 +1,8 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
-    extract::{Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     response::Response,
     routing::get,
     Router,
@@ -13,6 +14,8 @@ use log::info;
 use mizzle::servers::axum::serve;
 use mizzle::traits::{PushRef, RepoAccess};
 use simple_logger::SimpleLogger;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 struct Access {
     repo_path: String,
@@ -70,6 +73,12 @@ async fn main() {
 
     let app = Router::new()
         .route("/{*key}", get(git_handler).post(git_handler))
+        .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024)) // 5 GB
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            Duration::from_secs(300),
+        ))
+        .layer(ConcurrencyLimitLayer::new(64))
         .with_state(config);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
