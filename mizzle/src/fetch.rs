@@ -8,35 +8,57 @@ use gix_packetline::{
 
 pub use mizzle_proto::fetch::{read_fetch_args, read_fetch_args_v1, FetchArgs};
 
-/// Build a packfile from the given want/have sets, returning the raw pack bytes
-/// and the list of shallow boundary commits.
-fn build_pack_bytes(
+/// A write target that accumulates bytes between pack iterator steps,
+/// allowing the caller to drain and send them incrementally.
+struct ChunkBuffer {
+    data: std::sync::Mutex<Vec<u8>>,
+}
+
+impl ChunkBuffer {
+    fn new() -> Self {
+        Self {
+            data: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    fn drain(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.data.lock().unwrap())
+    }
+}
+
+impl std::io::Write for &ChunkBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.data.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Maximum payload per sideband data packet (65516 byte pkt-line minus 16
+/// bytes of overhead for the sideband channel framing).
+const MAX_SIDEBAND: usize = 65516 - 16;
+
+/// Stream pack data for the given objects as sideband-encoded packets.
+///
+/// Each chunk produced by the pack entry iterator is drained and sent
+/// immediately, so only one chunk's worth of pack data is held in memory
+/// at a time.
+async fn stream_pack_sideband(
     mut handle: gix::OdbHandle,
-    want: &[ObjectId],
-    have: &[ObjectId],
-    deepen: Option<u32>,
-    filter: Option<&crate::pack::Filter>,
+    objects: Vec<ObjectId>,
     thin_pack: bool,
-) -> anyhow::Result<(Vec<u8>, Vec<ObjectId>)> {
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
     handle.prevent_pack_unload();
     handle.ignore_replacements = true;
 
     let should_interrupt = AtomicBool::new(false);
     let progress = gix_features::progress::Discard {};
 
-    let pack_objects = crate::pack::objects_for_fetch_filtered(
-        handle.clone().into_inner(),
-        want,
-        have,
-        deepen,
-        filter,
-    )?;
-
-    let shallow = pack_objects.shallow.clone();
-
     let (counts, _) = gix_pack::data::output::count::objects(
         handle.clone().into_inner(),
-        Box::new(pack_objects.objects.into_iter().map(Ok)),
+        Box::new(objects.into_iter().map(Ok)),
         &progress,
         &should_interrupt,
         gix_pack::data::output::count::objects::Options {
@@ -61,17 +83,24 @@ fn build_pack_bytes(
         },
     ));
 
-    let mut buf: Vec<u8> = vec![];
+    let buf = ChunkBuffer::new();
     let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
         in_order_entries.by_ref(),
-        &mut buf,
+        &buf,
         num_objects as u32,
         Default::default(),
         gix_hash::Kind::default(),
     );
-    pack_iter.try_for_each(|_| Ok::<_, anyhow::Error>(()))?;
 
-    Ok((buf, shallow))
+    for chunk_result in &mut pack_iter {
+        chunk_result?;
+        let data = buf.drain();
+        for sub in data.chunks(MAX_SIDEBAND) {
+            band_to_write(Channel::Data, sub, &mut *writer).await?;
+        }
+    }
+
+    Ok(())
 }
 
 pub async fn perform_fetch(
@@ -121,29 +150,26 @@ pub async fn perform_fetch(
         .as_deref()
         .map(crate::pack::Filter::parse)
         .transpose()?;
-    let (pack_bytes, shallow) = build_pack_bytes(
-        handle,
+    let pack_objects = crate::pack::objects_for_fetch_filtered(
+        handle.clone().into_inner(),
         &args.want,
         &args.have,
         args.deepen,
         filter.as_ref(),
-        args.thin_pack,
     )?;
 
     // shallow-info section: tell the client which commits are shallow
     // boundaries so it knows not to expect their parents.
-    if !shallow.is_empty() {
+    if !pack_objects.shallow.is_empty() {
         text_to_write(b"shallow-info", &mut *writer).await?;
-        for id in &shallow {
+        for id in &pack_objects.shallow {
             text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
         }
         delim_to_write(&mut *writer).await?;
     }
 
     text_to_write(b"packfile", &mut *writer).await?;
-    for chunk in pack_bytes.chunks(65516 - 16) {
-        band_to_write(Channel::Data, chunk, &mut *writer).await?;
-    }
+    stream_pack_sideband(handle, pack_objects.objects, args.thin_pack, writer).await?;
     flush_to_write(&mut *writer).await?;
 
     Ok(())
@@ -163,23 +189,20 @@ pub async fn perform_fetch_v1(
         .as_deref()
         .map(crate::pack::Filter::parse)
         .transpose()?;
-    let (pack_bytes, shallow) = build_pack_bytes(
-        handle,
+    let pack_objects = crate::pack::objects_for_fetch_filtered(
+        handle.clone().into_inner(),
         &args.want,
         &args.have,
         args.deepen,
         filter.as_ref(),
-        args.thin_pack,
     )?;
 
     // In v1, shallow boundaries are sent before the NAK.
-    for id in &shallow {
+    for id in &pack_objects.shallow {
         text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
     }
     text_to_write(b"NAK", &mut *writer).await?;
-    for chunk in pack_bytes.chunks(65516 - 16) {
-        band_to_write(Channel::Data, chunk, &mut *writer).await?;
-    }
+    stream_pack_sideband(handle, pack_objects.objects, args.thin_pack, writer).await?;
     flush_to_write(&mut *writer).await?;
 
     Ok(())
