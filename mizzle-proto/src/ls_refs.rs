@@ -1,3 +1,4 @@
+use crate::limits::{check_limit, ProtocolLimits};
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use gix_packetline::PacketLineRef;
@@ -24,6 +25,7 @@ pub struct ListRefsArgs {
 
 pub async fn read_lsrefs_args<T>(
     parser: &mut gix_packetline::async_io::StreamingPeekableIter<T>,
+    limits: &ProtocolLimits,
 ) -> anyhow::Result<ListRefsArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
@@ -54,7 +56,14 @@ where
             PacketLineRef::Data(d) => {
                 let arg = d.strip_suffix(b"\n").unwrap_or(d);
                 match arg.strip_prefix(b"ref-prefix ") {
-                    Some(prefix) => args.prefixes.push(prefix.into()),
+                    Some(prefix) => {
+                        args.prefixes.push(prefix.into());
+                        check_limit(
+                            args.prefixes.len(),
+                            limits.max_ref_prefixes,
+                            "ref-prefix lines",
+                        )?;
+                    }
                     None => {
                         match arg {
                             b"peel" => args.peel = true,
@@ -68,4 +77,46 @@ where
         }
     }
     Ok(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gix_packetline::async_io::StreamingPeekableIter;
+
+    fn pkt_line(data: &[u8]) -> Vec<u8> {
+        let len = data.len() + 4;
+        let mut out = format!("{len:04x}").into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    const PKT_DELIMITER: &[u8] = b"0001";
+    const PKT_FLUSH: &[u8] = b"0000";
+
+    #[test]
+    fn rejects_too_many_ref_prefixes() {
+        futures_lite::future::block_on(async {
+            let limits = ProtocolLimits {
+                max_ref_prefixes: 2,
+                ..Default::default()
+            };
+
+            // read_lsrefs_args consumes the preamble (up to delimiter) internally.
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"ref-prefix refs/heads/\n"));
+            input.extend(pkt_line(b"ref-prefix refs/tags/\n"));
+            input.extend(pkt_line(b"ref-prefix refs/custom/\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let err = read_lsrefs_args(&mut parser, &limits).await.unwrap_err();
+            assert!(
+                err.to_string().contains("too many ref-prefix lines"),
+                "unexpected error: {err}"
+            );
+        });
+    }
 }

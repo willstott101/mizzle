@@ -95,7 +95,7 @@ impl SshTestServer {
         std::thread::spawn(move || {
             rt.block_on(async move {
                 tokio::select! {
-                    result = mizzle::servers::ssh::run_on_socket(&listener, config, auth) => {
+                    result = mizzle::servers::ssh::run_on_socket(&listener, config, auth, Default::default()) => {
                         if let Err(e) = result {
                             log::error!("SSH server error: {:#}", e);
                         }

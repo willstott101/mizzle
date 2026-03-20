@@ -263,7 +263,8 @@ async fn axum_git_handler(
     Path(path): Path<String>,
     req: Request,
 ) -> Response {
-    mizzle::servers::axum::serve((*config).clone(), &path, req).await
+    let limits = mizzle::serve::ProtocolLimits::default();
+    mizzle::servers::axum::serve((*config).clone(), &path, &limits, req).await
 }
 
 pub fn axum_server(config: Config) -> ServerHandle {

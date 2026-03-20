@@ -2,6 +2,7 @@ use anyhow::Result;
 use futures_lite::{AsyncRead, AsyncReadExt};
 use gix_hash::ObjectId;
 
+use crate::limits::{check_limit, ProtocolLimits};
 use crate::types::PushKind;
 
 /// Classifies a ref update without touching the object database.  Used for
@@ -32,6 +33,7 @@ pub struct RefUpdate {
 /// parsed ref updates and the reader positioned at the start of the pack data.
 pub async fn read_receive_request<T: AsyncRead + Unpin>(
     mut body: T,
+    limits: &ProtocolLimits,
 ) -> Result<(Vec<RefUpdate>, T)> {
     let mut ref_updates = Vec::new();
     let mut first_line = true;
@@ -77,6 +79,7 @@ pub async fn read_receive_request<T: AsyncRead + Unpin>(
                 new_oid,
                 refname,
             });
+            check_limit(ref_updates.len(), limits.max_ref_updates, "ref updates")?;
         }
     }
 
@@ -90,5 +93,67 @@ pub fn pack_object_count(data: &[u8]) -> Option<u32> {
         Some(u32::from_be_bytes(data[8..12].try_into().unwrap()))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pkt_line(data: &[u8]) -> Vec<u8> {
+        let len = data.len() + 4;
+        let mut out = format!("{len:04x}").into_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn ref_update_line(refname: &str) -> Vec<u8> {
+        let null = "0000000000000000000000000000000000000000";
+        let oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        pkt_line(format!("{null} {oid} {refname}\n").as_bytes())
+    }
+
+    #[test]
+    fn rejects_too_many_ref_updates() {
+        futures_lite::future::block_on(async {
+            let limits = ProtocolLimits {
+                max_ref_updates: 2,
+                ..Default::default()
+            };
+
+            let mut input = Vec::new();
+            for i in 0..3 {
+                input.extend(ref_update_line(&format!("refs/heads/branch-{i}")));
+            }
+            input.extend(b"0000");
+
+            let result = read_receive_request(input.as_slice(), &limits).await;
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("too many ref updates"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn accepts_ref_updates_at_limit() {
+        futures_lite::future::block_on(async {
+            let limits = ProtocolLimits {
+                max_ref_updates: 2,
+                ..Default::default()
+            };
+
+            let mut input = Vec::new();
+            for i in 0..2 {
+                input.extend(ref_update_line(&format!("refs/heads/branch-{i}")));
+            }
+            input.extend(b"0000");
+
+            let (updates, _) = read_receive_request(input.as_slice(), &limits)
+                .await
+                .unwrap();
+            assert_eq!(updates.len(), 2);
+        });
     }
 }

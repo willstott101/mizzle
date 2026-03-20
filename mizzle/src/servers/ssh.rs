@@ -7,7 +7,7 @@ use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use crate::serve::{serve_receive_pack, serve_upload_pack};
+use crate::serve::{serve_receive_pack, serve_upload_pack, ProtocolLimits};
 use crate::traits::RepoAccess;
 
 // TODO(config): make this configurable via run()/run_on_socket().
@@ -43,6 +43,7 @@ pub trait SshAuth: Send + Sync + 'static {
 
 struct MizzleSshHandler<A: SshAuth> {
     auth: Arc<A>,
+    limits: ProtocolLimits,
     user: Option<String>,
     public_key: Option<russh::keys::PublicKey>,
     exec_timeout: Option<tokio::task::JoinHandle<()>>,
@@ -150,6 +151,7 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
             .ok_or_else(|| anyhow::anyhow!("unknown channel {}", channel_id))?;
 
         let version = self.git_protocol_version;
+        let limits = self.limits;
         let handle = session.handle();
         let stream = channel.into_stream();
 
@@ -160,9 +162,11 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
 
             let result = match cmd {
                 GitCommand::UploadPack => {
-                    serve_upload_pack(access, reader, &mut writer, version).await
+                    serve_upload_pack(access, reader, &mut writer, version, &limits).await
                 }
-                GitCommand::ReceivePack => serve_receive_pack(access, reader, &mut writer).await,
+                GitCommand::ReceivePack => {
+                    serve_receive_pack(access, reader, &mut writer, &limits).await
+                }
             };
 
             let exit_code = match &result {
@@ -216,6 +220,7 @@ fn parse_git_command(command: &str) -> anyhow::Result<(GitCommand, &str)> {
 
 struct MizzleSshServer<A: SshAuth> {
     auth: Arc<A>,
+    limits: ProtocolLimits,
 }
 
 impl<A: SshAuth> russh::server::Server for MizzleSshServer<A> {
@@ -224,6 +229,7 @@ impl<A: SshAuth> russh::server::Server for MizzleSshServer<A> {
     fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self::Handler {
         MizzleSshHandler {
             auth: self.auth.clone(),
+            limits: self.limits,
             user: None,
             public_key: None,
             exec_timeout: None,
@@ -240,9 +246,10 @@ pub async fn run<A: SshAuth>(
     addr: impl tokio::net::ToSocketAddrs + Send,
     config: russh::server::Config,
     auth: A,
+    limits: ProtocolLimits,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    run_on_socket(&listener, config, auth).await
+    run_on_socket(&listener, config, auth, limits).await
 }
 
 /// Start an SSH server on an already-bound listener.
@@ -253,10 +260,12 @@ pub async fn run_on_socket<A: SshAuth>(
     listener: &tokio::net::TcpListener,
     config: russh::server::Config,
     auth: A,
+    limits: ProtocolLimits,
 ) -> anyhow::Result<()> {
     let config = Arc::new(config);
     let mut server = MizzleSshServer {
         auth: Arc::new(auth),
+        limits,
     };
 
     info!("Starting SSH server");

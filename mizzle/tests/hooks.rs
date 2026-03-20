@@ -82,7 +82,8 @@ where
         req: Request,
     ) -> Response {
         let access = state.1(state.0.as_str().into());
-        mizzle::servers::axum::serve(access, &path, req).await
+        let limits = mizzle::serve::ProtocolLimits::default();
+        mizzle::servers::axum::serve(access, &path, &limits, req).await
     }
 
     let state = Arc::new((repo_path.to_str().unwrap().to_string(), make_access));

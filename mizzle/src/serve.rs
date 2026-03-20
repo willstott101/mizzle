@@ -6,6 +6,7 @@ use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use gix_packetline::async_io::StreamingPeekableIter;
 use log::{error, info};
+pub use mizzle_proto::limits::ProtocolLimits;
 use piper::{Reader, Writer};
 use std::future::Future;
 use std::pin::Pin;
@@ -74,13 +75,14 @@ async fn recv_pack_post<T, A>(
     spawn: impl Fn(SpawnFut),
     access: A,
     repo_path: Box<str>,
+    limits: &ProtocolLimits,
     body: T,
 ) -> GitResponse
 where
     T: AsyncRead + Unpin,
     A: RepoAccess + Send + 'static,
 {
-    let (ref_updates, body) = res_try!(receive::read_receive_request(body).await);
+    let (ref_updates, body) = res_try!(receive::read_receive_request(body, limits).await);
 
     // Preliminary auth check before touching the disk.
     let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
@@ -263,6 +265,7 @@ pub async fn serve_git_protocol_1<T, A, S>(
     protocol_path: Box<str>,
     query_string: Box<str>,
     content_type: Box<str>,
+    limits: &ProtocolLimits,
     body: T,
 ) -> GitResponse
 where
@@ -315,7 +318,7 @@ where
                 ),
             };
         }
-        return recv_pack_post(spawn, access, repo_path, body).await;
+        return recv_pack_post(spawn, access, repo_path, limits, body).await;
     }
 
     // Upload-pack: POST /git-upload-pack
@@ -330,7 +333,7 @@ where
                 ),
             };
         }
-        let mut args = res_try!(fetch::read_fetch_args_v1(body).await);
+        let mut args = res_try!(fetch::read_fetch_args_v1(body, limits).await);
         let repo = res_try!(gix::open(repo_path.as_ref()));
         for refname in &args.want_refs {
             if let Ok(mut r) = repo.find_reference(refname.as_str()) {
@@ -368,6 +371,7 @@ pub async fn serve_git_protocol_2<T, A, S>(
     protocol_path: Box<str>,
     query_string: Box<str>,
     content_type: Box<str>,
+    limits: &ProtocolLimits,
     body: T,
 ) -> GitResponse
 where
@@ -412,7 +416,7 @@ where
                 ),
             };
         }
-        return recv_pack_post(spawn, access, repo_path, body).await;
+        return recv_pack_post(spawn, access, repo_path, limits, body).await;
     }
 
     // Upload-pack: POST /git-upload-pack
@@ -432,7 +436,7 @@ where
         let command = res_try!(read_command(&mut parser).await);
         match command {
             Command::ListRefs => {
-                let args = res_try!(ls_refs::read_lsrefs_args(&mut parser).await);
+                let args = res_try!(ls_refs::read_lsrefs_args(&mut parser, limits).await);
                 let repo = res_try!(gix::open(repo_path.as_ref())).into_sync();
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
@@ -450,7 +454,7 @@ where
             }
             Command::Empty => (),
             Command::Fetch => {
-                let mut args = res_try!(fetch::read_fetch_args(&mut parser).await);
+                let mut args = res_try!(fetch::read_fetch_args(&mut parser, limits).await);
                 let repo = res_try!(gix::open(repo_path.as_ref()));
                 // Resolve any want-ref names to OIDs and add to wants.
                 for refname in &args.want_refs {
@@ -526,6 +530,7 @@ pub async fn serve_upload_pack<R, W, A>(
     reader: R,
     writer: &mut W,
     version: u32,
+    limits: &ProtocolLimits,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -550,12 +555,12 @@ where
             };
             match command {
                 Command::ListRefs => {
-                    let args = ls_refs::read_lsrefs_args(&mut parser).await?;
+                    let args = ls_refs::read_lsrefs_args(&mut parser, limits).await?;
                     let repo = gix::open(repo_path.as_ref())?.into_sync();
                     ls_refs::perform_listrefs(&repo, &args, writer).await?;
                 }
                 Command::Fetch => {
-                    let mut args = fetch::read_fetch_args(&mut parser).await?;
+                    let mut args = fetch::read_fetch_args(&mut parser, limits).await?;
                     let repo = gix::open(repo_path.as_ref())?;
                     for refname in &args.want_refs {
                         if let Ok(mut r) = repo.find_reference(refname.as_str()) {
@@ -575,7 +580,7 @@ where
         let refs = gather_upload_pack_v1_refs(repo_path.as_ref())?;
         upload_pack_v1_refs(&refs, writer).await?;
 
-        let mut args = fetch::read_fetch_args_v1(reader).await?;
+        let mut args = fetch::read_fetch_args_v1(reader, limits).await?;
         let repo = gix::open(repo_path.as_ref())?;
         for refname in &args.want_refs {
             if let Ok(mut r) = repo.find_reference(refname.as_str()) {
@@ -595,7 +600,12 @@ where
 /// This is the core logic used by the SSH transport. The caller is responsible
 /// for providing the read and write sides and for any post-protocol cleanup
 /// (e.g. sending SSH exit-status).
-pub async fn serve_receive_pack<R, W, A>(access: A, reader: R, writer: &mut W) -> anyhow::Result<()>
+pub async fn serve_receive_pack<R, W, A>(
+    access: A,
+    reader: R,
+    writer: &mut W,
+    limits: &ProtocolLimits,
+) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -613,7 +623,7 @@ where
     receive::info_refs_receive_pack_task(refs, writer).await?;
 
     // Read the ref update commands (the reader is left positioned at the pack).
-    let (ref_updates, reader) = receive::read_receive_request(reader).await?;
+    let (ref_updates, reader) = receive::read_receive_request(reader, limits).await?;
 
     // Preliminary auth check.
     let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates

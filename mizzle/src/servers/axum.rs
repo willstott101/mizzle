@@ -10,7 +10,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse},
+    serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse, ProtocolLimits},
     traits::RepoAccess,
 };
 
@@ -38,6 +38,7 @@ impl IntoResponse for GitResponse {
 pub async fn serve<A: RepoAccess + Send + 'static>(
     access: A,
     path: &str,
+    limits: &ProtocolLimits,
     req: Request,
 ) -> Response {
     let git_protocol = req
@@ -75,6 +76,7 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
             service_path.into(),
             query_string,
             content_type,
+            limits,
             reader,
         )
         .await
@@ -88,6 +90,7 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
             service_path.into(),
             query_string,
             content_type,
+            limits,
             reader,
         )
         .await

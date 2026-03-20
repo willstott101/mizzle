@@ -1,3 +1,4 @@
+use crate::limits::{check_limit, ProtocolLimits};
 use crate::utils::skip_till_delimiter;
 use anyhow::Context;
 use gix_hash::ObjectId;
@@ -54,6 +55,7 @@ pub struct FetchArgs {
 
 pub async fn read_fetch_args<T>(
     parser: &mut gix_packetline::async_io::StreamingPeekableIter<T>,
+    limits: &ProtocolLimits,
 ) -> anyhow::Result<FetchArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
@@ -87,10 +89,13 @@ where
                 let arg = d.strip_suffix(b"\n").unwrap_or(d);
                 if let Some(oid) = arg.strip_prefix(b"want ") {
                     args.want.push(ObjectId::from_hex(oid)?);
+                    check_limit(args.want.len(), limits.max_wants, "want lines")?;
                 } else if let Some(oid) = arg.strip_prefix(b"have ") {
                     args.have.push(ObjectId::from_hex(oid)?);
+                    check_limit(args.have.len(), limits.max_haves, "have lines")?;
                 } else if let Some(refname) = arg.strip_prefix(b"want-ref ") {
                     args.want_refs.push(String::from_utf8(refname.to_vec())?);
+                    check_limit(args.want_refs.len(), limits.max_want_refs, "want-ref lines")?;
                 } else if let Some(depth) = arg.strip_prefix(b"deepen ") {
                     let n = std::str::from_utf8(depth)?
                         .parse::<u32>()
@@ -136,7 +141,7 @@ where
 /// flush (0000)
 /// PKT-LINE(done\n)
 /// ```
-pub async fn read_fetch_args_v1<T>(body: T) -> anyhow::Result<FetchArgs>
+pub async fn read_fetch_args_v1<T>(body: T, limits: &ProtocolLimits) -> anyhow::Result<FetchArgs>
 where
     T: futures_lite::AsyncRead + Unpin,
 {
@@ -172,6 +177,7 @@ where
                         None => (rest, None),
                     };
                     args.want.push(ObjectId::from_hex(oid_bytes)?);
+                    check_limit(args.want.len(), limits.max_wants, "want lines")?;
                     if let Some(caps) = caps_opt {
                         for cap in caps.split(|&b| b == b' ') {
                             match cap {
@@ -185,6 +191,7 @@ where
                     }
                 } else if let Some(rest) = data.strip_prefix(b"have ") {
                     args.have.push(ObjectId::from_hex(rest)?);
+                    check_limit(args.have.len(), limits.max_haves, "have lines")?;
                 } else if let Some(depth) = data.strip_prefix(b"deepen ") {
                     let n = std::str::from_utf8(depth)?
                         .parse::<u32>()
@@ -235,7 +242,8 @@ mod tests {
             input.extend(PKT_FLUSH);
 
             let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
-            let args = read_fetch_args(&mut parser).await.unwrap();
+            let limits = crate::limits::ProtocolLimits::default();
+            let args = read_fetch_args(&mut parser, &limits).await.unwrap();
 
             assert_eq!(args.want_refs, vec!["refs/heads/main".to_string()]);
             assert!(args.want.is_empty());
@@ -253,7 +261,8 @@ mod tests {
             input.extend(PKT_FLUSH);
 
             let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
-            let args = read_fetch_args(&mut parser).await.unwrap();
+            let limits = crate::limits::ProtocolLimits::default();
+            let args = read_fetch_args(&mut parser, &limits).await.unwrap();
 
             assert!(args.wait_for_done);
         });
@@ -271,7 +280,8 @@ mod tests {
             input.extend(PKT_FLUSH);
 
             let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
-            let args = read_fetch_args(&mut parser).await.unwrap();
+            let limits = crate::limits::ProtocolLimits::default();
+            let args = read_fetch_args(&mut parser, &limits).await.unwrap();
 
             assert_eq!(
                 args.want_refs,
@@ -292,7 +302,8 @@ mod tests {
             input.extend(PKT_FLUSH);
 
             let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
-            let args = read_fetch_args(&mut parser).await.unwrap();
+            let limits = crate::limits::ProtocolLimits::default();
+            let args = read_fetch_args(&mut parser, &limits).await.unwrap();
 
             assert_eq!(args.deepen, Some(3));
             assert!(args.done);
@@ -310,9 +321,86 @@ mod tests {
             input.extend(PKT_FLUSH);
 
             let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
-            let args = read_fetch_args(&mut parser).await.unwrap();
+            let limits = crate::limits::ProtocolLimits::default();
+            let args = read_fetch_args(&mut parser, &limits).await.unwrap();
 
             assert_eq!(args.filter, Some("blob:none".to_string()));
+        });
+    }
+
+    #[test]
+    fn rejects_too_many_wants() {
+        futures_lite::future::block_on(async {
+            let limits = crate::limits::ProtocolLimits {
+                max_wants: 2,
+                ..Default::default()
+            };
+
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            for i in 0..3u8 {
+                let oid = format!("{:0>40x}", i + 1);
+                input.extend(pkt_line(format!("want {oid}\n").as_bytes()));
+            }
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let err = read_fetch_args(&mut parser, &limits).await.unwrap_err();
+            assert!(
+                err.to_string().contains("too many want lines"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_too_many_haves() {
+        futures_lite::future::block_on(async {
+            let limits = crate::limits::ProtocolLimits {
+                max_haves: 1,
+                ..Default::default()
+            };
+
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            for i in 0..2u8 {
+                let oid = format!("{:0>40x}", i + 1);
+                input.extend(pkt_line(format!("have {oid}\n").as_bytes()));
+            }
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let err = read_fetch_args(&mut parser, &limits).await.unwrap_err();
+            assert!(
+                err.to_string().contains("too many have lines"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
+    #[test]
+    fn rejects_too_many_want_refs() {
+        futures_lite::future::block_on(async {
+            let limits = crate::limits::ProtocolLimits {
+                max_want_refs: 1,
+                ..Default::default()
+            };
+
+            let mut input = Vec::new();
+            input.extend(pkt_line(b"agent=test/1.0\n"));
+            input.extend(PKT_DELIMITER);
+            input.extend(pkt_line(b"want-ref refs/heads/a\n"));
+            input.extend(pkt_line(b"want-ref refs/heads/b\n"));
+            input.extend(PKT_FLUSH);
+
+            let mut parser = StreamingPeekableIter::new(input.as_slice(), &[], false);
+            let err = read_fetch_args(&mut parser, &limits).await.unwrap_err();
+            assert!(
+                err.to_string().contains("too many want-ref lines"),
+                "unexpected error: {err}"
+            );
         });
     }
 }

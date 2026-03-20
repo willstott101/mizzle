@@ -11,6 +11,7 @@ use axum::{
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use log::info;
+use mizzle::serve::ProtocolLimits;
 use mizzle::servers::axum::serve;
 use mizzle::traits::{PushRef, RepoAccess};
 use simple_logger::SimpleLogger;
@@ -52,12 +53,13 @@ async fn git_handler(
     let access = Access {
         repo_path: config.repo_path.clone(),
     };
-    serve(access, &path, req).await
+    serve(access, &path, &config.limits, req).await
 }
 
 #[derive(Clone)]
 struct Config {
     repo_path: String,
+    limits: ProtocolLimits,
 }
 
 #[tokio::main]
@@ -69,6 +71,7 @@ async fn main() {
 
     let config = Arc::new(Config {
         repo_path: ".".to_string(),
+        limits: ProtocolLimits::default(),
     });
 
     let app = Router::new()
