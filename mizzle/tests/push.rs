@@ -3,14 +3,15 @@ mod common;
 use std::fs;
 use tempfile::tempdir;
 
-use common::{test_with_servers, Config};
+use common::Config;
 
-test_with_servers!(test_push, |start_server| {
+#[test]
+fn test_push() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path().clone(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     // Clone the repo from the server.
     let clone_dir = tempdir()?;
@@ -43,4 +44,4 @@ test_with_servers!(test_push, |start_server| {
 
     server.stop();
     Ok(())
-});
+}

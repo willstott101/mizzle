@@ -136,9 +136,7 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
                     user, repo_path,
                 );
                 // ext=1 is stderr in the SSH protocol.
-                let _ = handle
-                    .extended_data(channel_id, 1, msg.into_bytes())
-                    .await;
+                let _ = handle.extended_data(channel_id, 1, msg.into_bytes()).await;
                 let _ = handle.exit_status_request(channel_id, 1).await;
                 let _ = handle.eof(channel_id).await;
                 let _ = handle.close(channel_id).await;

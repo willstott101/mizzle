@@ -8,7 +8,6 @@ use tempfile::tempdir;
 use mizzle::traits::{PushKind, PushRef, RepoAccess};
 
 /// Spin up an axum server pointing at a repo path that does not exist.
-#[cfg(feature = "axum")]
 fn bad_repo_server() -> common::ServerHandle {
     common::axum_server(common::Config {
         bare_repo_path: PathBuf::from("/nonexistent/path/that/does/not/exist.git"),
@@ -54,7 +53,6 @@ impl RepoAccess for KindFilterAccess {
 }
 
 /// Spin up an axum server whose handler always returns 403 before calling mizzle.
-#[cfg(feature = "axum")]
 fn deny_all_server() -> common::ServerHandle {
     use axum::{http::StatusCode, routing::get, Router};
 
@@ -88,13 +86,11 @@ fn deny_all_server() -> common::ServerHandle {
 }
 
 /// Spin up an axum server that uses DenyPushAccess — reads work, all pushes rejected.
-#[cfg(feature = "axum")]
 fn deny_push_server(bare_repo_path: PathBuf) -> common::ServerHandle {
     axum_access_server(bare_repo_path, |repo_path| DenyPushAccess { repo_path })
 }
 
 /// Spin up an axum server that uses KindFilterAccess — reads work, one push kind rejected.
-#[cfg(feature = "axum")]
 fn kind_filter_server(bare_repo_path: PathBuf, denied: PushKind) -> common::ServerHandle {
     axum_access_server(bare_repo_path, move |repo_path| KindFilterAccess {
         repo_path,
@@ -103,7 +99,6 @@ fn kind_filter_server(bare_repo_path: PathBuf, denied: PushKind) -> common::Serv
 }
 
 /// Generic axum server builder: constructs an access object from the repo path per request.
-#[cfg(feature = "axum")]
 fn axum_access_server<A, F>(bare_repo_path: PathBuf, make_access: F) -> common::ServerHandle
 where
     A: RepoAccess + Send + 'static,
@@ -157,7 +152,6 @@ where
     })
 }
 
-#[cfg(feature = "axum")]
 #[test]
 fn test_clone_denied() {
     let temprepo = common::temprepo().unwrap();
@@ -179,7 +173,6 @@ fn test_clone_denied() {
     drop(temprepo);
 }
 
-#[cfg(feature = "axum")]
 #[test]
 fn test_push_denied() {
     let temprepo = common::temprepo().unwrap();
@@ -219,7 +212,6 @@ fn test_push_denied() {
     server.stop();
 }
 
-#[cfg(feature = "axum")]
 #[test]
 fn test_force_push_denied() {
     let temprepo = common::temprepo().unwrap();
@@ -259,7 +251,6 @@ fn test_force_push_denied() {
     server.stop();
 }
 
-#[cfg(feature = "axum")]
 #[test]
 fn test_create_denied() {
     let temprepo = common::temprepo().unwrap();
@@ -295,7 +286,6 @@ fn test_create_denied() {
     server.stop();
 }
 
-#[cfg(feature = "axum")]
 #[test]
 fn test_delete_denied() {
     let temprepo = common::temprepo().unwrap();
@@ -330,7 +320,6 @@ fn test_delete_denied() {
 
 /// A server pointing at a non-existent repo path should return HTTP 500 with a
 /// non-empty error body immediately — not a silent truncated stream.
-#[cfg(feature = "axum")]
 #[test]
 fn test_bad_repo_path_returns_500() {
     let server = bad_repo_server();

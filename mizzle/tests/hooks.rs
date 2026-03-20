@@ -60,7 +60,6 @@ impl RepoAccess for RecordingAccess {
 
 // ── Server helpers ────────────────────────────────────────────────────────────
 
-#[cfg(feature = "axum")]
 fn axum_access_server<A, F>(repo_path: PathBuf, make_access: F) -> common::ServerHandle
 where
     A: RepoAccess + Send + 'static,
@@ -118,7 +117,6 @@ where
 
 /// Push to a repo path that does not exist yet.  With auto_init enabled the
 /// push should succeed and leave the repo in place.
-#[cfg(feature = "axum")]
 #[test]
 fn test_auto_init_creates_repo_on_push() {
     let temp = tempdir().unwrap();
@@ -154,7 +152,6 @@ fn test_auto_init_creates_repo_on_push() {
 }
 
 /// With auto_init disabled, pushing to a nonexistent path returns a 500.
-#[cfg(feature = "axum")]
 #[test]
 fn test_auto_init_disabled_returns_error() {
     let temp = tempdir().unwrap();
@@ -187,7 +184,6 @@ fn test_auto_init_disabled_returns_error() {
 /// Note: post_receive runs inside the spawn that writes the git response, so
 /// the HTTP response stream only closes (and git considers the push complete)
 /// after post_receive returns.  No sleep or extra synchronisation is needed.
-#[cfg(feature = "axum")]
 #[test]
 fn test_post_receive_called_after_push() {
     let temprepo = common::temprepo().unwrap();
@@ -230,7 +226,6 @@ fn test_post_receive_called_after_push() {
 }
 
 /// post_receive must NOT be called when authorize_push rejects the push.
-#[cfg(feature = "axum")]
 #[test]
 fn test_post_receive_not_called_on_rejection() {
     let temprepo = common::temprepo().unwrap();

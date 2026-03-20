@@ -2,14 +2,15 @@ mod common;
 
 use tempfile::tempdir;
 
-use common::{test_with_servers, Config};
+use common::Config;
 
-test_with_servers!(test_clone_protocol_v1, |start_server| {
+#[test]
+fn test_clone_protocol_v1() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let clone_dir = tempdir()?;
     // -c protocol.version=0 forces the client to use the old dumb HTTP
@@ -37,14 +38,15 @@ test_with_servers!(test_clone_protocol_v1, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
-test_with_servers!(test_clone, |start_server| {
+#[test]
+fn test_clone() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let git_output = common::run_git(
         tempdir()?.path(),
@@ -57,14 +59,15 @@ test_with_servers!(test_clone, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
-test_with_servers!(test_shallow_clone, |start_server| {
+#[test]
+fn test_shallow_clone() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let clone_dir = tempdir()?;
     common::run_git(
@@ -99,16 +102,17 @@ test_with_servers!(test_shallow_clone, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
 // The temprepo has 3 commits (2 on main, 1 on dev).  --depth 2 on main
 // should return exactly 2 commits, catching off-by-one boundary errors.
-test_with_servers!(test_shallow_clone_depth_2, |start_server| {
+#[test]
+fn test_shallow_clone_depth_2() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let clone_dir = tempdir()?;
     common::run_git(
@@ -140,14 +144,15 @@ test_with_servers!(test_shallow_clone_depth_2, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
-test_with_servers!(test_partial_clone_tree_none, |start_server| {
+#[test]
+fn test_partial_clone_tree_none() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let clone_dir = tempdir()?;
     common::run_git(
@@ -176,14 +181,15 @@ test_with_servers!(test_partial_clone_tree_none, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
-test_with_servers!(test_partial_clone_blob_none, |start_server| {
+#[test]
+fn test_partial_clone_blob_none() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let clone_dir = tempdir()?;
     common::run_git(
@@ -212,4 +218,4 @@ test_with_servers!(test_partial_clone_blob_none, |start_server| {
 
     server.stop();
     Ok(())
-});
+}

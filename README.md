@@ -39,7 +39,7 @@ This unlocks things that are difficult or impossible with forge software today:
       └─────────────────────┘  └─────────────────────────┘
 ```
 
-The `Transport` layer speaks to any HTTP server framework (Axum, Actix, etc.) via a thin integration crate — mizzle is not coupled to a particular async runtime or web framework.
+The `Transport` layer requires tokio and ships with an axum adapter for HTTP. Mizzle is a library, so forges can serve git and their own web API from the same process — avoiding proxy overhead between the forge API and git data access. The core protocol handlers accept generic `AsyncRead`/`AsyncWrite` types, so any tokio-based framework can integrate directly without an adapter.
 
 The `Auth` layer receives structured information about the operation being requested (repo path, ref name, push kind) and returns a decision. It never opens the repository.
 
@@ -81,7 +81,6 @@ Protocol support (gitoxide backend, HTTP transport):
 
 Planned:
 
-- [ ] SSH transport
 - [ ] FS + git CLI backend (baseline for correctness comparison)
 - [ ] SQL backend (proof of concept)
 - [ ] Cross-backend integration test harness

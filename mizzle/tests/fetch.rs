@@ -8,10 +8,10 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use common::{axum_server, test_with_servers, Config};
+use common::{axum_server, Config};
 
 /// A TCP proxy that sits between the git client and the mizzle server, recording
-/// all server→client bytes for every connection.  Run git commands through
+/// all server->client bytes for every connection.  Run git commands through
 /// `proxy.port`; afterwards call `has_thin_pack_in_response` to inspect the
 /// captured traffic.
 struct SniffingProxy {
@@ -60,7 +60,7 @@ impl SniffingProxy {
     }
 }
 
-/// Proxy one TCP connection: forward client↔server, capturing server→client bytes.
+/// Proxy one TCP connection: forward client<->server, capturing server->client bytes.
 fn proxy_connection(client: TcpStream, upstream_port: u16) -> anyhow::Result<Vec<u8>> {
     let server = TcpStream::connect(format!("127.0.0.1:{upstream_port}"))?;
     let mut client_r = client.try_clone()?;
@@ -68,15 +68,15 @@ fn proxy_connection(client: TcpStream, upstream_port: u16) -> anyhow::Result<Vec
     let mut server_r = server.try_clone()?;
     let mut server_w = server;
 
-    // Forward client → server.  When the client closes its write side (git is
-    // done sending), half-close the proxy→server direction so the server sees
+    // Forward client -> server.  When the client closes its write side (git is
+    // done sending), half-close the proxy->server direction so the server sees
     // EOF and can close its side promptly, unblocking our capture loop below.
     let fwd = thread::spawn(move || {
         let _ = io::copy(&mut client_r, &mut server_w);
         let _ = server_w.shutdown(std::net::Shutdown::Write);
     });
 
-    // Forward server → client, capturing everything sent.
+    // Forward server -> client, capturing everything sent.
     let mut captured = Vec::new();
     let mut buf = [0u8; 16384];
     loop {
@@ -94,7 +94,7 @@ fn proxy_connection(client: TcpStream, upstream_port: u16) -> anyhow::Result<Vec
     Ok(captured)
 }
 
-/// Parse raw server→client TCP bytes and extract sideband channel-1 pack bytes
+/// Parse raw server->client TCP bytes and extract sideband channel-1 pack bytes
 /// from a git-upload-pack response.  A single captured TCP stream may contain
 /// multiple HTTP responses (HTTP/1.1 keep-alive), so this iterates over all of
 /// them and returns the first one that contains packfile data.
@@ -209,8 +209,8 @@ fn pack_from_pkt_lines(body: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Verifies that a pack is "truly thin":
-///   1. It contains at least one OBJ_REF_DELTA (type 7) entry — the delta.
-///   2. It contains no full OBJ_BLOB (type 3) entries — the base blob is absent.
+///   1. It contains at least one OBJ_REF_DELTA (type 7) entry -- the delta.
+///   2. It contains no full OBJ_BLOB (type 3) entries -- the base blob is absent.
 ///
 /// In this test the only differing content between commits is a large blob.  A
 /// correct thin pack sends the new blob as a RefDelta against the old blob (which
@@ -239,12 +239,13 @@ fn is_thin_pack(pack: &[u8]) -> anyhow::Result<bool> {
     Ok(ref_delta_count > 0 && full_blob_count == 0)
 }
 
-test_with_servers!(test_fetch, |start_server| {
+#[test]
+fn test_fetch() -> anyhow::Result<()> {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path().clone(),
     };
-    let server = start_server(config);
+    let server = common::axum_server(config);
 
     let cloned = tempdir()?;
 
@@ -286,7 +287,7 @@ test_with_servers!(test_fetch, |start_server| {
 
     server.stop();
     Ok(())
-});
+}
 
 // Verifies that the server correctly honours the `thin-pack` fetch capability.
 //
@@ -306,10 +307,10 @@ test_with_servers!(test_fetch, |start_server| {
 // client has existing objects, so no special client flags are needed.
 //
 // We verify correctness two ways:
-//   a. `git fsck` — git thickens thin packs on receipt and fsck catches any pack
+//   a. `git fsck` -- git thickens thin packs on receipt and fsck catches any pack
 //      that references a base the client doesn't have.
-//   b. Wire sniffing — a TCP proxy sits between the real git client and our
-//      server; we parse the captured server→client bytes and assert that at least
+//   b. Wire sniffing -- a TCP proxy sits between the real git client and our
+//      server; we parse the captured server->client bytes and assert that at least
 //      one OBJ_REF_DELTA (type-7) entry appears in the pack git actually received.
 #[test]
 fn fetch_with_thin_pack() -> anyhow::Result<()> {
@@ -318,7 +319,7 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
 
     // Push a large file (~200 KB, moderate entropy) so git will definitely build
     // a delta chain between the old and new blob during repack.  We use numbered
-    // lines so the content isn't trivially compressible — git skips delta
+    // lines so the content isn't trivially compressible -- git skips delta
     // compression when zlib shrinks blobs to almost nothing.
     let setup_work = tempdir()?;
     common::run_git(setup_work.path(), ["clone", server.to_str().unwrap()])?;
@@ -342,7 +343,7 @@ fn fetch_with_thin_pack() -> anyhow::Result<()> {
     let server_port = handle.port;
 
     // A sniffing proxy forwards all traffic to the server and records every
-    // server→client response.  All git HTTP operations below go through it.
+    // server->client response.  All git HTTP operations below go through it.
     let proxy = SniffingProxy::new(server_port);
 
     // Clone so the client holds the large file.
