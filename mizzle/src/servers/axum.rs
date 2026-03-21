@@ -11,7 +11,7 @@ use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    backend::fs_gitoxide::FsGitoxide,
+    backend::{fs_gitoxide::FsGitoxide, StorageBackend},
     serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse, ProtocolLimits},
     traits::RepoAccess,
 };
@@ -44,6 +44,24 @@ pub async fn serve<A: RepoAccess<RepoId = PathBuf> + Send + 'static>(
     limits: &ProtocolLimits,
     req: Request,
 ) -> Response {
+    serve_with_backend(access, FsGitoxide, path, limits, req).await
+}
+
+/// Serve a git request using an arbitrary [`StorageBackend`].
+///
+/// This is the generic version of [`serve`] — use it when you want to plug in
+/// a backend other than the default [`FsGitoxide`].
+pub async fn serve_with_backend<A, B>(
+    access: A,
+    backend: B,
+    path: &str,
+    limits: &ProtocolLimits,
+    req: Request,
+) -> Response
+where
+    A: RepoAccess + Send + 'static,
+    B: StorageBackend<RepoId = A::RepoId> + Clone + Send + 'static,
+{
     let git_protocol = req
         .headers()
         .get("Git-Protocol")
@@ -69,8 +87,6 @@ pub async fn serve<A: RepoAccess<RepoId = PathBuf> + Send + 'static>(
     let Some((_, service_path)) = path.rsplit_once(".git/") else {
         return (StatusCode::BAD_REQUEST, "Path doesn't look like a git URL").into_response();
     };
-
-    let backend = FsGitoxide;
 
     if git_protocol.as_str() == "version=2" {
         serve_git_protocol_2(

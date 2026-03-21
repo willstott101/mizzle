@@ -300,3 +300,62 @@ pub fn axum_server(config: Config) -> ServerHandle {
         let _ = tx.send(());
     })
 }
+
+/// Spin up an axum test server with an arbitrary [`StorageBackend`].
+pub fn axum_server_with_backend<B>(config: Config, backend: B) -> ServerHandle
+where
+    B: mizzle::backend::StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+{
+    init_logging();
+
+    async fn handler_with_backend<B>(
+        State(state): State<Arc<(Config, B)>>,
+        Path(path): Path<String>,
+        req: Request,
+    ) -> Response
+    where
+        B: mizzle::backend::StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+    {
+        let limits = mizzle::serve::ProtocolLimits::default();
+        mizzle::servers::axum::serve_with_backend(
+            state.0.clone(),
+            state.1.clone(),
+            &path,
+            &limits,
+            req,
+        )
+        .await
+    }
+
+    let state = Arc::new((config, backend));
+
+    let app = Router::new()
+        .route(
+            "/{*key}",
+            get(handler_with_backend::<B>).post(handler_with_backend::<B>),
+        )
+        .with_state(state);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+        })
+        .unwrap()
+    });
+
+    ServerHandle::new(port, move || {
+        let _ = tx.send(());
+    })
+}

@@ -4,6 +4,7 @@
 //! allowing alternative backends (filesystem with git CLI, SQL, distributed KV)
 //! to be plugged in alongside the default [`FsGitoxide`](fs_gitoxide::FsGitoxide).
 
+pub mod fs_git_cli;
 pub mod fs_gitoxide;
 
 use std::path::Path;

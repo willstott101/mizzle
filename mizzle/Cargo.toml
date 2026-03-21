@@ -36,5 +36,6 @@ name = "axum"
 required-features = ["axum"]
 
 [dev-dependencies]
+paste = "1"
 tower = { version = "0.5.3", features = ["limit"] }
 tower-http = { version = "0.6.8", features = ["timeout", "limit"] }
