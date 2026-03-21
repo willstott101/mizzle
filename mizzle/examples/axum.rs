@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use log::info;
 use mizzle::serve::ProtocolLimits;
 use mizzle::servers::axum::serve;
-use mizzle::traits::{PushRef, RepoAccess};
+use mizzle::traits::{PackMetadata, PushRef, RepoAccess};
 use simple_logger::SimpleLogger;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -30,7 +30,11 @@ impl RepoAccess for Access {
         &self.repo_path
     }
 
-    fn authorize_push(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
+    fn authorize_push(
+        &self,
+        refs: &[PushRef<'_>],
+        _pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
         for r in refs {
             if !r.refname.starts_with("refs/heads/") {
                 return Err(format!("pushes to {} are not allowed", r.refname));

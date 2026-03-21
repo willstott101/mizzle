@@ -5,6 +5,8 @@ use std::pin::Pin;
 
 pub use mizzle_proto::types::{PushKind, PushRef};
 
+pub use crate::backend::PackMetadata;
+
 /// Boxed future returned by [`RepoAccess::post_receive`].
 pub type PostReceiveFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
@@ -46,8 +48,22 @@ pub trait RepoAccess {
     /// computed the [`PushKind`] for each ref.  Return `Err(reason)` to reject
     /// the entire push; `reason` is forwarded to the client.
     ///
+    /// `pack` is `Some` on the post-ingestion call when the push includes
+    /// pack data. It is `None` for the preliminary (pre-ingestion) call and
+    /// for delete-only pushes.
+    ///
+    /// **Security note:** this method is called *twice* per push — once before
+    /// ingestion (`pack = None`) and once after (`pack = Some(…)`).  Any check
+    /// that depends on pack metadata (e.g. requiring signed commits) **must**
+    /// gate on `pack.is_some()` rather than unconditionally passing when `pack`
+    /// is `None`, otherwise the preliminary call will bypass the check.
+    ///
     /// This must be cheap — see the [design contract](RepoAccess#design-contract).
-    fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
+    fn authorize_push(
+        &self,
+        _refs: &[PushRef<'_>],
+        _pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
         Ok(())
     }
 
@@ -79,8 +95,12 @@ impl<T: RepoAccess + ?Sized> RepoAccess for Box<T> {
     fn repo_id(&self) -> &T::RepoId {
         (**self).repo_id()
     }
-    fn authorize_push(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
-        (**self).authorize_push(refs)
+    fn authorize_push(
+        &self,
+        refs: &[PushRef<'_>],
+        pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
+        (**self).authorize_push(refs, pack)
     }
     fn post_receive<'a>(&'a self, refs: &'a [PushRef<'a>]) -> PostReceiveFut<'a> {
         (**self).post_receive(refs)

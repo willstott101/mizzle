@@ -34,13 +34,7 @@ Full-bypass backend that hands off to git CLI after auth. Use as the
 correctness oracle: run the integration tests against both `FsGitoxide`
 and `FsGitCli` and verify identical behaviour.
 
-### Phase 5.1 - Fixes
-Pack inspection at the protocol level for rejecting/accepting signed commits and similar?
-Temp written pack for inspection shouldn't assume anything about the tmp storage and accept
-a location in config.
-Do we have good progress info for cloning/fetching.
-
-### Phase 5.2 - Optimisations
+### Phase 5.1 - Optimisations
 Use bitmasks or whatever they're called to optimise pack inspection.
 Optimise by shipping pack as-is on disk when possible?
 

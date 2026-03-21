@@ -8,6 +8,7 @@ pub mod fs_git_cli;
 pub mod fs_gitoxide;
 
 use std::path::Path;
+use std::sync::mpsc;
 
 use anyhow::Result;
 use gix::ObjectId;
@@ -16,6 +17,49 @@ use crate::traits::PushKind;
 
 pub use mizzle_proto::pack::Filter;
 pub use mizzle_proto::receive::RefUpdate;
+
+// ---------------------------------------------------------------------------
+// Pack inspection types
+// ---------------------------------------------------------------------------
+
+/// Metadata extracted from an ingested pack for auth inspection.
+pub struct PackMetadata {
+    pub objects: Vec<PackObject>,
+}
+
+/// A single object from an ingested pack.
+pub struct PackObject {
+    pub oid: ObjectId,
+    pub kind: ObjectKind,
+    pub size: u64,
+}
+
+/// Object kind with extracted metadata for commits and tags.
+pub enum ObjectKind {
+    Blob,
+    Tree,
+    Commit(CommitInfo),
+    Tag(TagInfo),
+}
+
+/// Metadata extracted from a commit object.
+pub struct CommitInfo {
+    pub author: String,
+    pub committer: String,
+    pub message: String,
+    /// Raw GPG/SSH signature bytes, if present.
+    pub signature: Option<Vec<u8>>,
+}
+
+/// Metadata extracted from an annotated tag object.
+pub struct TagInfo {
+    pub target: ObjectId,
+    pub name: String,
+    pub tagger: Option<String>,
+    pub message: String,
+    /// Raw GPG/SSH signature bytes, if present.
+    pub signature: Option<Vec<u8>>,
+}
 
 /// Snapshot of a repository's refs.
 pub struct RefsSnapshot {
@@ -80,6 +124,9 @@ pub struct PackOutput {
     /// Streaming reader that yields pack bytes incrementally.
     pub reader: Box<dyn std::io::Read + Send>,
     pub shallow: Vec<ObjectId>,
+    /// Optional progress messages (e.g. "Counting objects: 42\n").
+    /// Backends that don't support progress return `None`.
+    pub progress: Option<mpsc::Receiver<String>>,
 }
 
 /// Thin storage trait abstracting over repository backends.
@@ -139,6 +186,10 @@ pub trait StorageBackend: Send + Sync + 'static {
         repo: &Self::RepoId,
         staged_pack: &Path,
     ) -> Result<Option<Self::IngestedPack>>;
+
+    /// Inspect an ingested pack and extract metadata (object types, commit
+    /// signatures, etc.) for auth decisions.
+    fn inspect_ingested(&self, pack: &Self::IngestedPack) -> Result<PackMetadata>;
 
     /// Roll back a previously ingested pack (e.g. on auth failure).
     fn rollback_ingest(&self, pack: Self::IngestedPack);

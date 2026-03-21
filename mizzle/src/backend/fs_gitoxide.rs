@@ -2,8 +2,8 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
 use gix::objs::Exists;
@@ -12,7 +12,8 @@ use gix::ObjectId;
 use gix_ref::file::ReferenceExt;
 
 use crate::backend::{
-    HeadInfo, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot, StorageBackend,
+    HeadInfo, PackMetadata, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot,
+    StorageBackend,
 };
 use crate::pack;
 use crate::traits::PushKind;
@@ -195,8 +196,10 @@ impl StorageBackend for FsGitoxide {
         // unbounded memory growth.
         let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
 
+        let (progress_tx, progress_rx) = mpsc::channel::<String>();
+
         let thread = std::thread::spawn(move || -> Result<()> {
-            stream_pack_to_channel(handle, objects, thin_pack, tx)
+            stream_pack_to_channel(handle, objects, thin_pack, tx, progress_tx)
         });
 
         let reader = PackReader {
@@ -208,6 +211,7 @@ impl StorageBackend for FsGitoxide {
         Ok(PackOutput {
             reader: Box::new(reader),
             shallow: pack_objects.shallow,
+            progress: Some(progress_rx),
         })
     }
 
@@ -276,6 +280,10 @@ impl StorageBackend for FsGitoxide {
         }))
     }
 
+    fn inspect_ingested(&self, pack: &FsWrittenPack) -> Result<PackMetadata> {
+        crate::inspect::inspect_pack(&pack.pack)
+    }
+
     fn rollback_ingest(&self, pack: FsWrittenPack) {
         let _ = std::fs::remove_file(&pack.index);
         let _ = std::fs::remove_file(&pack.pack);
@@ -340,17 +348,18 @@ fn stream_pack_to_channel(
     objects: Vec<ObjectId>,
     thin_pack: bool,
     tx: mpsc::SyncSender<Vec<u8>>,
+    progress_tx: mpsc::Sender<String>,
 ) -> Result<()> {
     handle.prevent_pack_unload();
     handle.ignore_replacements = true;
 
     let should_interrupt = AtomicBool::new(false);
-    let progress = gix_features::progress::Discard {};
+    let counting = ChannelProgress::new(progress_tx.clone(), "Enumerating objects");
 
     let (counts, _) = gix_pack::data::output::count::objects(
         handle.clone().into_inner(),
         Box::new(objects.into_iter().map(Ok)),
-        &progress,
+        &counting,
         &should_interrupt,
         gix_pack::data::output::count::objects::Options {
             thread_limit: None,
@@ -358,13 +367,14 @@ fn stream_pack_to_channel(
             input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
         },
     )?;
+    counting.send_done();
     let counts: Vec<_> = counts.into_iter().collect();
     let num_objects = counts.len();
 
     let mut in_order_entries = InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
         counts,
         handle.into_inner(),
-        Box::new(gix_features::progress::Discard),
+        Box::new(ChannelProgress::new(progress_tx, "Compressing objects")),
         gix_pack::data::output::entry::iter_from_counts::Options {
             thread_limit: None,
             mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
@@ -431,6 +441,149 @@ fn move_file(src: &Path, dst: &Path) -> Result<()> {
     std::fs::copy(src, dst).context("copying file cross-filesystem")?;
     std::fs::remove_file(src).context("removing source after copy")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Progress reporting via channel
+// ---------------------------------------------------------------------------
+
+/// Progress implementation that sends formatted status lines through a channel.
+///
+/// Used to produce git-compatible sideband progress output during pack
+/// generation (e.g. "Counting objects: 42\r", "Compressing objects: 100% (3/3), done.\n").
+struct ChannelProgress {
+    tx: Mutex<mpsc::Sender<String>>,
+    name: Mutex<String>,
+    step: Arc<AtomicUsize>,
+    max: Mutex<Option<usize>>,
+    last_sent_ms: AtomicU64,
+}
+
+impl ChannelProgress {
+    fn new(tx: mpsc::Sender<String>, name: &str) -> Self {
+        Self {
+            tx: Mutex::new(tx),
+            name: Mutex::new(name.to_string()),
+            step: Arc::new(AtomicUsize::new(0)),
+            max: Mutex::new(None),
+            last_sent_ms: AtomicU64::new(0),
+        }
+    }
+
+    fn maybe_send(&self) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let prev = self.last_sent_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) < 100 {
+            return; // throttle to ~10 updates/sec
+        }
+        self.last_sent_ms.store(now_ms, Ordering::Relaxed);
+
+        let name = self.name.lock().unwrap().clone();
+        let step = self.step.load(Ordering::Relaxed);
+        let max = *self.max.lock().unwrap();
+
+        let msg = match max {
+            Some(max) if max > 0 => {
+                let pct = (step as f64 / max as f64 * 100.0) as u32;
+                format!("{name}: {pct}% ({step}/{max})\r")
+            }
+            _ => format!("{name}: {step}\r"),
+        };
+
+        let _ = self.tx.lock().unwrap().send(msg);
+    }
+
+    fn send_done(&self) {
+        let name = self.name.lock().unwrap().clone();
+        let step = self.step.load(Ordering::Relaxed);
+        let max = *self.max.lock().unwrap();
+
+        let msg = match max {
+            Some(max) if max > 0 => {
+                format!("{name}: 100% ({max}/{max}), done.\n")
+            }
+            _ => format!("{name}: {step}, done.\n"),
+        };
+
+        let _ = self.tx.lock().unwrap().send(msg);
+    }
+}
+
+impl gix_features::progress::prodash::Count for ChannelProgress {
+    fn set(&self, step: usize) {
+        self.step.store(step, Ordering::Relaxed);
+        self.maybe_send();
+    }
+
+    fn step(&self) -> usize {
+        self.step.load(Ordering::Relaxed)
+    }
+
+    fn inc_by(&self, step: usize) {
+        self.step.fetch_add(step, Ordering::Relaxed);
+        self.maybe_send();
+    }
+
+    fn counter(&self) -> gix_features::progress::StepShared {
+        self.step.clone()
+    }
+}
+
+impl gix_features::progress::prodash::Progress for ChannelProgress {
+    fn init(&mut self, max: Option<usize>, _unit: Option<gix_features::progress::Unit>) {
+        *self.max.lock().unwrap() = max;
+        self.step.store(0, Ordering::Relaxed);
+    }
+
+    fn set_name(&mut self, name: String) {
+        *self.name.lock().unwrap() = name;
+    }
+
+    fn name(&self) -> Option<String> {
+        Some(self.name.lock().unwrap().clone())
+    }
+
+    fn id(&self) -> gix_features::progress::Id {
+        gix_features::progress::UNKNOWN
+    }
+
+    fn message(&self, _level: gix_features::progress::MessageLevel, message: String) {
+        let _ = self.tx.lock().unwrap().send(format!("{message}\n"));
+    }
+
+    fn show_throughput(&self, _start: std::time::Instant) {
+        self.send_done();
+    }
+
+    fn show_throughput_with(
+        &self,
+        _start: std::time::Instant,
+        _step: usize,
+        _unit: gix_features::progress::Unit,
+        _level: gix_features::progress::MessageLevel,
+    ) {
+        self.send_done();
+    }
+}
+
+impl gix_features::progress::NestedProgress for ChannelProgress {
+    type SubProgress = Self;
+
+    fn add_child(&mut self, name: impl Into<String>) -> Self::SubProgress {
+        let tx = self.tx.lock().unwrap().clone();
+        ChannelProgress::new(tx, &name.into())
+    }
+
+    fn add_child_with_id(
+        &mut self,
+        name: impl Into<String>,
+        _id: gix_features::progress::Id,
+    ) -> Self::SubProgress {
+        self.add_child(name)
+    }
 }
 
 #[cfg(test)]

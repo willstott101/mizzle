@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use anyhow::{Context, Result};
 use futures_lite::{AsyncRead, AsyncReadExt, AsyncWrite};
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
@@ -11,11 +13,16 @@ pub use mizzle_proto::receive::{preliminary_push_kind, read_receive_request};
 /// on drop), or `None` if no data was received.
 pub async fn stage_pack<R: AsyncRead + Unpin>(
     mut reader: R,
+    temp_dir: Option<&Path>,
 ) -> Result<Option<tempfile::NamedTempFile>> {
-    let temp = tempfile::Builder::new()
-        .prefix("mizzle_pack_")
-        .tempfile()
-        .context("creating temp file for pack staging")?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("mizzle_pack_");
+    let temp = if let Some(dir) = temp_dir {
+        builder.tempfile_in(dir)
+    } else {
+        builder.tempfile()
+    }
+    .context("creating temp file for pack staging")?;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut total = 0u64;

@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::sync::mpsc;
 
 use futures_lite::AsyncWrite;
 use gix::ObjectId;
@@ -78,7 +79,12 @@ pub async fn perform_fetch<B: StorageBackend>(
     }
 
     text_to_write(b"packfile", &mut *writer).await?;
-    stream_pack_sideband(&mut pack_output.reader, writer).await?;
+    let progress_rx = if args.no_progress {
+        None
+    } else {
+        pack_output.progress.take()
+    };
+    stream_pack_sideband(&mut pack_output.reader, progress_rx, writer).await?;
     flush_to_write(&mut *writer).await?;
 
     Ok(())
@@ -107,27 +113,49 @@ pub async fn perform_fetch_v1<B: StorageBackend>(
         text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
     }
     text_to_write(b"NAK", &mut *writer).await?;
-    stream_pack_sideband(&mut pack_output.reader, writer).await?;
+    let progress_rx = if args.no_progress {
+        None
+    } else {
+        pack_output.progress.take()
+    };
+    stream_pack_sideband(&mut pack_output.reader, progress_rx, writer).await?;
     flush_to_write(&mut *writer).await?;
 
     Ok(())
 }
 
 /// Read pack data from `reader` in chunks and write sideband-framed packets.
+/// If `progress_rx` is `Some`, interleave progress messages on channel 2.
 ///
 /// Each `reader.read()` call blocks briefly (one chunk from the backend's
 /// pipeline), then yields to the async executor via the sideband write.
 async fn stream_pack_sideband(
     reader: &mut (dyn Read + Send),
+    progress_rx: Option<mpsc::Receiver<String>>,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
     let mut buf = vec![0u8; MAX_SIDEBAND];
     loop {
+        // Drain any pending progress messages before each data chunk.
+        // Collect first to avoid holding the non-Sync Receiver across await.
+        if let Some(ref rx) = progress_rx {
+            let msgs: Vec<String> = rx.try_iter().collect();
+            for msg in msgs {
+                band_to_write(Channel::Progress, msg.as_bytes(), &mut *writer).await?;
+            }
+        }
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
         band_to_write(Channel::Data, &buf[..n], &mut *writer).await?;
+    }
+    // Drain any final progress messages after the reader is done.
+    if let Some(rx) = progress_rx {
+        let msgs: Vec<String> = rx.try_iter().collect();
+        for msg in msgs {
+            band_to_write(Channel::Progress, msg.as_bytes(), &mut *writer).await?;
+        }
     }
     Ok(())
 }

@@ -1,4 +1,4 @@
-use crate::backend::StorageBackend;
+use crate::backend::{PackMetadata, StorageBackend};
 use crate::command::{read_command, Command};
 use crate::traits::RepoAccess;
 use crate::{fetch, ls_refs, receive};
@@ -101,7 +101,7 @@ where
             kind: receive::preliminary_push_kind(u),
         })
         .collect();
-    if let Err(msg) = access.authorize_push(&preliminary_refs) {
+    if let Err(msg) = access.authorize_push(&preliminary_refs, None) {
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(async move {
             let mut w = writer;
@@ -121,9 +121,50 @@ where
     }
 
     // Stage pack data to a temp file (streamed, not buffered in memory).
-    let staged = res_try!(receive::stage_pack(body).await);
+    let staged = res_try!(receive::stage_pack(body, None).await);
     let written_pack = if let Some(ref staged) = staged {
         res_try!(backend.ingest_pack(&repo_id, staged.path()))
+    } else {
+        None
+    };
+
+    // Inspect the ingested pack for auth metadata.  If inspection fails,
+    // reject the push — proceeding without metadata could let a crafted
+    // pack bypass metadata-based auth checks.
+    let pack_meta: Option<PackMetadata> = if let Some(ref pack) = written_pack {
+        match backend.inspect_ingested(pack) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                error!("pack inspection failed: {:#}", e);
+                if let Some(pack) = written_pack {
+                    backend.rollback_ingest(pack);
+                }
+                let msg = format!("pack inspection failed: {e:#}");
+                let (reader, writer) = piper::pipe(4096);
+                spawn(Box::pin(async move {
+                    let mut w = writer;
+                    let result: anyhow::Result<()> = async {
+                        text_to_write(b"unpack ok", &mut w).await?;
+                        for update in &ref_updates {
+                            let line = format!("ng {} {}", update.refname, msg);
+                            text_to_write(line.as_bytes(), &mut w).await?;
+                        }
+                        flush_to_write(&mut w).await?;
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        error!("inspection rejection write error: {:#}", e);
+                    }
+                }));
+                return GitResponse {
+                    status_code: 200,
+                    content_type: Some("application/x-git-receive-pack-result".to_string()),
+                    reader: Some(reader),
+                    body: None,
+                };
+            }
+        }
     } else {
         None
     };
@@ -135,18 +176,19 @@ where
             kind: backend.compute_push_kind(&repo_id, u),
         })
         .collect();
-    let rejected: Vec<(String, String)> = match access.authorize_push(&push_refs) {
-        Err(msg) => {
-            if let Some(pack) = written_pack {
-                backend.rollback_ingest(pack);
+    let rejected: Vec<(String, String)> =
+        match access.authorize_push(&push_refs, pack_meta.as_ref()) {
+            Err(msg) => {
+                if let Some(pack) = written_pack {
+                    backend.rollback_ingest(pack);
+                }
+                ref_updates
+                    .iter()
+                    .map(|u| (u.refname.clone(), msg.clone()))
+                    .collect()
             }
-            ref_updates
-                .iter()
-                .map(|u| (u.refname.clone(), msg.clone()))
-                .collect()
-        }
-        Ok(()) => Vec::new(),
-    };
+            Ok(()) => Vec::new(),
+        };
 
     let (reader, writer) = piper::pipe(4096);
 
@@ -624,7 +666,7 @@ where
             kind: receive::preliminary_push_kind(u),
         })
         .collect();
-    if let Err(msg) = access.authorize_push(&preliminary_refs) {
+    if let Err(msg) = access.authorize_push(&preliminary_refs, None) {
         text_to_write(b"unpack ok", &mut *writer).await?;
         for update in &ref_updates {
             let line = format!("ng {} {}", update.refname, msg);
@@ -635,9 +677,33 @@ where
     }
 
     // Stage pack data to a temp file (streamed, not buffered in memory).
-    let staged = receive::stage_pack(reader).await?;
+    let staged = receive::stage_pack(reader, None).await?;
     let written_pack = if let Some(ref staged) = staged {
         backend.ingest_pack(&repo_id, staged.path())?
+    } else {
+        None
+    };
+
+    // Inspect the ingested pack for auth metadata.  If inspection fails,
+    // reject the push rather than proceeding without metadata.
+    let pack_meta: Option<PackMetadata> = if let Some(ref pack) = written_pack {
+        match backend.inspect_ingested(pack) {
+            Ok(meta) => Some(meta),
+            Err(e) => {
+                error!("pack inspection failed: {:#}", e);
+                if let Some(pack) = written_pack {
+                    backend.rollback_ingest(pack);
+                }
+                let msg = format!("pack inspection failed: {e:#}");
+                text_to_write(b"unpack ok", &mut *writer).await?;
+                for update in &ref_updates {
+                    let line = format!("ng {} {}", update.refname, msg);
+                    text_to_write(line.as_bytes(), &mut *writer).await?;
+                }
+                flush_to_write(&mut *writer).await?;
+                return Ok(());
+            }
+        }
     } else {
         None
     };
@@ -649,7 +715,7 @@ where
             kind: backend.compute_push_kind(&repo_id, u),
         })
         .collect();
-    if let Err(msg) = access.authorize_push(&push_refs) {
+    if let Err(msg) = access.authorize_push(&push_refs, pack_meta.as_ref()) {
         if let Some(pack) = written_pack {
             backend.rollback_ingest(pack);
         }

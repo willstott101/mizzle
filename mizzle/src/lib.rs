@@ -1,6 +1,7 @@
 pub mod backend;
 mod command;
 mod fetch;
+pub(crate) mod inspect;
 mod ls_refs;
 pub(crate) mod pack;
 mod receive;

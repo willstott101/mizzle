@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::thread;
 use tempfile::tempdir;
 
-use mizzle::traits::{PushKind, PushRef, RepoAccess};
+use mizzle::traits::{PackMetadata, PushKind, PushRef, RepoAccess};
 
 /// Spin up an axum server pointing at a repo path that does not exist.
 fn bad_repo_server() -> common::ServerHandle {
@@ -27,7 +27,11 @@ impl RepoAccess for DenyPushAccess {
         &self.repo_path
     }
 
-    fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
+    fn authorize_push(
+        &self,
+        _refs: &[PushRef<'_>],
+        _pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
         Err("permission denied".into())
     }
 }
@@ -46,7 +50,11 @@ impl RepoAccess for KindFilterAccess {
         &self.repo_path
     }
 
-    fn authorize_push(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
+    fn authorize_push(
+        &self,
+        refs: &[PushRef<'_>],
+        _pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
         for r in refs {
             if r.kind == self.denied {
                 return Err(format!("{:?} pushes are not allowed", self.denied));

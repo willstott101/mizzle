@@ -6,7 +6,7 @@ use std::thread;
 
 use tempfile::tempdir;
 
-use mizzle::traits::{PostReceiveFut, PushKind, PushRef, RepoAccess};
+use mizzle::traits::{PackMetadata, PostReceiveFut, PushKind, PushRef, RepoAccess};
 
 // ── Access types ─────────────────────────────────────────────────────────────
 
@@ -43,7 +43,11 @@ impl RepoAccess for RecordingAccess {
         &self.repo_path
     }
 
-    fn authorize_push(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
+    fn authorize_push(
+        &self,
+        _refs: &[PushRef<'_>],
+        _pack: Option<&PackMetadata>,
+    ) -> Result<(), String> {
         match &self.reject_with {
             Some(msg) => Err(msg.clone()),
             None => Ok(()),

@@ -7,12 +7,14 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
 use gix::ObjectId;
 
 use crate::backend::{
-    HeadInfo, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot, StorageBackend,
+    HeadInfo, PackMetadata, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot,
+    StorageBackend,
 };
 use crate::traits::PushKind;
 
@@ -65,32 +67,29 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// ChildReader — wraps a child process stdout as `impl Read`
+// ProgressChildReader — wraps a child process stdout as `impl Read`
 // ---------------------------------------------------------------------------
 
-/// Wraps a child process stdout as `impl Read`.
+/// Wraps a child process stdout as `impl Read`, with stderr consumed by a
+/// separate progress thread.  The thread accumulates raw stderr bytes in a
+/// shared buffer so that error messages are available on non-zero exit.
 ///
-/// On EOF, waits for the child and propagates non-zero exit as `io::Error`,
-/// including stderr output for diagnostics.
 /// The `Drop` impl kills the child if it is still running.
-struct ChildReader {
+struct ProgressChildReader {
     stdout: ChildStdout,
     child: Option<Child>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
 }
 
-impl Read for ChildReader {
+impl Read for ProgressChildReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let n = self.stdout.read(buf)?;
         if n == 0 {
-            // EOF — join the child to check for errors.
             if let Some(mut child) = self.child.take() {
-                let mut stderr_buf = Vec::new();
-                if let Some(mut stderr) = child.stderr.take() {
-                    let _ = stderr.read_to_end(&mut stderr_buf);
-                }
                 let status = child.wait()?;
                 if !status.success() {
-                    let msg = String::from_utf8_lossy(&stderr_buf);
+                    let stderr = self.stderr_buf.lock().unwrap();
+                    let msg = String::from_utf8_lossy(&stderr);
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!("git process exited with {status}: {msg}"),
@@ -102,13 +101,38 @@ impl Read for ChildReader {
     }
 }
 
-impl Drop for ChildReader {
+impl Drop for ProgressChildReader {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
     }
+}
+
+/// Spawn a thread that reads `stderr` in chunks, sends each chunk as a
+/// progress message through `tx`, and accumulates raw bytes in the returned
+/// shared buffer.
+fn spawn_stderr_progress(
+    mut stderr: std::process::ChildStderr,
+    tx: mpsc::Sender<String>,
+) -> Arc<Mutex<Vec<u8>>> {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let buf2 = buf.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 512];
+        loop {
+            match stderr.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = &chunk[..n];
+                    buf2.lock().unwrap().extend_from_slice(data);
+                    let _ = tx.send(String::from_utf8_lossy(data).into_owned());
+                }
+            }
+        }
+    });
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +386,7 @@ impl StorageBackend for FsGitCli {
             "pack-objects".to_string(),
             "--revs".to_string(),
             "--stdout".to_string(),
+            "--progress".to_string(),
         ];
         if opts.thin_pack {
             args.push("--thin".to_string());
@@ -390,15 +415,21 @@ impl StorageBackend for FsGitCli {
         }
         drop(stdin);
 
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_buf = spawn_stderr_progress(stderr, progress_tx);
+
         let stdout = child.stdout.take().unwrap();
-        let reader = ChildReader {
+        let reader = ProgressChildReader {
             stdout,
             child: Some(child),
+            stderr_buf,
         };
 
         Ok(PackOutput {
             reader: Box::new(reader),
             shallow: Vec::new(),
+            progress: Some(progress_rx),
         })
     }
 
@@ -455,6 +486,10 @@ impl StorageBackend for FsGitCli {
             pack: pack_file,
             index: idx_file,
         }))
+    }
+
+    fn inspect_ingested(&self, pack: &CliWrittenPack) -> Result<PackMetadata> {
+        crate::inspect::inspect_pack(&pack.pack)
     }
 
     fn rollback_ingest(&self, pack: CliWrittenPack) {
@@ -550,6 +585,7 @@ impl FsGitCli {
             "pack-objects".to_string(),
             "--revs".to_string(),
             "--stdout".to_string(),
+            "--progress".to_string(),
         ];
         if opts.thin_pack {
             pack_args.push("--thin".to_string());
@@ -581,15 +617,21 @@ impl FsGitCli {
         }
         drop(stdin);
 
+        let (progress_tx, progress_rx) = mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        let stderr_buf = spawn_stderr_progress(stderr, progress_tx);
+
         let stdout = child.stdout.take().unwrap();
-        let reader = ChildReader {
+        let reader = ProgressChildReader {
             stdout,
             child: Some(child),
+            stderr_buf,
         };
 
         Ok(PackOutput {
             reader: Box::new(reader),
             shallow,
+            progress: Some(progress_rx),
         })
     }
 }
