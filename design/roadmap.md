@@ -16,7 +16,7 @@ russh-based SSH server with deferred auth (`SshAuth` trait).
 Commit to tokio.  Remove trillium/actix/rocket adapters, keep axum as
 canonical HTTP integration.  See [runtime-consolidation.md](runtime-consolidation.md).
 
-### Phase 4 — Define storage traits
+### Phase 4 — Define storage traits ✓
 
 Audit all gitoxide calls in `fetch.rs`, `pack.rs`, `ls_refs.rs`,
 `receive.rs`. Define the thin storage trait and the full-bypass backend

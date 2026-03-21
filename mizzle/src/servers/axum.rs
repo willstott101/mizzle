@@ -6,10 +6,12 @@ use axum::{
 };
 use futures_util::TryStreamExt;
 use std::io;
+use std::path::PathBuf;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
+    backend::fs_gitoxide::FsGitoxide,
     serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse, ProtocolLimits},
     traits::RepoAccess,
 };
@@ -32,10 +34,11 @@ impl IntoResponse for GitResponse {
     }
 }
 
-/// Serve a git request.  Call this from your own handler after performing
-/// whatever authentication you need.  `path` is the full URL path (e.g.
-/// `"myrepo.git/info/refs"`).
-pub async fn serve<A: RepoAccess + Send + 'static>(
+/// Serve a git request using the default filesystem (gitoxide) backend.
+///
+/// Call this from your own handler after performing whatever authentication you
+/// need.  `path` is the full URL path (e.g. `"myrepo.git/info/refs"`).
+pub async fn serve<A: RepoAccess<RepoId = PathBuf> + Send + 'static>(
     access: A,
     path: &str,
     limits: &ProtocolLimits,
@@ -67,12 +70,15 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
         return (StatusCode::BAD_REQUEST, "Path doesn't look like a git URL").into_response();
     };
 
+    let backend = FsGitoxide;
+
     if git_protocol.as_str() == "version=2" {
         serve_git_protocol_2(
             |fut| {
                 tokio::spawn(fut);
             },
             access,
+            backend,
             service_path.into(),
             query_string,
             content_type,
@@ -87,6 +93,7 @@ pub async fn serve<A: RepoAccess + Send + 'static>(
                 tokio::spawn(fut);
             },
             access,
+            backend,
             service_path.into(),
             query_string,
             content_type,

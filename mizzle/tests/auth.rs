@@ -17,11 +17,13 @@ fn bad_repo_server() -> common::ServerHandle {
 // An access type that allows reads but rejects all pushes.
 #[derive(Clone)]
 struct DenyPushAccess {
-    repo_path: Box<str>,
+    repo_path: PathBuf,
 }
 
 impl RepoAccess for DenyPushAccess {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+
+    fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
@@ -33,12 +35,14 @@ impl RepoAccess for DenyPushAccess {
 // An access type that denies one specific push kind and allows the rest.
 #[derive(Clone)]
 struct KindFilterAccess {
-    repo_path: Box<str>,
+    repo_path: PathBuf,
     denied: PushKind,
 }
 
 impl RepoAccess for KindFilterAccess {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+
+    fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
@@ -87,13 +91,15 @@ fn deny_all_server() -> common::ServerHandle {
 
 /// Spin up an axum server that uses DenyPushAccess — reads work, all pushes rejected.
 fn deny_push_server(bare_repo_path: PathBuf) -> common::ServerHandle {
-    axum_access_server(bare_repo_path, |repo_path| DenyPushAccess { repo_path })
+    axum_access_server(bare_repo_path, |repo_path| DenyPushAccess {
+        repo_path: PathBuf::from(repo_path.as_ref()),
+    })
 }
 
 /// Spin up an axum server that uses KindFilterAccess — reads work, one push kind rejected.
 fn kind_filter_server(bare_repo_path: PathBuf, denied: PushKind) -> common::ServerHandle {
     axum_access_server(bare_repo_path, move |repo_path| KindFilterAccess {
-        repo_path,
+        repo_path: PathBuf::from(repo_path.as_ref()),
         denied: denied.clone(),
     })
 }
@@ -101,7 +107,7 @@ fn kind_filter_server(bare_repo_path: PathBuf, denied: PushKind) -> common::Serv
 /// Generic axum server builder: constructs an access object from the repo path per request.
 fn axum_access_server<A, F>(bare_repo_path: PathBuf, make_access: F) -> common::ServerHandle
 where
-    A: RepoAccess + Send + 'static,
+    A: RepoAccess<RepoId = PathBuf> + Send + 'static,
     F: Fn(Box<str>) -> A + Send + Sync + 'static,
 {
     use axum::{
@@ -113,7 +119,7 @@ where
     use std::sync::Arc;
 
     async fn handler<
-        A: RepoAccess + Send + 'static,
+        A: RepoAccess<RepoId = PathBuf> + Send + 'static,
         F: Fn(Box<str>) -> A + Send + Sync + 'static,
     >(
         State(state): State<Arc<(String, F)>>,

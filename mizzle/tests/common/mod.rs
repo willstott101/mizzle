@@ -223,8 +223,9 @@ pub struct Config {
 }
 
 impl RepoAccess for Config {
-    fn repo_path(&self) -> &str {
-        self.bare_repo_path.to_str().unwrap()
+    type RepoId = PathBuf;
+    fn repo_id(&self) -> &PathBuf {
+        &self.bare_repo_path
     }
 }
 

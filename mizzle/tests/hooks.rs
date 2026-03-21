@@ -12,12 +12,14 @@ use mizzle::traits::{PostReceiveFut, PushKind, PushRef, RepoAccess};
 
 #[derive(Clone)]
 struct AutoInitAccess {
-    repo_path: Box<str>,
+    repo_path: PathBuf,
     enabled: bool,
 }
 
 impl RepoAccess for AutoInitAccess {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+
+    fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
     fn auto_init(&self) -> bool {
@@ -27,7 +29,7 @@ impl RepoAccess for AutoInitAccess {
 
 #[derive(Clone)]
 struct RecordingAccess {
-    repo_path: Box<str>,
+    repo_path: PathBuf,
     // None = hook not yet called; Some(vec) = hook was called with these refs.
     received: Arc<Mutex<Option<Vec<(String, PushKind)>>>>,
     // When Some, authorize_push will return this error (simulates a rejection).
@@ -35,7 +37,9 @@ struct RecordingAccess {
 }
 
 impl RepoAccess for RecordingAccess {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+
+    fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
@@ -62,7 +66,7 @@ impl RepoAccess for RecordingAccess {
 
 fn axum_access_server<A, F>(repo_path: PathBuf, make_access: F) -> common::ServerHandle
 where
-    A: RepoAccess + Send + 'static,
+    A: RepoAccess<RepoId = PathBuf> + Send + 'static,
     F: Fn(Box<str>) -> A + Send + Sync + 'static,
 {
     use axum::{
@@ -74,7 +78,7 @@ where
     use std::sync::Arc;
 
     async fn handler<
-        A: RepoAccess + Send + 'static,
+        A: RepoAccess<RepoId = PathBuf> + Send + 'static,
         F: Fn(Box<str>) -> A + Send + Sync + 'static,
     >(
         State(state): State<Arc<(String, F)>>,
@@ -125,7 +129,7 @@ fn test_auto_init_creates_repo_on_push() {
     assert!(!repo_path.exists());
 
     let server = axum_access_server(repo_path.clone(), |rp| AutoInitAccess {
-        repo_path: rp,
+        repo_path: PathBuf::from(rp.as_ref()),
         enabled: true,
     });
 
@@ -159,7 +163,7 @@ fn test_auto_init_disabled_returns_error() {
     let repo_path = temp.path().join("nonexistent.git");
 
     let server = axum_access_server(repo_path, |rp| AutoInitAccess {
-        repo_path: rp,
+        repo_path: PathBuf::from(rp.as_ref()),
         enabled: false,
     });
 
@@ -192,7 +196,7 @@ fn test_post_receive_called_after_push() {
     let received_clone = received.clone();
 
     let server = axum_access_server(temprepo.path(), move |rp| RecordingAccess {
-        repo_path: rp,
+        repo_path: PathBuf::from(rp.as_ref()),
         received: received_clone.clone(),
         reject_with: None,
     });
@@ -234,7 +238,7 @@ fn test_post_receive_not_called_on_rejection() {
     let received_clone = received.clone();
 
     let server = axum_access_server(temprepo.path(), move |rp| RecordingAccess {
-        repo_path: rp,
+        repo_path: PathBuf::from(rp.as_ref()),
         received: received_clone.clone(),
         reject_with: Some("not allowed".to_string()),
     });

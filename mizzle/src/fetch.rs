@@ -1,6 +1,7 @@
-use core::sync::atomic::AtomicBool;
+use std::io::Read;
+
 use futures_lite::AsyncWrite;
-use gix::{objs::Exists, parallel::InOrderIter, ObjectId};
+use gix::ObjectId;
 use gix_packetline::{
     async_io::encode::{band_to_write, delim_to_write, flush_to_write, text_to_write},
     Channel,
@@ -8,119 +9,32 @@ use gix_packetline::{
 
 pub use mizzle_proto::fetch::{read_fetch_args, read_fetch_args_v1, FetchArgs};
 
-/// A write target that accumulates bytes between pack iterator steps,
-/// allowing the caller to drain and send them incrementally.
-struct ChunkBuffer {
-    data: std::sync::Mutex<Vec<u8>>,
-}
-
-impl ChunkBuffer {
-    fn new() -> Self {
-        Self {
-            data: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-    fn drain(&self) -> Vec<u8> {
-        std::mem::take(&mut *self.data.lock().unwrap())
-    }
-}
-
-impl std::io::Write for &ChunkBuffer {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+use crate::backend::{PackOptions, StorageBackend};
+pub use crate::pack::Filter;
 
 /// Maximum payload per sideband data packet (65516 byte pkt-line minus 16
 /// bytes of overhead for the sideband channel framing).
 const MAX_SIDEBAND: usize = 65516 - 16;
 
-/// Stream pack data for the given objects as sideband-encoded packets.
-///
-/// Each chunk produced by the pack entry iterator is drained and sent
-/// immediately, so only one chunk's worth of pack data is held in memory
-/// at a time.
-async fn stream_pack_sideband(
-    mut handle: gix::OdbHandle,
-    objects: Vec<ObjectId>,
-    thin_pack: bool,
-    writer: &mut (impl AsyncWrite + Unpin),
-) -> anyhow::Result<()> {
-    handle.prevent_pack_unload();
-    handle.ignore_replacements = true;
-
-    let should_interrupt = AtomicBool::new(false);
-    let progress = gix_features::progress::Discard {};
-
-    let (counts, _) = gix_pack::data::output::count::objects(
-        handle.clone().into_inner(),
-        Box::new(objects.into_iter().map(Ok)),
-        &progress,
-        &should_interrupt,
-        gix_pack::data::output::count::objects::Options {
-            thread_limit: None,
-            chunk_size: 16,
-            input_object_expansion: gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
-        },
-    )?;
-    let counts: Vec<_> = counts.into_iter().collect();
-    let num_objects = counts.len();
-
-    let mut in_order_entries = InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
-        counts,
-        handle.into_inner(),
-        Box::new(progress),
-        gix_pack::data::output::entry::iter_from_counts::Options {
-            thread_limit: None,
-            mode: gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
-            allow_thin_pack: thin_pack,
-            chunk_size: 16,
-            version: Default::default(),
-        },
-    ));
-
-    let buf = ChunkBuffer::new();
-    let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
-        in_order_entries.by_ref(),
-        &buf,
-        num_objects as u32,
-        Default::default(),
-        gix_hash::Kind::default(),
-    );
-
-    for chunk_result in &mut pack_iter {
-        chunk_result?;
-        let data = buf.drain();
-        for sub in data.chunks(MAX_SIDEBAND) {
-            band_to_write(Channel::Data, sub, &mut *writer).await?;
-        }
-    }
-
-    Ok(())
-}
-
-pub async fn perform_fetch(
-    handle: gix::OdbHandle,
+pub async fn perform_fetch<B: StorageBackend>(
+    backend: &B,
+    repo: &B::RepoId,
     args: &FetchArgs,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
-    let mut acks: Vec<ObjectId> = Vec::new();
-
     // output = acknowledgements flush-pkt |
     //   [acknowledgments delim-pkt] [shallow-info delim-pkt]
     //   [wanted-refs delim-pkt] [packfile-uris delim-pkt]
     //   packfile flush-pkt
 
     if !args.done {
-        for id in args.have.iter() {
-            if handle.clone().into_inner().exists(id) {
-                acks.push(id.clone());
-            }
-        }
+        let known = backend.has_objects(repo, &args.have)?;
+        let acks: Vec<ObjectId> = args
+            .have
+            .iter()
+            .zip(known)
+            .filter_map(|(id, exists)| if exists { Some(*id) } else { None })
+            .collect();
 
         // The server is ready to build a pack when it has at least one
         // common object with the client — unless the client asked for
@@ -145,31 +59,26 @@ pub async fn perform_fetch(
         // Fall through to build packfile below.
     }
 
-    let filter = args
-        .filter
-        .as_deref()
-        .map(crate::pack::Filter::parse)
-        .transpose()?;
-    let pack_objects = crate::pack::objects_for_fetch_filtered(
-        handle.clone().into_inner(),
-        &args.want,
-        &args.have,
-        args.deepen,
-        filter.as_ref(),
-    )?;
+    let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
+    let opts = PackOptions {
+        deepen: args.deepen,
+        filter,
+        thin_pack: args.thin_pack,
+    };
+    let mut pack_output = backend.build_pack(repo, &args.want, &args.have, &opts)?;
 
     // shallow-info section: tell the client which commits are shallow
     // boundaries so it knows not to expect their parents.
-    if !pack_objects.shallow.is_empty() {
+    if !pack_output.shallow.is_empty() {
         text_to_write(b"shallow-info", &mut *writer).await?;
-        for id in &pack_objects.shallow {
+        for id in &pack_output.shallow {
             text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
         }
         delim_to_write(&mut *writer).await?;
     }
 
     text_to_write(b"packfile", &mut *writer).await?;
-    stream_pack_sideband(handle, pack_objects.objects, args.thin_pack, writer).await?;
+    stream_pack_sideband(&mut pack_output.reader, writer).await?;
     flush_to_write(&mut *writer).await?;
 
     Ok(())
@@ -179,38 +88,54 @@ pub async fn perform_fetch(
 ///
 /// The pack content is still optimised against the client's `have` set even
 /// though we don't send per-object `ACK` lines (we don't advertise multi_ack).
-pub async fn perform_fetch_v1(
-    handle: gix::OdbHandle,
+pub async fn perform_fetch_v1<B: StorageBackend>(
+    backend: &B,
+    repo: &B::RepoId,
     args: &FetchArgs,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
-    let filter = args
-        .filter
-        .as_deref()
-        .map(crate::pack::Filter::parse)
-        .transpose()?;
-    let pack_objects = crate::pack::objects_for_fetch_filtered(
-        handle.clone().into_inner(),
-        &args.want,
-        &args.have,
-        args.deepen,
-        filter.as_ref(),
-    )?;
+    let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
+    let opts = PackOptions {
+        deepen: args.deepen,
+        filter,
+        thin_pack: args.thin_pack,
+    };
+    let mut pack_output = backend.build_pack(repo, &args.want, &args.have, &opts)?;
 
     // In v1, shallow boundaries are sent before the NAK.
-    for id in &pack_objects.shallow {
+    for id in &pack_output.shallow {
         text_to_write(format!("shallow {}", id).as_bytes(), &mut *writer).await?;
     }
     text_to_write(b"NAK", &mut *writer).await?;
-    stream_pack_sideband(handle, pack_objects.objects, args.thin_pack, writer).await?;
+    stream_pack_sideband(&mut pack_output.reader, writer).await?;
     flush_to_write(&mut *writer).await?;
 
+    Ok(())
+}
+
+/// Read pack data from `reader` in chunks and write sideband-framed packets.
+///
+/// Each `reader.read()` call blocks briefly (one chunk from the backend's
+/// pipeline), then yields to the async executor via the sideband write.
+async fn stream_pack_sideband(
+    reader: &mut (dyn Read + Send),
+    writer: &mut (impl AsyncWrite + Unpin),
+) -> anyhow::Result<()> {
+    let mut buf = vec![0u8; MAX_SIDEBAND];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        band_to_write(Channel::Data, &buf[..n], &mut *writer).await?;
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::fs_gitoxide::FsGitoxide;
     use gix::ObjectId;
     use std::{fs, path::Path, process::Command};
     use tempfile::tempdir;
@@ -311,7 +236,8 @@ mod tests {
         git(p, &["commit", "-m", "C2"]);
         let c2 = rev_parse(p, "HEAD");
 
-        let handle = gix::open(p).unwrap().objects;
+        let backend = FsGitoxide;
+        let repo_id = p.to_path_buf();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -328,7 +254,9 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, &mut writer).await.unwrap();
+            perform_fetch(&backend, &repo_id, &args, &mut writer)
+                .await
+                .unwrap();
         });
         drop(writer);
 
@@ -375,7 +303,8 @@ mod tests {
         git(p, &["commit", "-m", "C2"]);
         let c2 = rev_parse(p, "HEAD");
 
-        let handle = gix::open(p).unwrap().objects;
+        let backend = FsGitoxide;
+        let repo_id = p.to_path_buf();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -392,7 +321,9 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, &mut writer).await.unwrap();
+            perform_fetch(&backend, &repo_id, &args, &mut writer)
+                .await
+                .unwrap();
         });
         drop(writer);
 
@@ -437,7 +368,8 @@ mod tests {
         git(p, &["commit", "-m", "C3"]);
         let c3 = rev_parse(p, "HEAD");
 
-        let handle = gix::open(p).unwrap().objects;
+        let backend = FsGitoxide;
+        let repo_id = p.to_path_buf();
         let args = FetchArgs {
             want: vec![c3],
             want_refs: Vec::new(),
@@ -454,7 +386,9 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(handle, &args, &mut writer).await.unwrap();
+            perform_fetch(&backend, &repo_id, &args, &mut writer)
+                .await
+                .unwrap();
         });
         drop(writer);
 

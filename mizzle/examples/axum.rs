@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,11 +20,13 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 struct Access {
-    repo_path: String,
+    repo_path: PathBuf,
 }
 
 impl RepoAccess for Access {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+
+    fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
@@ -58,7 +61,7 @@ async fn git_handler(
 
 #[derive(Clone)]
 struct Config {
-    repo_path: String,
+    repo_path: PathBuf,
     limits: ProtocolLimits,
 }
 
@@ -70,7 +73,7 @@ async fn main() {
         .unwrap();
 
     let config = Arc::new(Config {
-        repo_path: ".".to_string(),
+        repo_path: PathBuf::from("."),
         limits: ProtocolLimits::default(),
     });
 

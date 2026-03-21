@@ -1,5 +1,6 @@
 use std::convert::Infallible;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 pub use mizzle_proto::types::{PushKind, PushRef};
@@ -32,8 +33,14 @@ pub type PostReceiveFut<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 ///
 /// [`authorize_push`]: RepoAccess::authorize_push
 pub trait RepoAccess {
-    /// Filesystem path of the repository to serve.
-    fn repo_path(&self) -> &str;
+    /// Identifier for the repository to serve.
+    ///
+    /// For filesystem backends this is typically a [`PathBuf`]; other backends
+    /// may use a UUID, database key, etc.
+    type RepoId: Send + Sync + Clone + std::fmt::Debug + 'static;
+
+    /// Return the identifier of the repository to serve.
+    fn repo_id(&self) -> &Self::RepoId;
 
     /// Called once per push with all requested ref updates, after mizzle has
     /// computed the [`PushKind`] for each ref.  Return `Err(reason)` to reject
@@ -52,7 +59,8 @@ pub trait RepoAccess {
     }
 
     /// Return `true` to have mizzle initialise a bare repository at
-    /// [`repo_path`] if none exists yet when the first push arrives.
+    /// [`repo_id`](RepoAccess::repo_id) if none exists yet when the first push
+    /// arrives.
     fn auto_init(&self) -> bool {
         false
     }
@@ -60,14 +68,16 @@ pub trait RepoAccess {
 
 /// Convenience impl for deny-all access objects that are never constructed.
 impl RepoAccess for Infallible {
-    fn repo_path(&self) -> &str {
+    type RepoId = PathBuf;
+    fn repo_id(&self) -> &PathBuf {
         match *self {}
     }
 }
 
 impl<T: RepoAccess + ?Sized> RepoAccess for Box<T> {
-    fn repo_path(&self) -> &str {
-        (**self).repo_path()
+    type RepoId = T::RepoId;
+    fn repo_id(&self) -> &T::RepoId {
+        (**self).repo_id()
     }
     fn authorize_push(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
         (**self).authorize_push(refs)

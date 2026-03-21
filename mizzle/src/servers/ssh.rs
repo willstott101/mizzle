@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use log::{error, info};
@@ -7,6 +8,7 @@ use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use crate::backend::fs_gitoxide::FsGitoxide;
 use crate::serve::{serve_receive_pack, serve_upload_pack, ProtocolLimits};
 use crate::traits::RepoAccess;
 
@@ -28,7 +30,7 @@ const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// interrogate for the remainder of the request (see the
 /// [`RepoAccess` design contract](RepoAccess#design-contract)).
 pub trait SshAuth: Send + Sync + 'static {
-    type Access: RepoAccess + Send + 'static;
+    type Access: RepoAccess<RepoId = PathBuf> + Send + 'static;
 
     /// Authorize a git operation.  Called once per exec request with the
     /// authenticated user, their public key, and the repository path.
@@ -154,6 +156,7 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
         let limits = self.limits;
         let handle = session.handle();
         let stream = channel.into_stream();
+        let backend = FsGitoxide;
 
         tokio::spawn(async move {
             let compat = stream.compat();
@@ -162,10 +165,10 @@ impl<A: SshAuth> russh::server::Handler for MizzleSshHandler<A> {
 
             let result = match cmd {
                 GitCommand::UploadPack => {
-                    serve_upload_pack(access, reader, &mut writer, version, &limits).await
+                    serve_upload_pack(access, &backend, reader, &mut writer, version, &limits).await
                 }
                 GitCommand::ReceivePack => {
-                    serve_receive_pack(access, reader, &mut writer, &limits).await
+                    serve_receive_pack(access, &backend, reader, &mut writer, &limits).await
                 }
             };
 
