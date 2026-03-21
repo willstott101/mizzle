@@ -34,9 +34,44 @@ Full-bypass backend that hands off to git CLI after auth. Use as the
 correctness oracle: run the integration tests against both `FsGitoxide`
 and `FsGitCli` and verify identical behaviour.
 
-### Phase 5.1 - Optimisations
-Use bitmasks or whatever they're called to optimise pack inspection.
-Optimise by shipping pack as-is on disk when possible?
+### Phase 5.1 — Optimisations
+
+#### 5.1a — Lazy pack inspection
+
+`inspect_pack` decodes every object in the pack (including blobs and
+trees) via zlib inflate just to extract OID, kind, and size.  Auth only
+needs commit/tag metadata.  Read the pack entry header to get type and
+size without inflating blob/tree data.
+
+#### 5.1b — Bitmap-accelerated have-set
+
+`build_have_set` materialises the entire reachable object graph from
+`have` tips into a `HashSet<ObjectId>`.  For large repos this is millions
+of OIDs.  Git solves this with `.bitmap` files alongside pack indexes —
+a single bitmap lookup replaces the full commit + tree walk.  gitoxide
+supports bitmaps via `gix_pack::Bundle`.
+
+#### 5.1c — Ship existing pack data as-is
+
+When a single on-disk pack already covers all wanted objects, skip the
+count → compress → chunk pipeline and stream the pack file directly.
+`PackCopyAndBaseObjects` mode already copies individual entries, but
+whole-pack bypass avoids the per-object overhead entirely.
+
+#### 5.1d — Per-request repo handle
+
+Each `StorageBackend` method calls `gix::open()` independently.  A
+single push or fetch opens the same repo multiple times (list_refs,
+build_pack/ingest, has_object, compute_push_kind, update_refs).  Cache a
+repo handle for the lifetime of the request.
+
+#### 5.1e — Reduce intermediate allocations
+
+- `stream_pack_to_channel`: `counts.into_iter().collect()` re-collects
+  unnecessarily.
+- `objects_for_fetch_filtered`: final `HashSet` → `Vec` conversion could
+  be avoided by returning an iterator or the set itself.
+- `ChunkBuffer::new()` starts at zero capacity — pre-allocate.
 
 ### Phase 6 — Cross-backend test harness
 
