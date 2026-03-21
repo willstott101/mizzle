@@ -28,11 +28,21 @@ Worth prototyping on paper before writing code — particularly streaming
 pack data (must not buffer), async graph traversal, and atomic
 receive-pack (write + ref update).
 
-### Phase 5 — `FsGitCli` backend
+### Phase 5 — `FsGitCli` backend ✓
 
 Full-bypass backend that hands off to git CLI after auth. Use as the
 correctness oracle: run the integration tests against both `FsGitoxide`
 and `FsGitCli` and verify identical behaviour.
+
+### Phase 5.1 - Fixes
+Pack inspection at the protocol level for rejecting/accepting signed commits and similar?
+Temp written pack for inspection shouldn't assume anything about the tmp storage and accept
+a location in config.
+Do we have good progress info for cloning/fetching.
+
+### Phase 5.2 - Optimisations
+Use bitmasks or whatever they're called to optimise pack inspection.
+Optimise by shipping pack as-is on disk when possible?
 
 ### Phase 6 — Cross-backend test harness
 
