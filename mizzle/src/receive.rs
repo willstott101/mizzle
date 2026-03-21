@@ -53,7 +53,7 @@ pub async fn stage_pack<R: AsyncRead + Unpin>(
 /// + per-ref ok lines) to `writer`.
 pub async fn update_refs_and_report<B: StorageBackend>(
     backend: &B,
-    repo: &B::RepoId,
+    repo: &B::Repo,
     ref_updates: &[RefUpdate],
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {

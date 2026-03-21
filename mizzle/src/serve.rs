@@ -53,7 +53,8 @@ where
     if access.auto_init() {
         res_try!(backend.init_repo(repo_id));
     }
-    let snapshot = res_try!(backend.list_refs(repo_id));
+    let repo = res_try!(backend.open(repo_id));
+    let snapshot = res_try!(backend.list_refs(&repo));
     let refs = snapshot.as_receive_pack();
     let (reader, writer) = piper::pipe(4096);
     spawn(Box::pin(async move {
@@ -120,10 +121,13 @@ where
         };
     }
 
+    // Open the repo handle once for the remainder of this request.
+    let repo = res_try!(backend.open(&repo_id));
+
     // Stage pack data to a temp file (streamed, not buffered in memory).
     let staged = res_try!(receive::stage_pack(body, None).await);
     let written_pack = if let Some(ref staged) = staged {
-        res_try!(backend.ingest_pack(&repo_id, staged.path()))
+        res_try!(backend.ingest_pack(&repo, staged.path()))
     } else {
         None
     };
@@ -173,7 +177,7 @@ where
         .iter()
         .map(|u| crate::traits::PushRef {
             refname: &u.refname,
-            kind: backend.compute_push_kind(&repo_id, u),
+            kind: backend.compute_push_kind(&repo, u),
         })
         .collect();
     let rejected: Vec<(String, String)> =
@@ -215,10 +219,9 @@ where
             .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
             .collect();
         let b = backend.clone();
-        let rid = repo_id.clone();
         spawn(Box::pin(async move {
             let mut w = writer;
-            match receive::update_refs_and_report(&b, &rid, &ref_updates, &mut w).await {
+            match receive::update_refs_and_report(&b, &repo, &ref_updates, &mut w).await {
                 Ok(()) => {
                     let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
                         .iter()
@@ -327,7 +330,8 @@ where
         if access.auto_init() {
             res_try!(backend.init_repo(&repo_id));
         }
-        let snapshot = res_try!(backend.list_refs(&repo_id));
+        let repo = res_try!(backend.open(&repo_id));
+        let snapshot = res_try!(backend.list_refs(&repo));
         let refs = snapshot.as_upload_pack_v1();
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(info_refs_upload_pack_v1_task(refs, writer)));
@@ -366,18 +370,17 @@ where
                 ),
             };
         }
+        let repo = res_try!(backend.open(&repo_id));
         let mut args = res_try!(fetch::read_fetch_args_v1(body, limits).await);
         for refname in &args.want_refs {
-            if let Ok(Some(oid)) = backend.resolve_ref(&repo_id, refname.as_str()) {
+            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
                 args.want.push(oid);
             }
         }
-        let b = backend.clone();
-        let rid = repo_id.clone();
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(async move {
             let mut w = writer;
-            if let Err(e) = fetch::perform_fetch_v1(&b, &rid, &args, &mut w).await {
+            if let Err(e) = fetch::perform_fetch_v1(&backend, &repo, &args, &mut w).await {
                 error!("perform_fetch_v1 error: {:#}", e);
             }
         }));
@@ -471,7 +474,8 @@ where
         match command {
             Command::ListRefs => {
                 let args = res_try!(ls_refs::read_lsrefs_args(&mut parser, limits).await);
-                let snapshot = res_try!(backend.list_refs(&repo_id));
+                let repo = res_try!(backend.open(&repo_id));
+                let snapshot = res_try!(backend.list_refs(&repo));
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
                     let mut w = writer;
@@ -488,20 +492,19 @@ where
             }
             Command::Empty => (),
             Command::Fetch => {
+                let repo = res_try!(backend.open(&repo_id));
                 let mut args = res_try!(fetch::read_fetch_args(&mut parser, limits).await);
                 // Resolve any want-ref names to OIDs and add to wants.
                 for refname in &args.want_refs {
-                    if let Ok(Some(oid)) = backend.resolve_ref(&repo_id, refname.as_str()) {
+                    if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
                         args.want.push(oid);
                     }
                 }
                 info!("FETCH: {:?}", args);
-                let b = backend.clone();
-                let rid = repo_id.clone();
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
                     let mut w = writer;
-                    if let Err(e) = fetch::perform_fetch(&b, &rid, &args, &mut w).await {
+                    if let Err(e) = fetch::perform_fetch(&backend, &repo, &args, &mut w).await {
                         error!("perform_fetch error: {:#}", e);
                     }
                 }));
@@ -578,6 +581,8 @@ where
         backend.init_repo(&repo_id)?;
     }
 
+    let repo = backend.open(&repo_id)?;
+
     if version >= 2 {
         info!("upload-pack v2 {:?}", repo_id);
         capability_advertisement_v2(writer).await?;
@@ -591,35 +596,35 @@ where
             match command {
                 Command::ListRefs => {
                     let args = ls_refs::read_lsrefs_args(&mut parser, limits).await?;
-                    let snapshot = backend.list_refs(&repo_id)?;
+                    let snapshot = backend.list_refs(&repo)?;
                     ls_refs::perform_listrefs(&snapshot, &args, writer).await?;
                 }
                 Command::Fetch => {
                     let mut args = fetch::read_fetch_args(&mut parser, limits).await?;
                     for refname in &args.want_refs {
-                        if let Ok(Some(oid)) = backend.resolve_ref(&repo_id, refname.as_str()) {
+                        if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
                             args.want.push(oid);
                         }
                     }
                     info!("FETCH: {:?}", args);
-                    fetch::perform_fetch(backend, &repo_id, &args, writer).await?;
+                    fetch::perform_fetch(backend, &repo, &args, writer).await?;
                 }
                 Command::Empty => break,
             }
         }
     } else {
         info!("upload-pack v1 {:?}", repo_id);
-        let snapshot = backend.list_refs(&repo_id)?;
+        let snapshot = backend.list_refs(&repo)?;
         let refs = snapshot.as_upload_pack_v1();
         upload_pack_v1_refs(&refs, writer).await?;
 
         let mut args = fetch::read_fetch_args_v1(reader, limits).await?;
         for refname in &args.want_refs {
-            if let Ok(Some(oid)) = backend.resolve_ref(&repo_id, refname.as_str()) {
+            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
                 args.want.push(oid);
             }
         }
-        fetch::perform_fetch_v1(backend, &repo_id, &args, writer).await?;
+        fetch::perform_fetch_v1(backend, &repo, &args, writer).await?;
     }
 
     Ok(())
@@ -650,8 +655,10 @@ where
         backend.init_repo(&repo_id)?;
     }
 
+    let repo = backend.open(&repo_id)?;
+
     // Advertise refs (no HTTP preamble).
-    let snapshot = backend.list_refs(&repo_id)?;
+    let snapshot = backend.list_refs(&repo)?;
     let refs = snapshot.as_receive_pack();
     receive::info_refs_receive_pack_task(refs, writer).await?;
 
@@ -679,7 +686,7 @@ where
     // Stage pack data to a temp file (streamed, not buffered in memory).
     let staged = receive::stage_pack(reader, None).await?;
     let written_pack = if let Some(ref staged) = staged {
-        backend.ingest_pack(&repo_id, staged.path())?
+        backend.ingest_pack(&repo, staged.path())?
     } else {
         None
     };
@@ -712,7 +719,7 @@ where
         .iter()
         .map(|u| crate::traits::PushRef {
             refname: &u.refname,
-            kind: backend.compute_push_kind(&repo_id, u),
+            kind: backend.compute_push_kind(&repo, u),
         })
         .collect();
     if let Err(msg) = access.authorize_push(&push_refs, pack_meta.as_ref()) {
@@ -728,7 +735,7 @@ where
         return Ok(());
     }
 
-    receive::update_refs_and_report(backend, &repo_id, &ref_updates, writer).await?;
+    receive::update_refs_and_report(backend, &repo, &ref_updates, writer).await?;
 
     let owned_kinds: Vec<(String, crate::traits::PushKind)> = push_refs
         .iter()

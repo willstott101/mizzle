@@ -25,6 +25,14 @@ use crate::traits::PushKind;
 #[derive(Clone, Copy)]
 pub struct FsGitCli;
 
+/// Opened repository handle for [`FsGitCli`].
+///
+/// A thin wrapper around the repository path — opening is a no-op for the CLI
+/// backend, but the type satisfies the [`StorageBackend::Repo`] contract.
+pub struct FsGitCliRepo {
+    path: PathBuf,
+}
+
 /// Pack and index files written by [`FsGitCli::ingest_pack`].
 pub struct CliWrittenPack {
     pack: PathBuf,
@@ -141,7 +149,12 @@ fn spawn_stderr_progress(
 
 impl StorageBackend for FsGitCli {
     type RepoId = PathBuf;
+    type Repo = FsGitCliRepo;
     type IngestedPack = CliWrittenPack;
+
+    fn open(&self, id: &PathBuf) -> Result<FsGitCliRepo> {
+        Ok(FsGitCliRepo { path: id.clone() })
+    }
 
     fn init_repo(&self, repo_path: &PathBuf) -> Result<()> {
         if !repo_path.exists() {
@@ -164,7 +177,8 @@ impl StorageBackend for FsGitCli {
         Ok(())
     }
 
-    fn list_refs(&self, repo_path: &PathBuf) -> Result<RefsSnapshot> {
+    fn list_refs(&self, repo: &FsGitCliRepo) -> Result<RefsSnapshot> {
+        let repo_path = &repo.path;
         // HEAD
         let head = match run_git(repo_path, &["symbolic-ref", "HEAD"]) {
             Ok(symref_target) => {
@@ -247,7 +261,8 @@ impl StorageBackend for FsGitCli {
         Ok(RefsSnapshot { head, refs })
     }
 
-    fn resolve_ref(&self, repo_path: &PathBuf, refname: &str) -> Result<Option<ObjectId>> {
+    fn resolve_ref(&self, repo: &FsGitCliRepo, refname: &str) -> Result<Option<ObjectId>> {
+        let repo_path = &repo.path;
         let arg = format!("{refname}^{{}}");
         match run_git(repo_path, &["rev-parse", "--verify", &arg]) {
             Ok(hex) => {
@@ -258,20 +273,20 @@ impl StorageBackend for FsGitCli {
         }
     }
 
-    fn has_object(&self, repo_path: &PathBuf, oid: &ObjectId) -> Result<bool> {
-        let status = git_cmd(repo_path)
+    fn has_object(&self, repo: &FsGitCliRepo, oid: &ObjectId) -> Result<bool> {
+        let status = git_cmd(&repo.path)
             .args(["cat-file", "-e", &oid.to_hex().to_string()])
             .status()
             .context("spawning git cat-file -e")?;
         Ok(status.success())
     }
 
-    fn has_objects(&self, repo_path: &PathBuf, oids: &[ObjectId]) -> Result<Vec<bool>> {
+    fn has_objects(&self, repo: &FsGitCliRepo, oids: &[ObjectId]) -> Result<Vec<bool>> {
         if oids.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut child = git_cmd(repo_path)
+        let mut child = git_cmd(&repo.path)
             .args(["cat-file", "--batch-check"])
             .stdin(Stdio::piped())
             .spawn()
@@ -299,7 +314,7 @@ impl StorageBackend for FsGitCli {
         Ok(results)
     }
 
-    fn compute_push_kind(&self, repo_path: &PathBuf, update: &RefUpdate) -> PushKind {
+    fn compute_push_kind(&self, repo: &FsGitCliRepo, update: &RefUpdate) -> PushKind {
         if update.old_oid.is_null() {
             return PushKind::Create;
         }
@@ -307,7 +322,7 @@ impl StorageBackend for FsGitCli {
             return PushKind::Delete;
         }
 
-        let status = git_cmd(repo_path)
+        let status = git_cmd(&repo.path)
             .args([
                 "merge-base",
                 "--is-ancestor",
@@ -322,12 +337,12 @@ impl StorageBackend for FsGitCli {
         }
     }
 
-    fn update_refs(&self, repo_path: &PathBuf, updates: &[RefUpdate]) -> Result<()> {
+    fn update_refs(&self, repo: &FsGitCliRepo, updates: &[RefUpdate]) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
 
-        let mut child = git_cmd(repo_path)
+        let mut child = git_cmd(&repo.path)
             .args(["update-ref", "--stdin"])
             .stdin(Stdio::piped())
             .spawn()
@@ -373,11 +388,12 @@ impl StorageBackend for FsGitCli {
 
     fn build_pack(
         &self,
-        repo_path: &PathBuf,
+        repo: &FsGitCliRepo,
         want: &[ObjectId],
         have: &[ObjectId],
         opts: &PackOptions,
     ) -> Result<PackOutput> {
+        let repo_path = &repo.path;
         if let Some(depth) = opts.deepen {
             return self.build_pack_shallow(repo_path, want, have, depth, opts);
         }
@@ -435,9 +451,10 @@ impl StorageBackend for FsGitCli {
 
     fn ingest_pack(
         &self,
-        repo_path: &PathBuf,
+        repo: &FsGitCliRepo,
         staged_pack: &Path,
     ) -> Result<Option<CliWrittenPack>> {
+        let repo_path = &repo.path;
         // Check the object count in the pack header.
         let mut file = std::fs::File::open(staged_pack).context("opening staged pack")?;
         let mut header = [0u8; 12];
@@ -712,7 +729,8 @@ mod tests {
     #[test]
     fn list_refs_returns_head_and_branches() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitCli.list_refs(&bare).unwrap();
+        let repo = FsGitCli.open(&bare).unwrap();
+        let snap = FsGitCli.list_refs(&repo).unwrap();
 
         let head = snap.head.as_ref().expect("HEAD should exist");
         assert_eq!(
@@ -747,7 +765,8 @@ mod tests {
     #[test]
     fn refs_snapshot_as_upload_pack_v1() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitCli.list_refs(&bare).unwrap();
+        let repo = FsGitCli.open(&bare).unwrap();
+        let snap = FsGitCli.list_refs(&repo).unwrap();
         let v1 = snap.as_upload_pack_v1();
 
         assert!(!v1.is_empty());
@@ -763,7 +782,8 @@ mod tests {
     #[test]
     fn refs_snapshot_as_receive_pack() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitCli.list_refs(&bare).unwrap();
+        let repo = FsGitCli.open(&bare).unwrap();
+        let snap = FsGitCli.list_refs(&repo).unwrap();
         let rp = snap.as_receive_pack();
 
         for (_, name) in &rp {
@@ -775,16 +795,17 @@ mod tests {
     #[test]
     fn resolve_ref_existing_and_nonexistent() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
 
-        let main_oid = FsGitCli.resolve_ref(&bare, "refs/heads/main").unwrap();
+        let main_oid = FsGitCli.resolve_ref(&repo, "refs/heads/main").unwrap();
         assert!(main_oid.is_some(), "main should resolve");
 
-        let dev_oid = FsGitCli.resolve_ref(&bare, "refs/heads/dev").unwrap();
+        let dev_oid = FsGitCli.resolve_ref(&repo, "refs/heads/dev").unwrap();
         assert!(dev_oid.is_some(), "dev should resolve");
         assert_ne!(main_oid, dev_oid, "main and dev should differ");
 
         let none = FsGitCli
-            .resolve_ref(&bare, "refs/heads/nonexistent")
+            .resolve_ref(&repo, "refs/heads/nonexistent")
             .unwrap();
         assert!(none.is_none(), "nonexistent ref should return None");
     }
@@ -792,31 +813,33 @@ mod tests {
     #[test]
     fn has_object_and_has_objects() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
-        assert!(FsGitCli.has_object(&bare, &main_oid).unwrap());
+        assert!(FsGitCli.has_object(&repo, &main_oid).unwrap());
 
         let fake_oid = ObjectId::from_hex(b"0000000000000000000000000000000000000001").unwrap();
-        assert!(!FsGitCli.has_object(&bare, &fake_oid).unwrap());
+        assert!(!FsGitCli.has_object(&repo, &fake_oid).unwrap());
 
-        let results = FsGitCli.has_objects(&bare, &[main_oid, fake_oid]).unwrap();
+        let results = FsGitCli.has_objects(&repo, &[main_oid, fake_oid]).unwrap();
         assert_eq!(results, vec![true, false]);
     }
 
     #[test]
     fn update_refs_creates_new_ref() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         FsGitCli
             .update_refs(
-                &bare,
+                &repo,
                 &[RefUpdate {
                     old_oid: ObjectId::null(gix_hash::Kind::Sha1),
                     new_oid: main_oid,
@@ -826,7 +849,7 @@ mod tests {
             .unwrap();
 
         let resolved = FsGitCli
-            .resolve_ref(&bare, "refs/heads/new-branch")
+            .resolve_ref(&repo, "refs/heads/new-branch")
             .unwrap();
         assert_eq!(resolved, Some(main_oid));
     }
@@ -834,13 +857,14 @@ mod tests {
     #[test]
     fn compute_push_kind_create() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let kind = FsGitCli.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: ObjectId::null(gix_hash::Kind::Sha1),
                 new_oid: main_oid,
@@ -853,13 +877,14 @@ mod tests {
     #[test]
     fn compute_push_kind_delete() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let kind = FsGitCli.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: main_oid,
                 new_oid: ObjectId::null(gix_hash::Kind::Sha1),
@@ -872,17 +897,18 @@ mod tests {
     #[test]
     fn compute_push_kind_fast_forward() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         let kind = FsGitCli.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: main_oid,
                 new_oid: dev_oid,
@@ -895,17 +921,18 @@ mod tests {
     #[test]
     fn compute_push_kind_force_push() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         let kind = FsGitCli.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: dev_oid,
                 new_oid: main_oid,
@@ -918,14 +945,15 @@ mod tests {
     #[test]
     fn build_pack_returns_valid_pack_data() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let mut output = FsGitCli
             .build_pack(
-                &bare,
+                &repo,
                 &[main_oid],
                 &[],
                 &PackOptions {
@@ -946,18 +974,19 @@ mod tests {
     #[test]
     fn build_pack_with_have_produces_smaller_pack() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         let mut full = FsGitCli
             .build_pack(
-                &bare,
+                &repo,
                 &[dev_oid],
                 &[],
                 &PackOptions {
@@ -972,7 +1001,7 @@ mod tests {
 
         let mut incr = FsGitCli
             .build_pack(
-                &bare,
+                &repo,
                 &[dev_oid],
                 &[main_oid],
                 &PackOptions {
@@ -996,15 +1025,16 @@ mod tests {
     #[test]
     fn ingest_pack_and_rollback() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitCli.open(&bare).unwrap();
         let main_oid = FsGitCli
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         // Build a pack from the existing repo
         let mut output = FsGitCli
             .build_pack(
-                &bare,
+                &repo,
                 &[main_oid],
                 &[],
                 &PackOptions {
@@ -1021,12 +1051,13 @@ mod tests {
         let target_dir = tempfile::tempdir().unwrap();
         let target = target_dir.path().join("target.git");
         FsGitCli.init_repo(&target).unwrap();
+        let target_repo = FsGitCli.open(&target).unwrap();
 
         // Stage the pack to a temp file
         let staged = target_dir.path().join("staged.pack");
         std::fs::write(&staged, &pack_data).unwrap();
 
-        let written = FsGitCli.ingest_pack(&target, &staged).unwrap();
+        let written = FsGitCli.ingest_pack(&target_repo, &staged).unwrap();
         assert!(written.is_some(), "non-empty pack should return Some");
         let written = written.unwrap();
 
@@ -1034,7 +1065,7 @@ mod tests {
         assert!(written.index.exists(), "index file should exist");
 
         // The objects should now be accessible
-        assert!(FsGitCli.has_object(&target, &main_oid).unwrap());
+        assert!(FsGitCli.has_object(&target_repo, &main_oid).unwrap());
 
         // Rollback should remove the files
         FsGitCli.rollback_ingest(written);
@@ -1045,6 +1076,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bare = dir.path().join("test.git");
         FsGitCli.init_repo(&bare).unwrap();
+        let repo = FsGitCli.open(&bare).unwrap();
 
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
@@ -1054,7 +1086,7 @@ mod tests {
         let staged = dir.path().join("empty.pack");
         std::fs::write(&staged, &pack).unwrap();
 
-        let result = FsGitCli.ingest_pack(&bare, &staged).unwrap();
+        let result = FsGitCli.ingest_pack(&repo, &staged).unwrap();
         assert!(result.is_none(), "empty pack should return None");
     }
 }

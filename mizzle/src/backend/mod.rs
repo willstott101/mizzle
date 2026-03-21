@@ -139,41 +139,50 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// filesystem backends).
     type RepoId: Send + Sync + Clone + 'static;
 
+    /// Per-request handle for an opened repository.
+    ///
+    /// Callers open once via [`open`](StorageBackend::open) and pass the handle
+    /// to all subsequent methods within the same request.
+    type Repo: Send + Sync;
+
     /// Opaque handle for an ingested pack, used for rollback on auth failure.
     type IngestedPack: Send;
 
+    /// Open a repository, returning a reusable handle.
+    fn open(&self, id: &Self::RepoId) -> Result<Self::Repo>;
+
     /// List all refs in the repository.
-    fn list_refs(&self, repo: &Self::RepoId) -> Result<RefsSnapshot>;
+    fn list_refs(&self, repo: &Self::Repo) -> Result<RefsSnapshot>;
 
     /// Resolve a single ref name to its OID. Returns `None` if the ref does
     /// not exist.
-    fn resolve_ref(&self, repo: &Self::RepoId, refname: &str) -> Result<Option<ObjectId>>;
+    fn resolve_ref(&self, repo: &Self::Repo, refname: &str) -> Result<Option<ObjectId>>;
 
     /// Update refs after a successful push.
-    fn update_refs(&self, repo: &Self::RepoId, updates: &[RefUpdate]) -> Result<()>;
+    fn update_refs(&self, repo: &Self::Repo, updates: &[RefUpdate]) -> Result<()>;
 
     /// Initialize a bare repository if it does not already exist.
     fn init_repo(&self, repo: &Self::RepoId) -> Result<()>;
 
     /// Check whether an object exists in the repository.
-    fn has_object(&self, repo: &Self::RepoId, oid: &ObjectId) -> Result<bool>;
+    fn has_object(&self, repo: &Self::Repo, oid: &ObjectId) -> Result<bool>;
 
     /// Check which of the given OIDs exist in the repository.
     ///
     /// The default implementation calls [`has_object`](StorageBackend::has_object)
-    /// in a loop.  Backends should override this to open the repo once.
-    fn has_objects(&self, repo: &Self::RepoId, oids: &[ObjectId]) -> Result<Vec<bool>> {
+    /// in a loop.
+    fn has_objects(&self, repo: &Self::Repo, oids: &[ObjectId]) -> Result<Vec<bool>> {
         oids.iter().map(|oid| self.has_object(repo, oid)).collect()
     }
 
     /// Classify a ref update as create / delete / fast-forward / force-push.
-    fn compute_push_kind(&self, repo: &Self::RepoId, update: &RefUpdate) -> PushKind;
+    fn compute_push_kind(&self, repo: &Self::Repo, update: &RefUpdate) -> PushKind;
 
     /// Build a pack containing objects reachable from `want` but not from
     /// `have`.
     fn build_pack(
         &self,
-        repo: &Self::RepoId,
+        repo: &Self::Repo,
         want: &[ObjectId],
         have: &[ObjectId],
         opts: &PackOptions,
@@ -183,7 +192,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// Returns `None` if the pack contained no objects.
     fn ingest_pack(
         &self,
-        repo: &Self::RepoId,
+        repo: &Self::Repo,
         staged_pack: &Path,
     ) -> Result<Option<Self::IngestedPack>>;
 

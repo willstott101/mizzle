@@ -58,7 +58,7 @@ count → compress → chunk pipeline and stream the pack file directly.
 `PackCopyAndBaseObjects` mode already copies individual entries, but
 whole-pack bypass avoids the per-object overhead entirely.
 
-#### 5.1d — Per-request repo handle
+#### 5.1d — Per-request repo handle ✓
 
 Each `StorageBackend` method calls `gix::open()` independently.  A
 single push or fetch opens the same repo multiple times (list_refs,

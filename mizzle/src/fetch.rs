@@ -19,7 +19,7 @@ const MAX_SIDEBAND: usize = 65516 - 16;
 
 pub async fn perform_fetch<B: StorageBackend>(
     backend: &B,
-    repo: &B::RepoId,
+    repo: &B::Repo,
     args: &FetchArgs,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
@@ -96,7 +96,7 @@ pub async fn perform_fetch<B: StorageBackend>(
 /// though we don't send per-object `ACK` lines (we don't advertise multi_ack).
 pub async fn perform_fetch_v1<B: StorageBackend>(
     backend: &B,
-    repo: &B::RepoId,
+    repo: &B::Repo,
     args: &FetchArgs,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
@@ -265,7 +265,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo_id = p.to_path_buf();
+        let repo = backend.open(&p.to_path_buf()).unwrap();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -282,7 +282,7 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(&backend, &repo_id, &args, &mut writer)
+            perform_fetch(&backend, &repo, &args, &mut writer)
                 .await
                 .unwrap();
         });
@@ -332,7 +332,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo_id = p.to_path_buf();
+        let repo = backend.open(&p.to_path_buf()).unwrap();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -349,7 +349,7 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(&backend, &repo_id, &args, &mut writer)
+            perform_fetch(&backend, &repo, &args, &mut writer)
                 .await
                 .unwrap();
         });
@@ -397,7 +397,7 @@ mod tests {
         let c3 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo_id = p.to_path_buf();
+        let repo = backend.open(&p.to_path_buf()).unwrap();
         let args = FetchArgs {
             want: vec![c3],
             want_refs: Vec::new(),
@@ -414,7 +414,7 @@ mod tests {
 
         let (reader, mut writer) = piper::pipe(65536);
         futures_lite::future::block_on(async {
-            perform_fetch(&backend, &repo_id, &args, &mut writer)
+            perform_fetch(&backend, &repo, &args, &mut writer)
                 .await
                 .unwrap();
         });

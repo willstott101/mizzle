@@ -20,10 +20,16 @@ use crate::traits::PushKind;
 
 /// Filesystem backend using gitoxide.
 ///
-/// This is the default backend.  Each method opens the repository at the given
-/// [`PathBuf`] and delegates to the gitoxide library.
+/// This is the default backend.  The [`open`](StorageBackend::open) method
+/// returns an [`FsGitoxideRepo`] handle that is reused across all method calls
+/// within a single request, avoiding repeated `gix::open()` overhead.
 #[derive(Clone, Copy)]
 pub struct FsGitoxide;
+
+/// Opened repository handle for [`FsGitoxide`].
+pub struct FsGitoxideRepo {
+    repo: gix::ThreadSafeRepository,
+}
 
 /// Pack and index files written by [`FsGitoxide::ingest_pack`].
 ///
@@ -40,10 +46,16 @@ const MAX_FF_WALK: usize = 10_000;
 
 impl StorageBackend for FsGitoxide {
     type RepoId = PathBuf;
+    type Repo = FsGitoxideRepo;
     type IngestedPack = FsWrittenPack;
 
-    fn list_refs(&self, repo_path: &PathBuf) -> Result<RefsSnapshot> {
-        let repo = gix::open(repo_path)?.into_sync();
+    fn open(&self, id: &PathBuf) -> Result<FsGitoxideRepo> {
+        let repo = gix::open(id)?.into_sync();
+        Ok(FsGitoxideRepo { repo })
+    }
+
+    fn list_refs(&self, repo: &FsGitoxideRepo) -> Result<RefsSnapshot> {
+        let repo = &repo.repo;
 
         // HEAD
         let head = {
@@ -101,9 +113,9 @@ impl StorageBackend for FsGitoxide {
         Ok(RefsSnapshot { head, refs })
     }
 
-    fn resolve_ref(&self, repo_path: &PathBuf, refname: &str) -> Result<Option<ObjectId>> {
-        let repo = gix::open(repo_path)?;
-        match repo.find_reference(refname) {
+    fn resolve_ref(&self, repo: &FsGitoxideRepo, refname: &str) -> Result<Option<ObjectId>> {
+        let local = repo.repo.to_thread_local();
+        match local.find_reference(refname) {
             Ok(mut r) => match r.peel_to_id() {
                 Ok(id) => Ok(Some(id.detach())),
                 Err(_) => Ok(None),
@@ -112,18 +124,19 @@ impl StorageBackend for FsGitoxide {
         }
     }
 
-    fn update_refs(&self, repo_path: &PathBuf, updates: &[RefUpdate]) -> Result<()> {
+    fn update_refs(&self, repo: &FsGitoxideRepo, updates: &[RefUpdate]) -> Result<()> {
         use gix_ref::transaction::PreviousValue;
 
-        let repo = gix::open(repo_path)?;
+        let local = repo.repo.to_thread_local();
         for update in updates {
-            repo.reference(
-                update.refname.as_str(),
-                update.new_oid,
-                PreviousValue::Any,
-                "push",
-            )
-            .with_context(|| format!("updating ref {}", update.refname))?;
+            local
+                .reference(
+                    update.refname.as_str(),
+                    update.new_oid,
+                    PreviousValue::Any,
+                    "push",
+                )
+                .with_context(|| format!("updating ref {}", update.refname))?;
         }
         Ok(())
     }
@@ -136,18 +149,16 @@ impl StorageBackend for FsGitoxide {
         Ok(())
     }
 
-    fn has_object(&self, repo_path: &PathBuf, oid: &ObjectId) -> Result<bool> {
-        let repo = gix::open(repo_path)?;
-        Ok(repo.objects.clone().into_inner().exists(oid))
+    fn has_object(&self, repo: &FsGitoxideRepo, oid: &ObjectId) -> Result<bool> {
+        Ok(repo.repo.objects.to_handle().exists(oid))
     }
 
-    fn has_objects(&self, repo_path: &PathBuf, oids: &[ObjectId]) -> Result<Vec<bool>> {
-        let repo = gix::open(repo_path)?;
-        let store = repo.objects.clone().into_inner();
+    fn has_objects(&self, repo: &FsGitoxideRepo, oids: &[ObjectId]) -> Result<Vec<bool>> {
+        let store = repo.repo.objects.to_handle();
         Ok(oids.iter().map(|oid| store.exists(oid)).collect())
     }
 
-    fn compute_push_kind(&self, repo_path: &PathBuf, update: &RefUpdate) -> PushKind {
+    fn compute_push_kind(&self, repo: &FsGitoxideRepo, update: &RefUpdate) -> PushKind {
         if update.old_oid.is_null() {
             return PushKind::Create;
         }
@@ -155,14 +166,14 @@ impl StorageBackend for FsGitoxide {
             return PushKind::Delete;
         }
 
-        let odb = match gix::open(repo_path) {
-            Ok(repo) => repo.objects.into_inner(),
-            Err(_) => return PushKind::ForcePush,
-        };
+        let local = repo.repo.to_thread_local();
+        let odb = local.objects.into_inner();
 
         let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb)
             .take(MAX_FF_WALK)
-            .any(|r| r.map(|info| info.id == update.old_oid).unwrap_or(false));
+            .any(|r: Result<gix::traverse::commit::Info, _>| {
+                r.map(|info| info.id == update.old_oid).unwrap_or(false)
+            });
 
         if is_ff {
             PushKind::FastForward
@@ -173,13 +184,12 @@ impl StorageBackend for FsGitoxide {
 
     fn build_pack(
         &self,
-        repo_path: &PathBuf,
+        repo: &FsGitoxideRepo,
         want: &[ObjectId],
         have: &[ObjectId],
         opts: &PackOptions,
     ) -> Result<PackOutput> {
-        let repo = gix::open(repo_path)?;
-        let handle = repo.objects;
+        let handle = repo.repo.to_thread_local().objects;
 
         let pack_objects = pack::objects_for_fetch_filtered(
             handle.clone().into_inner(),
@@ -217,7 +227,7 @@ impl StorageBackend for FsGitoxide {
 
     fn ingest_pack(
         &self,
-        repo_path: &PathBuf,
+        repo: &FsGitoxideRepo,
         staged_pack: &Path,
     ) -> Result<Option<FsWrittenPack>> {
         use std::io::{Read, Seek};
@@ -233,8 +243,8 @@ impl StorageBackend for FsGitoxide {
         file.seek(io::SeekFrom::Start(0))
             .context("seeking staged pack to start")?;
 
-        let repo = gix::open(repo_path)?;
-        let pack_dir = repo.path().join("objects").join("pack");
+        let local = repo.repo.to_thread_local();
+        let pack_dir = local.path().join("objects").join("pack");
         std::fs::create_dir_all(&pack_dir)?;
 
         let temp_dir = tempfile::Builder::new()
@@ -669,7 +679,8 @@ mod tests {
     #[test]
     fn list_refs_returns_head_and_branches() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitoxide.list_refs(&bare).unwrap();
+        let repo = FsGitoxide.open(&bare).unwrap();
+        let snap = FsGitoxide.list_refs(&repo).unwrap();
 
         // HEAD should be present and point at main
         let head = snap.head.as_ref().expect("HEAD should exist");
@@ -707,7 +718,8 @@ mod tests {
     #[test]
     fn refs_snapshot_as_upload_pack_v1() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitoxide.list_refs(&bare).unwrap();
+        let repo = FsGitoxide.open(&bare).unwrap();
+        let snap = FsGitoxide.list_refs(&repo).unwrap();
         let v1 = snap.as_upload_pack_v1();
 
         assert!(!v1.is_empty());
@@ -725,7 +737,8 @@ mod tests {
     #[test]
     fn refs_snapshot_as_receive_pack() {
         let (_dir, bare) = test_bare_repo();
-        let snap = FsGitoxide.list_refs(&bare).unwrap();
+        let repo = FsGitoxide.open(&bare).unwrap();
+        let snap = FsGitoxide.list_refs(&repo).unwrap();
         let rp = snap.as_receive_pack();
 
         // Should not contain HEAD
@@ -738,16 +751,17 @@ mod tests {
     #[test]
     fn resolve_ref_existing_and_nonexistent() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
 
-        let main_oid = FsGitoxide.resolve_ref(&bare, "refs/heads/main").unwrap();
+        let main_oid = FsGitoxide.resolve_ref(&repo, "refs/heads/main").unwrap();
         assert!(main_oid.is_some(), "main should resolve");
 
-        let dev_oid = FsGitoxide.resolve_ref(&bare, "refs/heads/dev").unwrap();
+        let dev_oid = FsGitoxide.resolve_ref(&repo, "refs/heads/dev").unwrap();
         assert!(dev_oid.is_some(), "dev should resolve");
         assert_ne!(main_oid, dev_oid, "main and dev should differ");
 
         let none = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/nonexistent")
+            .resolve_ref(&repo, "refs/heads/nonexistent")
             .unwrap();
         assert!(none.is_none(), "nonexistent ref should return None");
     }
@@ -755,18 +769,19 @@ mod tests {
     #[test]
     fn has_object_and_has_objects() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
-        assert!(FsGitoxide.has_object(&bare, &main_oid).unwrap());
+        assert!(FsGitoxide.has_object(&repo, &main_oid).unwrap());
 
         let fake_oid = ObjectId::from_hex(b"0000000000000000000000000000000000000001").unwrap();
-        assert!(!FsGitoxide.has_object(&bare, &fake_oid).unwrap());
+        assert!(!FsGitoxide.has_object(&repo, &fake_oid).unwrap());
 
         let results = FsGitoxide
-            .has_objects(&bare, &[main_oid, fake_oid])
+            .has_objects(&repo, &[main_oid, fake_oid])
             .unwrap();
         assert_eq!(results, vec![true, false]);
     }
@@ -774,14 +789,15 @@ mod tests {
     #[test]
     fn update_refs_creates_new_ref() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         FsGitoxide
             .update_refs(
-                &bare,
+                &repo,
                 &[RefUpdate {
                     old_oid: ObjectId::null(gix_hash::Kind::Sha1),
                     new_oid: main_oid,
@@ -791,7 +807,7 @@ mod tests {
             .unwrap();
 
         let resolved = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/new-branch")
+            .resolve_ref(&repo, "refs/heads/new-branch")
             .unwrap();
         assert_eq!(resolved, Some(main_oid));
     }
@@ -799,13 +815,14 @@ mod tests {
     #[test]
     fn compute_push_kind_create() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let kind = FsGitoxide.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: ObjectId::null(gix_hash::Kind::Sha1),
                 new_oid: main_oid,
@@ -818,13 +835,14 @@ mod tests {
     #[test]
     fn compute_push_kind_delete() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let kind = FsGitoxide.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: main_oid,
                 new_oid: ObjectId::null(gix_hash::Kind::Sha1),
@@ -837,18 +855,19 @@ mod tests {
     #[test]
     fn compute_push_kind_fast_forward() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         // dev is ahead of main (main is ancestor of dev), so main->dev is a fast-forward
         let kind = FsGitoxide.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: main_oid,
                 new_oid: dev_oid,
@@ -861,18 +880,19 @@ mod tests {
     #[test]
     fn compute_push_kind_force_push() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         // dev->main is not a fast-forward (main is not ahead of dev)
         let kind = FsGitoxide.compute_push_kind(
-            &bare,
+            &repo,
             &RefUpdate {
                 old_oid: dev_oid,
                 new_oid: main_oid,
@@ -885,14 +905,15 @@ mod tests {
     #[test]
     fn build_pack_returns_valid_pack_data() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         let mut output = FsGitoxide
             .build_pack(
-                &bare,
+                &repo,
                 &[main_oid],
                 &[],
                 &PackOptions {
@@ -915,19 +936,20 @@ mod tests {
     #[test]
     fn build_pack_with_have_produces_smaller_pack() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
         let dev_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/dev")
+            .resolve_ref(&repo, "refs/heads/dev")
             .unwrap()
             .unwrap();
 
         // Full pack: want dev, have nothing
         let mut full = FsGitoxide
             .build_pack(
-                &bare,
+                &repo,
                 &[dev_oid],
                 &[],
                 &PackOptions {
@@ -943,7 +965,7 @@ mod tests {
         // Incremental pack: want dev, have main
         let mut incr = FsGitoxide
             .build_pack(
-                &bare,
+                &repo,
                 &[dev_oid],
                 &[main_oid],
                 &PackOptions {
@@ -967,15 +989,16 @@ mod tests {
     #[test]
     fn ingest_pack_and_rollback() {
         let (_dir, bare) = test_bare_repo();
+        let repo = FsGitoxide.open(&bare).unwrap();
         let main_oid = FsGitoxide
-            .resolve_ref(&bare, "refs/heads/main")
+            .resolve_ref(&repo, "refs/heads/main")
             .unwrap()
             .unwrap();
 
         // Build a pack from the existing repo
         let mut output = FsGitoxide
             .build_pack(
-                &bare,
+                &repo,
                 &[main_oid],
                 &[],
                 &PackOptions {
@@ -992,12 +1015,13 @@ mod tests {
         let target_dir = tempfile::tempdir().unwrap();
         let target = target_dir.path().join("target.git");
         FsGitoxide.init_repo(&target).unwrap();
+        let target_repo = FsGitoxide.open(&target).unwrap();
 
         // Stage the pack to a temp file
         let staged = target_dir.path().join("staged.pack");
         std::fs::write(&staged, &pack_data).unwrap();
 
-        let written = FsGitoxide.ingest_pack(&target, &staged).unwrap();
+        let written = FsGitoxide.ingest_pack(&target_repo, &staged).unwrap();
         assert!(written.is_some(), "non-empty pack should return Some");
         let written = written.unwrap();
 
@@ -1006,7 +1030,7 @@ mod tests {
         assert!(written.index.exists(), "index file should exist");
 
         // The objects should now be accessible
-        assert!(FsGitoxide.has_object(&target, &main_oid).unwrap());
+        assert!(FsGitoxide.has_object(&target_repo, &main_oid).unwrap());
 
         // Rollback should remove the files
         FsGitoxide.rollback_ingest(written);
@@ -1019,6 +1043,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bare = dir.path().join("test.git");
         FsGitoxide.init_repo(&bare).unwrap();
+        let repo = FsGitoxide.open(&bare).unwrap();
 
         // Create a pack header with 0 objects.  We only need the first 12 bytes
         // to be valid for the object-count check — ingest_pack returns None
@@ -1031,7 +1056,7 @@ mod tests {
         let staged = dir.path().join("empty.pack");
         std::fs::write(&staged, &pack).unwrap();
 
-        let result = FsGitoxide.ingest_pack(&bare, &staged).unwrap();
+        let result = FsGitoxide.ingest_pack(&repo, &staged).unwrap();
         assert!(result.is_none(), "empty pack should return None");
     }
 }

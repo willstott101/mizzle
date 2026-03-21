@@ -121,9 +121,10 @@ mod tests {
 
         // Build a pack from the repo.
         let backend = FsGitoxide;
+        let repo = backend.open(&p.to_path_buf()).unwrap();
         let mut output = backend
             .build_pack(
-                &p.to_path_buf(),
+                &repo,
                 &[main_oid],
                 &[],
                 &PackOptions {
@@ -140,11 +141,12 @@ mod tests {
         let target_dir = tempdir().unwrap();
         let target = target_dir.path().join("target.git");
         backend.init_repo(&target).unwrap();
+        let target_repo = backend.open(&target).unwrap();
 
         let staged = target_dir.path().join("staged.pack");
         std::fs::write(&staged, &pack_data).unwrap();
 
-        let written = backend.ingest_pack(&target, &staged).unwrap().unwrap();
+        let written = backend.ingest_pack(&target_repo, &staged).unwrap().unwrap();
 
         // Inspect the pack.
         let meta = backend.inspect_ingested(&written).unwrap();
