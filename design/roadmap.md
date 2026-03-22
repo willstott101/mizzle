@@ -14,7 +14,7 @@ russh-based SSH server with deferred auth (`SshAuth` trait).
 ### Phase 3 — Runtime consolidation ✓
 
 Commit to tokio.  Remove trillium/actix/rocket adapters, keep axum as
-canonical HTTP integration.  See [runtime-consolidation.md](runtime-consolidation.md).
+canonical HTTP integration.
 
 ### Phase 4 — Define storage traits ✓
 

@@ -58,35 +58,6 @@ For most users these are interchangeable — both serve bare repos on a local or
 
 Note: push-kind classification (fast-forward vs. force-push) always uses gitoxide regardless of backend, because the received pack must be inspected before mizzle can call auth. The CLI backend hands off to `git` only after auth has passed.
 
-## Design rules
-
-**Construction is where expensive auth work happens.**
-`RepoAccess` is constructed by your code before being handed to mizzle. By that point your code has already resolved the user, loaded permissions, and evaluated any branch-protection rules. Every call mizzle makes into `RepoAccess` after that must be a cheap value comparison — no database queries, no HTTP calls, no file I/O. This is what makes mizzle's auth model faster and simpler than hook-callback approaches used by traditional forges.
-
-**Authorisers must never open the repository.**
-`RepoAccess::authorize_push` receives all the information needed to make an authorisation decision as plain values — repo path, ref name, and a `PushKind` enum that encodes create/delete/fast-forward/force. Branch-protection rules, glob patterns, team membership — all of that lives in your `RepoAccess` impl, resolved at construction time. If an authoriser needs to inspect the object graph it is a bug in mizzle's callback interface, not in the authoriser.
-
-## Status
-
-Protocol support (gitoxide backend, HTTP transport):
-
-- [x] Shallow clone (`--depth N`) — essential for CI/CD workloads
-- [x] Protocol v1 support — compatibility with older git clients and tooling that doesn't send `Git-Protocol: version=2`
-- [x] Fetch negotiation — proper ACK/NAK handling so incremental fetches send minimal packs rather than always recomputing from scratch
-- [x] Server-side hooks — `post_receive` callback on `RepoAccess` called after refs are updated
-- [x] Repository auto-init — `auto_init()` on `RepoAccess`; mizzle calls `git init --bare` on first push if the path doesn't exist
-- [x] Partial clone filters (`--filter=blob:none`, `--filter=tree:0`)
-- [x] Ref-in-want
-- [x] `wait-for-done`
-
-Planned:
-
-- [ ] FS + git CLI backend (baseline for correctness comparison)
-- [ ] SQL backend (proof of concept)
-- [ ] Cross-backend integration test harness
-- [ ] Fuzzing against the protocol layer
-- [ ] API Layer for non-git repo interaction
-
 ## Notes on the git protocol spec
 
 Some underdocumented protocol behaviours discovered during implementation:

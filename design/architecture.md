@@ -40,14 +40,10 @@ The canonical HTTP integration is axum.  The core protocol functions
 (`serve_upload_pack`, `serve_receive_pack`, `serve_git_protocol_1`,
 `serve_git_protocol_2`) take generic `AsyncRead`/`AsyncWrite` types and
 can be called from any tokio-based framework directly.
-See [runtime-consolidation.md](runtime-consolidation.md) for the rationale.
 
-The reason mizzle provides HTTP integration at all (rather than being a
-standalone proxy) is so that forges can serve git and their own web API
-from the same binary.  A forge that also exposes a REST API for browsing
-files, viewing diffs, or querying commit history can embed mizzle as a
-library alongside those routes — avoiding the overhead of proxying git
-traffic between two processes.
+Mizzle is a library that can be included into a wider HTTP rust
+application. This should offer forge APIs that use git data to directly
+access the mizzle backend, rather than proxying/translating API calls.
 
 ### Auth — `RepoAccess`
 
