@@ -168,12 +168,6 @@ fn depth_limited_commits(
 
         result.push(commit_id);
 
-        // At the depth boundary: include this commit but not its parents.
-        if current_depth >= depth {
-            shallow_out.push(commit_id);
-            continue;
-        }
-
         // Walk parents.  obj.data borrows from buf; collecting parent_ids
         // into an owned Vec before the next iteration (which reuses buf) is
         // required to avoid a dangling borrow.
@@ -184,6 +178,17 @@ fn depth_limited_commits(
         let parents: Vec<ObjectId> = gix::objs::CommitRefIter::from_bytes(obj.data)
             .parent_ids()
             .collect();
+
+        // At the depth boundary: include this commit but not its parents.
+        // Only mark as shallow if the commit actually has parents that are
+        // being omitted — root commits have no parents to cut off, so the
+        // client has the full history and should not consider it shallow.
+        if current_depth >= depth {
+            if !parents.is_empty() {
+                shallow_out.push(commit_id);
+            }
+            continue;
+        }
 
         for parent_id in parents {
             if visited.insert(parent_id) {

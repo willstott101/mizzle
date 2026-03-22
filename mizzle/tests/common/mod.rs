@@ -1,10 +1,11 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code, unused_imports, unused_macros)]
 
 use anyhow::{anyhow, bail, Result};
 use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
+use mizzle::backend::StorageBackend;
 use mizzle::traits::RepoAccess;
 use simple_logger::SimpleLogger;
 use std::ffi::OsStr;
@@ -14,6 +15,54 @@ use std::sync::{Arc, Once};
 use std::{fs, thread};
 
 use tempfile::{tempdir, TempDir};
+
+/// Generate a test for each backend (FsGitoxide and FsGitCli).
+///
+/// The body receives a `make_server` closure: `fn(Config) -> ServerHandle`.
+#[macro_export]
+macro_rules! dual_backend_test {
+    ($name:ident, $body:expr) => {
+        paste::paste! {
+            #[test]
+            fn [< $name _gitoxide >]() -> anyhow::Result<()> {
+                let make_server = |config: common::Config| common::axum_server(config);
+                $body(make_server)
+            }
+
+            #[test]
+            fn [< $name _git_cli >]() -> anyhow::Result<()> {
+                let make_server = |config: common::Config| {
+                    common::axum_server_with_backend(
+                        config,
+                        mizzle::backend::fs_git_cli::FsGitCli,
+                    )
+                };
+                $body(make_server)
+            }
+        }
+    };
+}
+
+/// Generate a test for each backend, passing the backend directly to the body.
+///
+/// Use this for tests that need a custom [`RepoAccess`] impl and call
+/// [`axum_access_server_with_backend`] themselves.
+#[macro_export]
+macro_rules! dual_backend_access_test {
+    ($name:ident, $body:expr) => {
+        paste::paste! {
+            #[test]
+            fn [< $name _gitoxide >]() -> anyhow::Result<()> {
+                $body(mizzle::backend::fs_gitoxide::FsGitoxide)
+            }
+
+            #[test]
+            fn [< $name _git_cli >]() -> anyhow::Result<()> {
+                $body(mizzle::backend::fs_git_cli::FsGitCli)
+            }
+        }
+    };
+}
 
 pub struct TempRepo {
     dir: TempDir,
@@ -304,7 +353,7 @@ pub fn axum_server(config: Config) -> ServerHandle {
 /// Spin up an axum test server with an arbitrary [`StorageBackend`].
 pub fn axum_server_with_backend<B>(config: Config, backend: B) -> ServerHandle
 where
-    B: mizzle::backend::StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+    B: StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
 {
     init_logging();
 
@@ -314,7 +363,7 @@ where
         req: Request,
     ) -> Response
     where
-        B: mizzle::backend::StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+        B: StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
     {
         let limits = mizzle::serve::ProtocolLimits::default();
         mizzle::servers::axum::serve_with_backend(
@@ -358,4 +407,79 @@ where
     ServerHandle::new(port, move || {
         let _ = tx.send(());
     })
+}
+
+/// Spin up an axum server with a custom [`RepoAccess`] and arbitrary [`StorageBackend`].
+///
+/// `make_access` is called per-request with the repo path string, returning the access object.
+pub fn axum_access_server_with_backend<A, B, F>(
+    bare_repo_path: PathBuf,
+    backend: B,
+    make_access: F,
+) -> ServerHandle
+where
+    A: RepoAccess<RepoId = PathBuf> + Send + 'static,
+    B: StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+    F: Fn(Box<str>) -> A + Send + Sync + 'static,
+{
+    init_logging();
+
+    async fn handler<
+        A: RepoAccess<RepoId = PathBuf> + Send + 'static,
+        B: StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
+        F: Fn(Box<str>) -> A + Send + Sync + 'static,
+    >(
+        State(state): State<Arc<(String, B, F)>>,
+        Path(path): Path<String>,
+        req: Request,
+    ) -> Response {
+        let access = state.2(state.0.as_str().into());
+        let limits = mizzle::serve::ProtocolLimits::default();
+        mizzle::servers::axum::serve_with_backend(access, state.1.clone(), &path, &limits, req)
+            .await
+    }
+
+    let state = Arc::new((
+        bare_repo_path.to_str().unwrap().to_string(),
+        backend,
+        make_access,
+    ));
+    let app = Router::new()
+        .route("/{*key}", get(handler::<A, B, F>).post(handler::<A, B, F>))
+        .with_state(state);
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+
+    thread::spawn(move || {
+        rt.block_on(async {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    rx.await.ok();
+                })
+                .await
+        })
+        .unwrap()
+    });
+
+    ServerHandle::new(port, move || {
+        let _ = tx.send(());
+    })
+}
+
+/// Spin up an axum server with a custom [`RepoAccess`] using the default FsGitoxide backend.
+pub fn axum_access_server<A, F>(bare_repo_path: PathBuf, make_access: F) -> ServerHandle
+where
+    A: RepoAccess<RepoId = PathBuf> + Send + 'static,
+    F: Fn(Box<str>) -> A + Send + Sync + 'static,
+{
+    axum_access_server_with_backend(
+        bare_repo_path,
+        mizzle::backend::fs_gitoxide::FsGitoxide,
+        make_access,
+    )
 }

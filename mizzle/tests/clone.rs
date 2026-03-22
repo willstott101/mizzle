@@ -4,18 +4,37 @@ use tempfile::tempdir;
 
 use common::Config;
 
-#[test]
-fn test_clone_protocol_v1() -> anyhow::Result<()> {
+dual_backend_test!(test_clone, |make_server: fn(
+    Config,
+) -> common::ServerHandle| {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = common::axum_server(config);
+    let server = make_server(config);
+
+    common::run_git(
+        tempdir()?.path(),
+        [
+            "clone",
+            format!("http://localhost:{}/test.git", server.port).as_ref(),
+        ],
+    )?;
+
+    server.stop();
+    Ok(())
+});
+
+dual_backend_test!(test_clone_v1, |make_server: fn(
+    Config,
+) -> common::ServerHandle| {
+    let temprepo = common::temprepo()?;
+    let config = Config {
+        bare_repo_path: temprepo.path(),
+    };
+    let server = make_server(config);
 
     let clone_dir = tempdir()?;
-    // -c protocol.version=0 forces the client to use the old dumb HTTP
-    // discovery path (GET /info/refs?service=git-upload-pack) with no
-    // Git-Protocol header, which exercises our v1 upload-pack handler.
     common::run_git(
         clone_dir.path(),
         [
@@ -38,184 +57,168 @@ fn test_clone_protocol_v1() -> anyhow::Result<()> {
 
     server.stop();
     Ok(())
-}
+});
 
-#[test]
-fn test_clone() -> anyhow::Result<()> {
-    let temprepo = common::temprepo()?;
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-    let server = common::axum_server(config);
+dual_backend_test!(
+    test_shallow_clone,
+    |make_server: fn(Config) -> common::ServerHandle| {
+        let temprepo = common::temprepo()?;
+        let config = Config {
+            bare_repo_path: temprepo.path(),
+        };
+        let server = make_server(config);
 
-    let git_output = common::run_git(
-        tempdir()?.path(),
-        [
-            "clone",
-            format!("http://localhost:{}/test.git", server.port).as_ref(),
-        ],
-    )?;
-    println!("{}", git_output);
+        let clone_dir = tempdir()?;
+        common::run_git(
+            clone_dir.path(),
+            [
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                "main",
+                format!("http://localhost:{}/test.git", server.port).as_ref(),
+            ],
+        )?;
 
-    server.stop();
-    Ok(())
-}
+        let repo_dir = clone_dir.path().join("test");
 
-#[test]
-fn test_shallow_clone() -> anyhow::Result<()> {
-    let temprepo = common::temprepo()?;
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-    let server = common::axum_server(config);
+        let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
+        let commit_count = log.lines().count();
+        assert_eq!(
+            commit_count, 1,
+            "shallow clone --depth 1 should have exactly 1 commit, got:\n{}",
+            log
+        );
 
-    let clone_dir = tempdir()?;
-    common::run_git(
-        clone_dir.path(),
-        [
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            "main",
-            format!("http://localhost:{}/test.git", server.port).as_ref(),
-        ],
-    )?;
+        let is_shallow = common::run_git(&repo_dir, ["rev-parse", "--is-shallow-repository"])?;
+        assert_eq!(is_shallow, "true", "cloned repo should be shallow");
 
-    let repo_dir = clone_dir.path().join("test");
+        common::run_git(&repo_dir, ["fsck", "--no-progress"])?;
 
-    // With --depth 1, `git log` should show only the single tip commit.
-    let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
-    let commit_count = log.lines().count();
-    assert_eq!(
-        commit_count, 1,
-        "shallow clone --depth 1 should have exactly 1 commit, got:\n{}",
-        log
-    );
+        server.stop();
+        Ok(())
+    }
+);
 
-    // `git rev-parse --is-shallow-repository` confirms it's shallow.
-    let is_shallow = common::run_git(&repo_dir, ["rev-parse", "--is-shallow-repository"])?;
-    assert_eq!(is_shallow, "true", "cloned repo should be shallow");
+// When --depth covers the full history (2 commits on main), both backends
+// should recognise there is nothing to cut off and tell the client it has a
+// complete clone rather than marking it shallow.
+dual_backend_test!(
+    test_shallow_clone_depth_covers_full_history,
+    |make_server: fn(Config) -> common::ServerHandle| {
+        let temprepo = common::temprepo()?;
+        let config = Config {
+            bare_repo_path: temprepo.path(),
+        };
+        let server = make_server(config);
 
-    // fsck should pass — the shallow grafts are well-formed.
-    common::run_git(&repo_dir, ["fsck", "--no-progress"])?;
+        let clone_dir = tempdir()?;
+        common::run_git(
+            clone_dir.path(),
+            [
+                "clone",
+                "--depth",
+                "2",
+                "--branch",
+                "main",
+                format!("http://localhost:{}/test.git", server.port).as_ref(),
+            ],
+        )?;
 
-    server.stop();
-    Ok(())
-}
+        let repo_dir = clone_dir.path().join("test");
 
-// The temprepo has 3 commits (2 on main, 1 on dev).  --depth 2 on main
-// should return exactly 2 commits, catching off-by-one boundary errors.
-#[test]
-fn test_shallow_clone_depth_2() -> anyhow::Result<()> {
-    let temprepo = common::temprepo()?;
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-    let server = common::axum_server(config);
+        let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
+        let commit_count = log.lines().count();
+        assert_eq!(
+            commit_count, 2,
+            "clone --depth 2 should have exactly 2 commits, got:\n{}",
+            log
+        );
 
-    let clone_dir = tempdir()?;
-    common::run_git(
-        clone_dir.path(),
-        [
-            "clone",
-            "--depth",
-            "2",
-            "--branch",
-            "main",
-            format!("http://localhost:{}/test.git", server.port).as_ref(),
-        ],
-    )?;
+        let is_shallow = common::run_git(&repo_dir, ["rev-parse", "--is-shallow-repository"])?;
+        assert_eq!(
+            is_shallow, "false",
+            "depth covers full history — client should see a full clone"
+        );
 
-    let repo_dir = clone_dir.path().join("test");
+        common::run_git(&repo_dir, ["fsck", "--no-progress"])?;
 
-    let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
-    let commit_count = log.lines().count();
-    assert_eq!(
-        commit_count, 2,
-        "shallow clone --depth 2 should have exactly 2 commits, got:\n{}",
-        log
-    );
+        server.stop();
+        Ok(())
+    }
+);
 
-    let is_shallow = common::run_git(&repo_dir, ["rev-parse", "--is-shallow-repository"])?;
-    assert_eq!(is_shallow, "true", "cloned repo should be shallow");
+dual_backend_test!(
+    test_partial_clone_tree_none,
+    |make_server: fn(Config) -> common::ServerHandle| {
+        let temprepo = common::temprepo()?;
+        let config = Config {
+            bare_repo_path: temprepo.path(),
+        };
+        let server = make_server(config);
 
-    common::run_git(&repo_dir, ["fsck", "--no-progress"])?;
+        let clone_dir = tempdir()?;
+        common::run_git(
+            clone_dir.path(),
+            [
+                "clone",
+                "--filter=tree:0",
+                "--branch",
+                "main",
+                format!("http://localhost:{}/test.git", server.port).as_ref(),
+            ],
+        )?;
 
-    server.stop();
-    Ok(())
-}
+        let repo_dir = clone_dir.path().join("test");
 
-#[test]
-fn test_partial_clone_tree_none() -> anyhow::Result<()> {
-    let temprepo = common::temprepo()?;
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-    let server = common::axum_server(config);
+        let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
+        assert!(
+            !log.is_empty(),
+            "partial clone should have at least one commit"
+        );
 
-    let clone_dir = tempdir()?;
-    common::run_git(
-        clone_dir.path(),
-        [
-            "clone",
-            "--filter=tree:0",
-            "--branch",
-            "main",
-            format!("http://localhost:{}/test.git", server.port).as_ref(),
-        ],
-    )?;
+        let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
+        assert_eq!(is_partial, "true", "should be a promisor/partial clone");
 
-    let repo_dir = clone_dir.path().join("test");
+        server.stop();
+        Ok(())
+    }
+);
 
-    // The clone should succeed and have commits.
-    let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
-    assert!(
-        !log.is_empty(),
-        "partial clone should have at least one commit"
-    );
+dual_backend_test!(
+    test_partial_clone_blob_none,
+    |make_server: fn(Config) -> common::ServerHandle| {
+        let temprepo = common::temprepo()?;
+        let config = Config {
+            bare_repo_path: temprepo.path(),
+        };
+        let server = make_server(config);
 
-    // Verify by checking that git recognizes it as a partial clone.
-    let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
-    assert_eq!(is_partial, "true", "should be a promisor/partial clone");
+        let clone_dir = tempdir()?;
+        common::run_git(
+            clone_dir.path(),
+            [
+                "clone",
+                "--filter=blob:none",
+                "--branch",
+                "main",
+                format!("http://localhost:{}/test.git", server.port).as_ref(),
+            ],
+        )?;
 
-    server.stop();
-    Ok(())
-}
+        let repo_dir = clone_dir.path().join("test");
 
-#[test]
-fn test_partial_clone_blob_none() -> anyhow::Result<()> {
-    let temprepo = common::temprepo()?;
-    let config = Config {
-        bare_repo_path: temprepo.path(),
-    };
-    let server = common::axum_server(config);
+        let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
+        assert!(
+            !log.is_empty(),
+            "partial clone should have at least one commit"
+        );
 
-    let clone_dir = tempdir()?;
-    common::run_git(
-        clone_dir.path(),
-        [
-            "clone",
-            "--filter=blob:none",
-            "--branch",
-            "main",
-            format!("http://localhost:{}/test.git", server.port).as_ref(),
-        ],
-    )?;
+        let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
+        assert_eq!(is_partial, "true", "should be a promisor/partial clone");
 
-    let repo_dir = clone_dir.path().join("test");
-
-    // The clone should succeed and have commits.
-    let log = common::run_git(&repo_dir, ["log", "--oneline"])?;
-    assert!(
-        !log.is_empty(),
-        "partial clone should have at least one commit"
-    );
-
-    // Verify by checking that git recognizes it as a partial clone.
-    let is_partial = common::run_git(&repo_dir, ["config", "--get", "remote.origin.promisor"])?;
-    assert_eq!(is_partial, "true", "should be a promisor/partial clone");
-
-    server.stop();
-    Ok(())
-}
+        server.stop();
+        Ok(())
+    }
+);

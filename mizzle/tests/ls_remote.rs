@@ -2,13 +2,15 @@ mod common;
 
 use common::Config;
 
-#[test]
-fn test_ls_remote() -> anyhow::Result<()> {
+dual_backend_test!(test_ls_remote, |make_server: fn(
+    Config,
+)
+    -> common::ServerHandle| {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path(),
     };
-    let server = common::axum_server(config);
+    let server = make_server(config);
 
     let git_output_from_path = common::run_git(
         &temprepo.path(),
@@ -26,4 +28,4 @@ fn test_ls_remote() -> anyhow::Result<()> {
 
     server.stop();
     Ok(())
-}
+});

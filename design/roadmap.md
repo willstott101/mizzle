@@ -73,7 +73,7 @@ repo handle for the lifetime of the request.
   be avoided by returning an iterator or the set itself.
 - `ChunkBuffer::new()` starts at zero capacity — pre-allocate.
 
-### Phase 6 — Cross-backend test harness
+### Phase 6 — Cross-backend test harness ✓
 
 Parameterise the integration tests over backends. Add benchmarks.
 After this phase every subsequent backend gets full coverage for free.

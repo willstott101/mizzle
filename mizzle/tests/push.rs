@@ -5,15 +5,15 @@ use tempfile::tempdir;
 
 use common::Config;
 
-#[test]
-fn test_push() -> anyhow::Result<()> {
+dual_backend_test!(test_push, |make_server: fn(
+    Config,
+) -> common::ServerHandle| {
     let temprepo = common::temprepo()?;
     let config = Config {
         bare_repo_path: temprepo.path().clone(),
     };
-    let server = common::axum_server(config);
+    let server = make_server(config);
 
-    // Clone the repo from the server.
     let clone_dir = tempdir()?;
     common::run_git(
         clone_dir.path(),
@@ -26,16 +26,13 @@ fn test_push() -> anyhow::Result<()> {
     )?;
     let repo_dir = clone_dir.path().join("test");
 
-    // Make a new commit in the clone.
     fs::write(repo_dir.join("push_test.txt"), "pushed content\n")?;
     common::run_git(&repo_dir, ["add", "push_test.txt"])?;
     common::run_git(&repo_dir, ["commit", "-m", "Push test commit"])?;
     let pushed_commit = common::run_git(&repo_dir, ["rev-parse", "HEAD"])?;
 
-    // Push to the server via HTTP.
     common::run_git(&repo_dir, ["push", "origin", "main"])?;
 
-    // Verify the bare repo was updated.
     let bare_head = common::run_git(temprepo.path().as_path(), ["rev-parse", "refs/heads/main"])?;
     assert_eq!(
         bare_head, pushed_commit,
@@ -44,4 +41,4 @@ fn test_push() -> anyhow::Result<()> {
 
     server.stop();
     Ok(())
-}
+});

@@ -182,28 +182,24 @@ impl StorageBackend for FsGitCli {
         // HEAD
         let head = match run_git(repo_path, &["symbolic-ref", "HEAD"]) {
             Ok(symref_target) => {
-                // Resolve HEAD to an OID
+                // Resolve HEAD to an OID.  On an unborn branch `git rev-parse
+                // HEAD` exits 0 but prints the literal string "HEAD" — treat
+                // that (and any other non-hex output) as unborn.
                 match run_git(repo_path, &["rev-parse", "HEAD"]) {
-                    Ok(hex) => {
-                        let oid = ObjectId::from_hex(hex.as_bytes()).context("parsing HEAD oid")?;
-                        Some(HeadInfo {
-                            oid,
-                            symref_target: Some(symref_target),
-                        })
-                    }
-                    Err(_) => None, // detached HEAD pointing at nothing
+                    Ok(hex) => ObjectId::from_hex(hex.as_bytes()).ok().map(|oid| HeadInfo {
+                        oid,
+                        symref_target: Some(symref_target),
+                    }),
+                    Err(_) => None,
                 }
             }
             Err(_) => {
                 // Detached HEAD or unborn
                 match run_git(repo_path, &["rev-parse", "HEAD"]) {
-                    Ok(hex) => {
-                        let oid = ObjectId::from_hex(hex.as_bytes()).context("parsing HEAD oid")?;
-                        Some(HeadInfo {
-                            oid,
-                            symref_target: None,
-                        })
-                    }
+                    Ok(hex) => ObjectId::from_hex(hex.as_bytes()).ok().map(|oid| HeadInfo {
+                        oid,
+                        symref_target: None,
+                    }),
                     Err(_) => None,
                 }
             }
