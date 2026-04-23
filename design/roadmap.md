@@ -34,16 +34,27 @@ Full-bypass backend that hands off to git CLI after auth. Use as the
 correctness oracle: run the integration tests against both `FsGitoxide`
 and `FsGitCli` and verify identical behaviour.
 
-### Phase 5.1 — Optimisations
+### Phase 5.1 — Performance testing infrastructure
 
-#### 5.1a — Lazy pack inspection
+Instrument `build_have_set` and the pack-generation path with `tracing`
+spans.  Build the deterministic reference repos (`medium`, `deep`) and
+extend the benchmark suite to cover them.  See
+`design/performance-testing.md` (Steps 1–3) for the full plan.
+
+These benchmarks are a prerequisite for 5.2b: the `deep`-repo
+incremental-fetch span data will show whether the bitmap optimisation
+is actually needed before committing to the implementation.
+
+### Phase 5.2 — Optimisations
+
+#### 5.2a — Lazy pack inspection
 
 `inspect_pack` decodes every object in the pack (including blobs and
 trees) via zlib inflate just to extract OID, kind, and size.  Auth only
 needs commit/tag metadata.  Read the pack entry header to get type and
 size without inflating blob/tree data.
 
-#### 5.1b — Bitmap-accelerated have-set
+#### 5.2b — Bitmap-accelerated have-set
 
 `build_have_set` materialises the entire reachable object graph from
 `have` tips into a `HashSet<ObjectId>`.  For large repos this is millions
@@ -51,21 +62,24 @@ of OIDs.  Git solves this with `.bitmap` files alongside pack indexes —
 a single bitmap lookup replaces the full commit + tree walk.  gitoxide
 supports bitmaps via `gix_pack::Bundle`.
 
-#### 5.1c — Ship existing pack data as-is
+Implement only if Phase 5.1 benchmark results show meaningful cost on
+the `deep` repo.
+
+#### 5.2c — Ship existing pack data as-is
 
 When a single on-disk pack already covers all wanted objects, skip the
 count → compress → chunk pipeline and stream the pack file directly.
 `PackCopyAndBaseObjects` mode already copies individual entries, but
 whole-pack bypass avoids the per-object overhead entirely.
 
-#### 5.1d — Per-request repo handle ✓
+#### 5.2d — Per-request repo handle ✓
 
 Each `StorageBackend` method calls `gix::open()` independently.  A
 single push or fetch opens the same repo multiple times (list_refs,
 build_pack/ingest, has_object, compute_push_kind, update_refs).  Cache a
 repo handle for the lifetime of the request.
 
-#### 5.1e — Reduce intermediate allocations
+#### 5.2e — Reduce intermediate allocations
 
 - `stream_pack_to_channel`: `counts.into_iter().collect()` re-collects
   unnecessarily.
