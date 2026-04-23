@@ -137,7 +137,7 @@ map well to `wrk`-style drivers.
   should bound this, but `inspect_pack` inflates every object.
 - **CPU time** for negotiation on deep repos.  `build_have_set`
   materialises the full reachable graph — this is called out in the
-  roadmap (5.1b) as a known scaling issue.
+  roadmap 5.2b as a known scaling issue.
 - **Temp disk usage** during push staging.  Important for operators
   sizing ephemeral storage.
 - **File descriptor count** under concurrent load.  Each repo open
@@ -164,7 +164,8 @@ matrix:
 
 For bandwidth, `git-http-backend` is the reference.  Mizzle should
 produce packs of equal or smaller size.  For latency and throughput,
-`git-http-backend` is the bar to beat (or at least match).
+comparisons are between mizzle backends; `git-http-backend` via CGI
+is not a meaningful latency baseline.
 
 ---
 
@@ -220,6 +221,46 @@ The measurement approach:
 
 ---
 
+## Variance control
+
+Sources of measurement noise to control before trusting numbers:
+
+**Reference repo lifecycle.**  The `medium` and `deep` repos must be
+built once per benchmark process and shared across all groups — not
+rebuilt per-group or per-iteration.  Use `std::sync::OnceLock` (or leak
+the `TempDir` as the existing bench already does for `temprepo`).  A
+cold build of the `deep` repo takes several seconds and would dwarf
+measurements if it falls inside the iteration loop.
+
+**Push bench state drift.**  The existing `bench_push` includes a full
+clone inside each Criterion iteration, so it measures clone + push
+together.  It also mutates the server-side repo on every iteration,
+so later iterations exercise a larger have-set.  Fix: pre-clone once
+outside the loop (matching what `bench_fetch` already does), and either
+reset the server-side repo to its initial state between iterations or
+document the drift explicitly.
+
+**`tempdir()` in the hot path.**  `bench_clone` and `bench_push`
+allocate a new `TempDir` on each iteration.  Tmpfs allocation is fast
+but not free.  Pre-allocate a staging directory and
+remove/recreate its contents between iterations instead.
+
+**Page-cache warm-up.**  Criterion's default 3 s warm-up may not be
+sufficient to warm the pack-file page cache for `deep` or `large-blobs`.
+Add an explicit pre-measurement pass that reads through the pack file
+before the timing window opens.
+
+**Server / load-generator CPU sharing.**  In Step 4, the mizzle server
+and the load-generator tasks share the same machine and compete for
+cores.  P99 latency under high concurrency will reflect scheduler
+contention as well as protocol cost — document this rather than treating
+the numbers as production-representative.
+
+**Latency baseline.**  `git-http-backend` served via a CGI adapter
+introduces process-spawn overhead absent in production deployments.
+Use `git-http-backend` only as a bandwidth reference (Step 6); latency
+comparisons should be between mizzle backends only.
+
 ## Implementation plan
 
 ### Step 1 — Deterministic repo builder
@@ -237,12 +278,29 @@ given repo.  Assert against reference values.
 
 ### Step 3 — Phased latency instrumentation
 
-Add timing hooks in the serve layer.  A few `Instant::now()` calls at
-phase boundaries are cheap enough to leave on unconditionally — avoid
-a feature flag unless profiling shows measurable overhead.  Extend
-`benches/backends.rs` to report per-phase timings alongside total
-wall-clock time.  Add the medium and deep repos to the benchmark
-suite.
+Replace the `log` dependency with `tracing`, bridging existing `log::*`
+call sites via `tracing-log`.  Annotate the key internal functions with
+`#[tracing::instrument(skip_all)]`:
+
+- `build_have_set` in `pack.rs` — the full object-graph walk (roadmap 5.2b candidate)
+- `objects_for_fetch_filtered` — wraps have-set build and want traversal
+- the pack stream / compression step in `fetch.rs`
+
+Spans are zero-cost when no subscriber is installed, so the annotations
+ship unconditionally without a feature flag.  In the benchmark harness,
+install a timing subscriber before each benchmark group that accumulates
+per-span `Duration` via its `on_close` hook, then read the totals after
+`b.iter(...)` completes.  This gives sub-operation breakdowns independent
+of transport noise and aligned with Criterion's iteration model.
+
+`#[instrument]` is safe for the sync functions in `pack.rs`.  For async
+functions in `serve.rs` and `fetch.rs`, use `#[instrument(skip_all)]`
+and verify no non-`Send` types are held across await points before adding
+spans there.
+
+Extend `benches/backends.rs` to include the `medium` and `deep`
+reference repos.  The `deep`-repo incremental-fetch span data is the
+primary signal for whether roadmap 5.2b is needed.
 
 ### Step 4 — Concurrency harness
 
@@ -260,10 +318,11 @@ visible.
 
 ### Step 6 — External baseline
 
-Add `git-http-backend` as a comparison target.  The test harness
-starts a `git-http-backend` server alongside the mizzle servers,
-running against the same repos.  Bandwidth and latency results include
-this baseline.
+Add `git-http-backend` as a bandwidth comparison target.  The test
+harness starts a `git-http-backend` server alongside the mizzle servers,
+running against the same repos.  Use for bandwidth results only — see
+the variance control section for why latency comparisons against a CGI
+adapter are not meaningful.
 
 **Open question:** what's the lightest way to run `git-http-backend`
 in the test harness?  Options: spawn `git http-backend` behind a
@@ -282,16 +341,16 @@ not CI, so a system dependency may be acceptable.
   packs comparable to `git-http-backend` (tolerance TBD — see open
   questions).  Thin packs, partial clones, and shallow clones transfer
   strictly less data than full clones by the expected margin.
-- **Latency:** FsGitoxide is no slower than `git-http-backend` for
-  clone and fetch.  Push latency is dominated by pack ingestion, not
-  auth or protocol overhead.
+- **Latency:** FsGitoxide is faster than FsGitCli for clone and fetch
+  (process-spawn overhead is measurable).  Push latency is dominated
+  by pack ingestion, not auth or protocol overhead.
 - **Throughput:** Concurrent read operations scale linearly up to
   available cores.  Concurrent writes to distinct refs show no
   contention.
 - **Resources:** Peak RSS during clone of a 1 GB repo (on-disk
   packfile size) stays under 200 MB (streaming, not buffering).
   `inspect_pack` memory scales with pack object count, not pack data
-  size (blocked on roadmap 5.1a).
+  size (blocked on roadmap 5.2a).
 
 ---
 
@@ -318,6 +377,6 @@ not CI, so a system dependency may be acceptable.
 
 - **Roadmap cross-reference:** The `deep` repo is specifically
   designed to measure whether bitmap-accelerated have-set (roadmap
-  5.1b) is needed.  The `large-blobs` repo will show whether lazy
-  pack inspection (5.1a) matters.  Results from these benchmarks
+  5.2b) is needed.  The `large-blobs` repo will show whether lazy
+  pack inspection (5.2a) matters.  Results from these benchmarks
   should inform prioritisation of those optimisations.
