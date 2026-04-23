@@ -6,11 +6,11 @@ use futures_lite::{AsyncRead, AsyncWrite};
 use gix::ObjectId;
 use gix_packetline::async_io::encode::{flush_to_write, text_to_write};
 use gix_packetline::async_io::StreamingPeekableIter;
-use log::{error, info};
 pub use mizzle_proto::limits::ProtocolLimits;
 use piper::{Reader, Writer};
 use std::future::Future;
 use std::pin::Pin;
+use tracing::{error, info};
 
 pub struct GitResponse {
     pub status_code: u16,

@@ -37,6 +37,10 @@ pub struct PackObjects {
 ///
 /// When `filter` is provided, objects matching the filter are omitted from the
 /// pack (partial clone).
+#[tracing::instrument(
+    skip_all,
+    fields(want = want.len(), have = have.len(), deepen, filter = ?filter)
+)]
 pub fn objects_for_fetch_filtered(
     odb: impl Find + Clone,
     want: &[ObjectId],
@@ -202,6 +206,7 @@ fn depth_limited_commits(
 
 /// Builds a set of all object IDs reachable from the `have` commits. Used to
 /// exclude already-known objects when building a pack for the want side.
+#[tracing::instrument(skip_all, fields(have = have.len()))]
 fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<HashSet<ObjectId>> {
     let mut have_set: HashSet<ObjectId> = HashSet::new();
     let mut state = gix::traverse::tree::breadthfirst::State::default();
@@ -246,6 +251,7 @@ fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<H
         }
     }
 
+    tracing::debug!(have_set_len = have_set.len(), "have-set built");
     Ok(have_set)
 }
 

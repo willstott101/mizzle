@@ -2,8 +2,9 @@ use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use axum::extract::{Path as AxumPath, Request, State};
@@ -16,6 +17,16 @@ use mizzle::backend::fs_gitoxide::FsGitoxide;
 use mizzle::backend::StorageBackend;
 use mizzle::traits::RepoAccess;
 use tempfile::{tempdir, TempDir};
+
+mod support;
+use support::repo_builder::RepoBuilder;
+use support::span_totals;
+
+/// Number of linear commits in the `deep` reference repo.  Sized for the
+/// 5.2b bitmap-acceleration decision: large enough that `build_have_set`
+/// walks meaningful history, small enough that the cold build stays under
+/// ~30s on commodity hardware.
+const DEEP_LINEAR_COMMITS: usize = 10_000;
 
 // ── Minimal test infrastructure (mirrors tests/common) ──────────────────────
 
@@ -340,11 +351,128 @@ fn make_servers() -> Vec<(String, ServerHandle)> {
     ]
 }
 
+// ── Deep-repo fetch-incremental bench (5.2b bitmap decision) ────────────────
+
+/// Holds the bare `deep` repo for the lifetime of the bench process.  Cold
+/// build takes several seconds so it must not fall inside any iteration loop.
+static DEEP_REPO: OnceLock<DeepRepo> = OnceLock::new();
+
+struct DeepRepo {
+    /// Bare repo path.
+    bare: PathBuf,
+    /// Held to keep the TempDir alive for the process lifetime.
+    _dir: TempDir,
+}
+
+fn deep_repo() -> &'static DeepRepo {
+    DEEP_REPO.get_or_init(|| {
+        let dir = tempdir().expect("tempdir for deep repo");
+        let bare = dir.path().join("deep.git");
+        RepoBuilder::new(bare.clone())
+            .linear_commits(DEEP_LINEAR_COMMITS)
+            .build()
+            .expect("build deep repo");
+        DeepRepo { bare, _dir: dir }
+    })
+}
+
+/// Resolve a rev to an `ObjectId` via git CLI.
+fn rev_parse(repo: &Path, rev: &str) -> gix::ObjectId {
+    let hex = run_git(repo, ["rev-parse", rev]).unwrap();
+    gix::ObjectId::from_hex(hex.as_bytes()).unwrap()
+}
+
+/// Drive `build_pack` on a backend and fully consume its streaming reader.
+///
+/// The bench measures this directly (not via an HTTP server + `git fetch`)
+/// for two reasons: (1) `git fetch` short-circuits after the first iteration
+/// once the client's object DB already holds the target tip, so iteration
+/// after iteration the server never rebuilds the pack; (2) the bitmap
+/// question (roadmap 5.2b) is specifically about `objects_for_fetch_filtered`
+/// / `build_have_set` cost — the HTTP transport is orthogonal.
+fn drive_build_pack<B>(backend: &B, repo: &B::Repo, want: &[gix::ObjectId], have: &[gix::ObjectId])
+where
+    B: StorageBackend,
+{
+    use std::io::Read;
+    let opts = mizzle::backend::PackOptions {
+        deepen: None,
+        filter: None,
+        thin_pack: false,
+    };
+    let mut out = backend.build_pack(repo, want, have, &opts).unwrap();
+    let mut sink = [0u8; 64 * 1024];
+    while out.reader.read(&mut sink).unwrap() > 0 {}
+}
+
+fn bench_fetch_incremental(c: &mut Criterion) {
+    span_totals::install();
+
+    // Snapshot JSON lives next to criterion's output so it's easy to diff
+    // across runs.  Deleted at start so each bench run produces a fresh file.
+    let out_path = PathBuf::from("target/criterion/bitmap-spans.jsonl");
+    let _ = fs::remove_file(&out_path);
+
+    let bare = deep_repo().bare.clone();
+    let tip = rev_parse(&bare, "HEAD");
+    let have_oids: Vec<(usize, gix::ObjectId)> = [1usize, 100]
+        .into_iter()
+        .map(|n| (n, rev_parse(&bare, &format!("HEAD~{n}"))))
+        .collect();
+
+    let mut group = c.benchmark_group("fetch_incremental");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(10));
+
+    // FsGitoxide — the code path the 5.2b decision is actually about.
+    {
+        let backend = FsGitoxide;
+        let repo = backend.open(&bare).unwrap();
+        for &(behind, have_oid) in &have_oids {
+            let case = format!("{behind}_behind");
+            span_totals::reset();
+            group.bench_with_input(
+                BenchmarkId::new("FsGitoxide", &case),
+                &have_oid,
+                |b, &have_oid| {
+                    b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
+                },
+            );
+            let snap = span_totals::snapshot(format!("deep/FsGitoxide/{case}"));
+            let _ = span_totals::append_snapshot(&out_path, &snap);
+        }
+    }
+
+    // FsGitCli — included as a wall-clock cross-check.  It shells out to
+    // `git upload-pack`, so `pack::*` spans are never entered and
+    // `build_have_set.total_ns` will be zero; this is expected.
+    {
+        let backend = FsGitCli;
+        let repo = backend.open(&bare).unwrap();
+        for &(behind, have_oid) in &have_oids {
+            let case = format!("{behind}_behind");
+            span_totals::reset();
+            group.bench_with_input(
+                BenchmarkId::new("FsGitCli", &case),
+                &have_oid,
+                |b, &have_oid| {
+                    b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
+                },
+            );
+            let snap = span_totals::snapshot(format!("deep/FsGitCli/{case}"));
+            let _ = span_totals::append_snapshot(&out_path, &snap);
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_clone,
     bench_push,
     bench_fetch,
-    bench_ls_remote
+    bench_ls_remote,
+    bench_fetch_incremental
 );
 criterion_main!(benches);

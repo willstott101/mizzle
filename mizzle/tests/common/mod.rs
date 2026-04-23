@@ -7,7 +7,6 @@ use axum::routing::get;
 use axum::Router;
 use mizzle::backend::StorageBackend;
 use mizzle::traits::RepoAccess;
-use simple_logger::SimpleLogger;
 use std::ffi::OsStr;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::{Command, Stdio};
@@ -282,10 +281,12 @@ static INIT: Once = Once::new();
 
 pub fn init_logging() {
     INIT.call_once(|| {
-        SimpleLogger::new()
-            .with_level(log::LevelFilter::Info)
-            .init()
-            .unwrap();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .try_init();
     });
 }
 

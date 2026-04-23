@@ -302,6 +302,43 @@ Extend `benches/backends.rs` to include the `medium` and `deep`
 reference repos.  The `deep`-repo incremental-fetch span data is the
 primary signal for whether roadmap 5.2b is needed.
 
+### Step 3.1 — Bitmap (5.2b) decision criterion
+
+Steps 1–3 above are enough on their own to decide whether to implement
+roadmap 5.2b.  The benchmark group `fetch_incremental` in
+`benches/backends.rs` runs `git fetch` against the `deep` reference repo
+(10,000 linear commits) with two catch-up distances (`1_behind`,
+`100_behind`) on each filesystem backend.  The span-totals subscriber
+(`benches/support/span_totals.rs`) installs a global `tracing` layer that
+accumulates per-span wall time and the maximum `have_set_len` debug event.
+After each bench case it appends one JSON line to
+`target/criterion/bitmap-spans.jsonl` and prints the same totals to
+stderr, tagged with `bench_id = deep/<backend>/<case>`.
+
+FsGitCli shells out to `git upload-pack` rather than going through
+`pack::objects_for_fetch_filtered`, so its span totals will always be
+empty.  Use its wall-clock number only as a cross-check that the test
+rig is sound; the bitmap question is specifically about the gitoxide
+code path.
+
+Decision rule, applied once the bench has been run on a representative
+box:
+
+- `build_have_set.mean_ns / objects_for_fetch_filtered.mean_ns ≥ 0.20` on
+  FsGitoxide at `1_behind` → implement 5.2b.
+- That ratio `< 0.10` at both distances → close 5.2b as "not justified".
+- `0.10 – 0.20` → re-evaluate after Step 3 is extended with async pack-
+  streaming spans; the denominator is currently just the have-set build
+  plus the want traversal, so a large ratio could still hide behind a
+  slow streaming step.
+- Independently of wall time, if `have_set_len_max` on `deep/1_behind`
+  exceeds ≈ 1,000,000, the memory pressure argument for bitmaps stands
+  even if the CPU ratio is under 10%.
+
+Numbers above are thresholds for decisiveness, not measured values.
+Record the actual observed ratios in the ADR/PR that closes or opens
+5.2b.
+
 ### Step 4 — Concurrency harness
 
 Build a load generator that runs N concurrent git operations.  Start
