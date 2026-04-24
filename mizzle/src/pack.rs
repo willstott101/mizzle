@@ -49,7 +49,24 @@ pub fn objects_for_fetch_filtered(
     filter: Option<&Filter>,
 ) -> anyhow::Result<PackObjects> {
     let have_set = build_have_set(odb.clone(), have)?;
+    objects_for_fetch_with_have_set(odb, want, have, deepen, filter, have_set)
+}
 
+/// Like [`objects_for_fetch_filtered`] but uses a caller-supplied `have_set`
+/// rather than walking the have commits.  The `fs_gitoxide` backend uses
+/// this to plug in a pack-reachability-bitmap lookup when one is available.
+#[tracing::instrument(
+    skip_all,
+    fields(want = want.len(), have = have.len(), deepen, filter = ?filter, have_set_len = have_set.len())
+)]
+pub(crate) fn objects_for_fetch_with_have_set(
+    odb: impl Find + Clone,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    deepen: Option<u32>,
+    filter: Option<&Filter>,
+    have_set: HashSet<ObjectId>,
+) -> anyhow::Result<PackObjects> {
     // Separate wanted OIDs by type: commits go through graph traversal,
     // non-commits (blobs/trees requested directly, e.g. lazy fetch after
     // partial clone) are included as-is.

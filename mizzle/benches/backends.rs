@@ -353,13 +353,15 @@ fn make_servers() -> Vec<(String, ServerHandle)> {
 
 // ── Deep-repo fetch-incremental bench (5.2b bitmap decision) ────────────────
 
-/// Holds the bare `deep` repo for the lifetime of the bench process.  Cold
-/// build takes several seconds so it must not fall inside any iteration loop.
+/// Two versions of the `deep` repo: one plain (`bare`), one post-processed
+/// with `git repack -adb` so it has `.bitmap` + `.rev` side files
+/// (`bare_bitmap`).  Cold build takes several seconds so both must live
+/// outside the iteration loop.
 static DEEP_REPO: OnceLock<DeepRepo> = OnceLock::new();
 
 struct DeepRepo {
-    /// Bare repo path.
     bare: PathBuf,
+    bare_bitmap: PathBuf,
     /// Held to keep the TempDir alive for the process lifetime.
     _dir: TempDir,
 }
@@ -368,11 +370,21 @@ fn deep_repo() -> &'static DeepRepo {
     DEEP_REPO.get_or_init(|| {
         let dir = tempdir().expect("tempdir for deep repo");
         let bare = dir.path().join("deep.git");
+        let bare_bitmap = dir.path().join("deep-bitmap.git");
         RepoBuilder::new(bare.clone())
             .linear_commits(DEEP_LINEAR_COMMITS)
             .build()
             .expect("build deep repo");
-        DeepRepo { bare, _dir: dir }
+        RepoBuilder::new(bare_bitmap.clone())
+            .linear_commits(DEEP_LINEAR_COMMITS)
+            .with_bitmap()
+            .build()
+            .expect("build deep-bitmap repo");
+        DeepRepo {
+            bare,
+            bare_bitmap,
+            _dir: dir,
+        }
     })
 }
 
@@ -413,54 +425,65 @@ fn bench_fetch_incremental(c: &mut Criterion) {
     let out_path = PathBuf::from("target/criterion/bitmap-spans.jsonl");
     let _ = fs::remove_file(&out_path);
 
-    let bare = deep_repo().bare.clone();
-    let tip = rev_parse(&bare, "HEAD");
+    let repos = deep_repo();
+    // Re-parse tips against the non-bitmap repo; both variants have
+    // identical commit OIDs by construction (same RepoBuilder input).
+    let tip = rev_parse(&repos.bare, "HEAD");
     let have_oids: Vec<(usize, gix::ObjectId)> = [1usize, 100]
         .into_iter()
-        .map(|n| (n, rev_parse(&bare, &format!("HEAD~{n}"))))
+        .map(|n| (n, rev_parse(&repos.bare, &format!("HEAD~{n}"))))
         .collect();
 
     let mut group = c.benchmark_group("fetch_incremental");
     group.sample_size(20);
     group.measurement_time(Duration::from_secs(10));
 
-    // FsGitoxide — the code path the 5.2b decision is actually about.
-    {
-        let backend = FsGitoxide;
-        let repo = backend.open(&bare).unwrap();
-        for &(behind, have_oid) in &have_oids {
-            let case = format!("{behind}_behind");
-            span_totals::reset();
-            group.bench_with_input(
-                BenchmarkId::new("FsGitoxide", &case),
-                &have_oid,
-                |b, &have_oid| {
-                    b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
-                },
-            );
-            let snap = span_totals::snapshot(format!("deep/FsGitoxide/{case}"));
-            let _ = span_totals::append_snapshot(&out_path, &snap);
-        }
-    }
+    // Run each backend against both the plain and bitmap-enabled `deep`
+    // repo so we can read off bitmap-vs-walker deltas directly from
+    // criterion's change report.  `FsGitoxide` uses our in-tree bitmap
+    // reader (see `src/bitmap.rs`); `FsGitCli` uses git's native bitmap
+    // support, providing an external reference for the gitoxide path.
+    let variants: [(&str, &PathBuf); 2] =
+        [("nobitmap", &repos.bare), ("bitmap", &repos.bare_bitmap)];
 
-    // FsGitCli — included as a wall-clock cross-check.  It shells out to
-    // `git upload-pack`, so `pack::*` spans are never entered and
-    // `build_have_set.total_ns` will be zero; this is expected.
-    {
-        let backend = FsGitCli;
-        let repo = backend.open(&bare).unwrap();
-        for &(behind, have_oid) in &have_oids {
-            let case = format!("{behind}_behind");
-            span_totals::reset();
-            group.bench_with_input(
-                BenchmarkId::new("FsGitCli", &case),
-                &have_oid,
-                |b, &have_oid| {
-                    b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
-                },
-            );
-            let snap = span_totals::snapshot(format!("deep/FsGitCli/{case}"));
-            let _ = span_totals::append_snapshot(&out_path, &snap);
+    for (variant, bare_path) in variants {
+        {
+            let backend = FsGitoxide;
+            let repo = backend.open(bare_path).unwrap();
+            for &(behind, have_oid) in &have_oids {
+                let case = format!("{variant}/{behind}_behind");
+                span_totals::reset();
+                group.bench_with_input(
+                    BenchmarkId::new("FsGitoxide", &case),
+                    &have_oid,
+                    |b, &have_oid| {
+                        b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
+                    },
+                );
+                let snap = span_totals::snapshot(format!("deep/FsGitoxide/{case}"));
+                let _ = span_totals::append_snapshot(&out_path, &snap);
+            }
+        }
+
+        // FsGitCli shells out to `git upload-pack`, so `pack::*` spans are
+        // never entered and its span totals are always empty.  Wall-clock
+        // is the only useful output for it; keep it as a cross-check.
+        {
+            let backend = FsGitCli;
+            let repo = backend.open(bare_path).unwrap();
+            for &(behind, have_oid) in &have_oids {
+                let case = format!("{variant}/{behind}_behind");
+                span_totals::reset();
+                group.bench_with_input(
+                    BenchmarkId::new("FsGitCli", &case),
+                    &have_oid,
+                    |b, &have_oid| {
+                        b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[have_oid]));
+                    },
+                );
+                let snap = span_totals::snapshot(format!("deep/FsGitCli/{case}"));
+                let _ = span_totals::append_snapshot(&out_path, &snap);
+            }
         }
     }
 

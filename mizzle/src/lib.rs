@@ -1,4 +1,5 @@
 pub mod backend;
+pub(crate) mod bitmap;
 mod command;
 mod fetch;
 pub(crate) mod inspect;

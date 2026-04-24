@@ -14,6 +14,7 @@ gix-packetline = { version = "0.21", features = ["async-io"] }
 gix-ref = "0.60"
 gix-object = "0.57"
 gix-pack = "0.67"
+gix-bitmap = "0.3"
 gix-features = { version = "0.46", features = ["parallel"] }
 futures-lite = "2.6"
 piper = "0.2"

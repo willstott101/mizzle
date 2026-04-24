@@ -3228,6 +3228,7 @@ dependencies = [
  "futures-lite 2.6.1",
  "futures-util",
  "gix",
+ "gix-bitmap",
  "gix-features",
  "gix-hash",
  "gix-object",

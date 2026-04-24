@@ -51,6 +51,7 @@ where
 pub struct RepoBuilder {
     bare_path: PathBuf,
     linear: Option<usize>,
+    with_bitmap: bool,
 }
 
 impl RepoBuilder {
@@ -60,6 +61,7 @@ impl RepoBuilder {
         Self {
             bare_path,
             linear: None,
+            with_bitmap: false,
         }
     }
 
@@ -67,6 +69,14 @@ impl RepoBuilder {
     /// with content derived from the commit index.
     pub fn linear_commits(mut self, n: usize) -> Self {
         self.linear = Some(n);
+        self
+    }
+
+    /// After pushing to the bare repo, run `git repack -adb` to consolidate
+    /// everything into a single pack and generate `.bitmap` + `.rev` side
+    /// files.  Required for benchmarking the bitmap-accelerated have-set.
+    pub fn with_bitmap(mut self) -> Self {
+        self.with_bitmap = true;
         self
     }
 
@@ -119,6 +129,10 @@ impl RepoBuilder {
         run_git(&work, ["push", "--mirror", "origin"])?;
         run_git(&self.bare_path, ["symbolic-ref", "HEAD", "refs/heads/main"])?;
         fs::remove_dir_all(&work)?;
+
+        if self.with_bitmap {
+            run_git(&self.bare_path, ["repack", "-adb"])?;
+        }
 
         Ok(self.bare_path)
     }

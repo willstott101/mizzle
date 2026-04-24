@@ -302,42 +302,37 @@ Extend `benches/backends.rs` to include the `medium` and `deep`
 reference repos.  The `deep`-repo incremental-fetch span data is the
 primary signal for whether roadmap 5.2b is needed.
 
-### Step 3.1 — Bitmap (5.2b) decision criterion
+### Step 3.1 — Bitmap (5.2b) implementation + comparison bench
 
-Steps 1–3 above are enough on their own to decide whether to implement
-roadmap 5.2b.  The benchmark group `fetch_incremental` in
-`benches/backends.rs` runs `git fetch` against the `deep` reference repo
-(10,000 linear commits) with two catch-up distances (`1_behind`,
-`100_behind`) on each filesystem backend.  The span-totals subscriber
-(`benches/support/span_totals.rs`) installs a global `tracing` layer that
-accumulates per-span wall time and the maximum `have_set_len` debug event.
-After each bench case it appends one JSON line to
-`target/criterion/bitmap-spans.jsonl` and prints the same totals to
-stderr, tagged with `bench_id = deep/<backend>/<case>`.
+Roadmap 5.2b is implemented.  `src/bitmap.rs` reads git's `.bitmap` +
+`.rev` files (format v1, sha1) directly — gitoxide 0.67/0.68 doesn't
+expose a reachability-bitmap reader, only the lower-level EWAH primitive
+in `gix-bitmap`.  `fs_gitoxide::try_bitmap_have_set` probes the repo's
+pack directory, loads each pack's bitmap if present, and returns a
+complete have-set when every have OID is covered.  On any miss the
+backend falls back to `pack::build_have_set` (the walker).
 
-FsGitCli shells out to `git upload-pack` rather than going through
-`pack::objects_for_fetch_filtered`, so its span totals will always be
-empty.  Use its wall-clock number only as a cross-check that the test
-rig is sound; the bitmap question is specifically about the gitoxide
-code path.
+The `fetch_incremental` bench in `benches/backends.rs` exercises both
+paths by building two copies of the `deep` repo (10,000 linear commits):
+one plain, one post-processed with `git repack -adb`.  Bench IDs encode
+the variant: `fetch_incremental/<backend>/{nobitmap,bitmap}/{1,100}_behind`.
+The span-totals subscriber emits per-span timings to
+`target/criterion/bitmap-spans.jsonl` and to stderr.
 
-Decision rule, applied once the bench has been run on a representative
-box:
+Spans to watch:
 
-- `build_have_set.mean_ns / objects_for_fetch_filtered.mean_ns ≥ 0.20` on
-  FsGitoxide at `1_behind` → implement 5.2b.
-- That ratio `< 0.10` at both distances → close 5.2b as "not justified".
-- `0.10 – 0.20` → re-evaluate after Step 3 is extended with async pack-
-  streaming spans; the denominator is currently just the have-set build
-  plus the want traversal, so a large ratio could still hide behind a
-  slow streaming step.
-- Independently of wall time, if `have_set_len_max` on `deep/1_behind`
-  exceeds ≈ 1,000,000, the memory pressure argument for bitmaps stands
-  even if the CPU ratio is under 10%.
+- `build_have_set` — fires only on the walker path; absent on the bitmap
+  path means `try_bitmap_have_set` covered all haves.
+- `try_bitmap_have_set` — ~60-100µs when no bitmap is present (directory
+  probe + early exit), hundreds of µs to low ms when it actually loads a
+  bitmap and answers.
+- `objects_for_fetch_with_have_set` — the shared tail work after the
+  have-set is resolved, identical code on both paths.
 
-Numbers above are thresholds for decisiveness, not measured values.
-Record the actual observed ratios in the ADR/PR that closes or opens
-5.2b.
+FsGitCli uses git's native bitmap support via `git pack-objects --revs`.
+Its span totals are always empty (it doesn't go through `pack::*`), but
+its wall-clock delta across the two variants is a useful external
+reference for the gitoxide path.
 
 ### Step 4 — Concurrency harness
 
