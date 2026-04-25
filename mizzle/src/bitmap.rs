@@ -324,7 +324,7 @@ mod tests {
     use super::*;
     use crate::pack::objects_for_fetch_filtered;
     use std::collections::HashSet;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use tempfile::tempdir;
 
