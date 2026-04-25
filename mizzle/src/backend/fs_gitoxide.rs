@@ -648,7 +648,7 @@ fn try_single_pack_bitmap(
     let obj_count = pack_idx.num_objects();
     let mut bitmap = crate::bitmap::PackBitmap::load(idx_path, obj_count).ok()??;
     bitmap.build_oid_index(|pos| pack_idx.oid_at_index(pos).try_into().ok());
-    bitmap.have_reachable(have, |pos| pack_idx.oid_at_index(pos).try_into().ok())
+    bitmap.have_reachable(have)
 }
 
 #[cfg(test)]

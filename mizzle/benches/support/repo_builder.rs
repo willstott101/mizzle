@@ -1,51 +1,14 @@
-//! Deterministic test-repo builder for performance benchmarks.
+//! Deterministic bare-repository builder for performance benchmarks.
 //!
-//! Only the shapes needed by the 5.2b bitmap-decision benchmark are
-//! implemented.  Content is derived from the commit index so the resulting
-//! packs are byte-for-byte reproducible across runs.
+//! Content is derived from the commit index so the resulting packs are
+//! byte-for-byte reproducible across runs.
 
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Result};
 
-const AUTHOR_NAME: &str = "Test Author";
-const AUTHOR_EMAIL: &str = "author@example.com";
-const COMMITTER_NAME: &str = "Test Committer";
-const COMMITTER_EMAIL: &str = "committer@example.com";
-const FIXED_TIME: &str = "1700000000 +0000";
-
-fn run_git<I, S>(cwd: &Path, args: I) -> Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
-        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
-        .env("GIT_AUTHOR_DATE", FIXED_TIME)
-        .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
-        .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
-        .env("GIT_COMMITTER_DATE", FIXED_TIME)
-        .env("TZ", "UTC")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !output.status.success() {
-        bail!(
-            "git failed (status {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
+use super::git_runner::{run_git, AUTHOR_EMAIL, AUTHOR_NAME};
 
 /// Builder for a deterministic bare git repository used by performance benches.
 pub struct RepoBuilder {

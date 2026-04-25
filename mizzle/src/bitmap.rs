@@ -6,9 +6,9 @@
 //! EWAH bitmaps — replacing the commit + tree walk in
 //! [`crate::pack::build_have_set`].
 //!
-//! Gitoxide (as of `gix-pack` 0.67) does not ship a reachability-bitmap
-//! reader, only the lower-level EWAH primitive in `gix-bitmap`.  This module
-//! fills the gap for the filesystem backend.
+//! Gitoxide does not ship a reachability-bitmap reader, only the lower-level
+//! EWAH primitive in `gix-bitmap`.  This module fills the gap for the
+//! filesystem backend.
 //!
 //! Scope: v1 bitmaps, sha1 hashes, single-pack.  Multi-pack bitmaps (midx)
 //! and OPT_LOOKUP_TABLE (v3) are not supported; a bitmap that uses features
@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 use gix::ObjectId;
@@ -27,7 +27,6 @@ const REV_MAGIC: &[u8; 4] = b"RIDX";
 const SHA1_LEN: usize = 20;
 const BITMAP_HEADER_LEN: usize = 4 + 2 + 2 + 4 + SHA1_LEN;
 
-const FLAG_HASH_CACHE: u16 = 0x4;
 const FLAG_LOOKUP_TABLE: u16 = 0x10;
 
 /// Loaded reachability bitmap for a single pack.
@@ -35,15 +34,14 @@ pub struct PackBitmap {
     /// Bit position (in the bitmap's pack-offset ordering) → idx position
     /// (OID-sorted position within the `.idx`).  Read from the `.rev` file.
     offset_pos_to_idx_pos: Vec<u32>,
+    /// Bitmap position → OID.  Populated by [`build_oid_index`].
+    offset_pos_to_oid: Vec<Option<ObjectId>>,
     /// OID → entry index in `entries`.
     oid_to_entry: HashMap<ObjectId, usize>,
     /// Entries in on-disk order, with pre-decoded EWAH bitmaps.
     entries: Vec<Entry>,
     /// Number of objects in the pack.  Drives the dense bitmap size.
     pack_object_count: u32,
-    /// Path to the loaded `.bitmap` file (for diagnostics).
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 struct Entry {
@@ -75,19 +73,16 @@ impl PackBitmap {
             return Ok(None);
         };
 
-        // OID lookup needs an index callback, but parse_bitmap doesn't have
-        // one.  We'll build oid_to_entry in a second pass from the caller
-        // because it needs the pack index.  For now, return a partial state.
         Ok(Some(Self {
+            offset_pos_to_oid: vec![None; offset_pos_to_idx_pos.len()],
             offset_pos_to_idx_pos,
             oid_to_entry: HashMap::new(),
             entries,
             pack_object_count,
-            path: bitmap_path,
         }))
     }
 
-    /// Populate the OID → entry map.  Called after [`load`] with a callback
+    /// Populate the OID lookup tables.  Called after [`load`] with a callback
     /// that maps `.idx` positions to object IDs (via `gix_pack::index::File`
     /// in the caller).
     ///
@@ -102,16 +97,17 @@ impl PackBitmap {
                 self.oid_to_entry.insert(oid, entry_idx);
             }
         }
+        for (bitmap_pos, &idx_pos) in self.offset_pos_to_idx_pos.iter().enumerate() {
+            self.offset_pos_to_oid[bitmap_pos] = oid_at_idx_pos(idx_pos);
+        }
     }
 
     /// If every `have` OID is covered by this bitmap, return the complete
     /// set of OIDs reachable from any of them.  Returns `None` if any have
     /// is missing from the bitmap (caller should fall back to the walker).
-    pub fn have_reachable(
-        &self,
-        haves: &[ObjectId],
-        oid_at_idx_pos: impl Fn(u32) -> Option<ObjectId>,
-    ) -> Option<HashSet<ObjectId>> {
+    ///
+    /// Must be called after [`build_oid_index`].
+    pub fn have_reachable(&self, haves: &[ObjectId]) -> Option<HashSet<ObjectId>> {
         // Resolve each have to an entry index up front.
         let mut entry_indices = Vec::with_capacity(haves.len());
         for have in haves {
@@ -129,12 +125,11 @@ impl PackBitmap {
             union.or_with(&bitmap);
         }
 
-        // Map set bits back to OIDs.
+        // Map set bits back to OIDs using the index built by build_oid_index.
         let mut out: HashSet<ObjectId> = HashSet::with_capacity(union.popcount());
         union.for_each_set_bit(|bitmap_pos| {
-            let idx_pos = *self.offset_pos_to_idx_pos.get(bitmap_pos)?;
-            let oid = oid_at_idx_pos(idx_pos)?;
-            out.insert(oid);
+            let oid = self.offset_pos_to_oid.get(bitmap_pos)?.as_ref()?;
+            out.insert(*oid);
             Some(())
         });
         Some(out)
@@ -233,7 +228,7 @@ fn parse_bitmap(bytes: &[u8]) -> Result<Option<(Vec<Entry>, u16)>> {
         }
         let idx_pos = u32::from_be_bytes(cursor[0..4].try_into().unwrap());
         let xor_offset = cursor[4];
-        let _flags_byte = cursor[5];
+        let _ = cursor[5]; // per-entry flags, unused
         cursor = &cursor[6..];
         let (ewah, rest) =
             gix_bitmap::ewah::decode(cursor).map_err(|e| anyhow!("EWAH entry bitmap: {e}"))?;
@@ -245,13 +240,9 @@ fn parse_bitmap(bytes: &[u8]) -> Result<Option<(Vec<Entry>, u16)>> {
         });
     }
 
-    if flags & FLAG_HASH_CACHE != 0 {
-        // We don't use the hash cache; skip past it.  Its size is
-        // 4 × pack_object_count, but we don't have that here without the
-        // idx — and the trailer is fixed at 20 bytes, so we just trust the
-        // remaining bytes are [hash cache][trailer].  Nothing more to parse.
-    }
-
+    // If the hash-cache flag (0x4) is set, additional bytes follow the
+    // entries before the 20-byte pack hash trailer.  We don't consume them;
+    // nothing after this point is parsed.
     Ok(Some((entries, flags)))
 }
 
@@ -399,9 +390,7 @@ mod tests {
         bm.build_oid_index(|i| pack_idx.oid_at_index(i).try_into().ok());
 
         for (i, &have) in tips.iter().enumerate() {
-            let from_bitmap = bm
-                .have_reachable(&[have], |p| pack_idx.oid_at_index(p).try_into().ok())
-                .expect("have covered by bitmap");
+            let from_bitmap = bm.have_reachable(&[have]).expect("have covered by bitmap");
 
             // Ground truth via the walker.
             let odb = gix::open(p).unwrap().objects;
@@ -428,9 +417,7 @@ mod tests {
 
         // Multi-have: OR of two disjoint tips' closures.
         let haves = vec![tips[5], tips[10]];
-        let from_bitmap = bm
-            .have_reachable(&haves, |pos| pack_idx.oid_at_index(pos).try_into().ok())
-            .expect("all haves covered");
+        let from_bitmap = bm.have_reachable(&haves).expect("all haves covered");
         let odb = gix::open(p).unwrap().objects;
         let walked: HashSet<ObjectId> = {
             let result =
@@ -469,12 +456,8 @@ mod tests {
         bm.build_oid_index(|pos| pack_idx.oid_at_index(pos).try_into().ok());
 
         // Tree OID is not a bitmap entry (only commits are).
-        assert!(bm
-            .have_reachable(&[tree], |pos| pack_idx.oid_at_index(pos).try_into().ok())
-            .is_none());
+        assert!(bm.have_reachable(&[tree]).is_none());
         // Commit OID works.
-        assert!(bm
-            .have_reachable(&[tip], |pos| pack_idx.oid_at_index(pos).try_into().ok())
-            .is_some());
+        assert!(bm.have_reachable(&[tip]).is_some());
     }
 }

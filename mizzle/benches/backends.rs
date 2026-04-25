@@ -1,7 +1,5 @@
-use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -19,56 +17,16 @@ use mizzle::traits::RepoAccess;
 use tempfile::{tempdir, TempDir};
 
 mod support;
+use support::git_runner::run_git;
 use support::repo_builder::RepoBuilder;
 use support::span_totals;
 
-/// Number of linear commits in the `deep` reference repo.  Sized for the
-/// 5.2b bitmap-acceleration decision: large enough that `build_have_set`
-/// walks meaningful history, small enough that the cold build stays under
-/// ~30s on commodity hardware.
+/// Number of linear commits in the `deep` reference repo — large enough that
+/// `build_have_set` walks meaningful history, small enough that the cold
+/// build completes in ~30s on commodity hardware.
 const DEEP_LINEAR_COMMITS: usize = 10_000;
 
 // ── Minimal test infrastructure (mirrors tests/common) ──────────────────────
-
-const AUTHOR_NAME: &str = "Test Author";
-const AUTHOR_EMAIL: &str = "author@example.com";
-const COMMITTER_NAME: &str = "Test Committer";
-const COMMITTER_EMAIL: &str = "committer@example.com";
-const FIXED_TIME: &str = "1700000000 +0000";
-
-fn run_git<I, S>(cwd: &Path, args: I) -> Result<String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    let output = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
-        .env("GIT_AUTHOR_EMAIL", AUTHOR_EMAIL)
-        .env("GIT_AUTHOR_DATE", FIXED_TIME)
-        .env("GIT_COMMITTER_NAME", COMMITTER_NAME)
-        .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
-        .env("GIT_COMMITTER_DATE", FIXED_TIME)
-        .env("TZ", "UTC")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "git failed (status {}):\nSTDOUT:\n{}\nSTDERR:\n{}",
-            output.status,
-            stdout,
-            stderr
-        );
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
 
 struct TempRepo {
     dir: TempDir,
@@ -351,7 +309,7 @@ fn make_servers() -> Vec<(String, ServerHandle)> {
     ]
 }
 
-// ── Deep-repo fetch-incremental bench (5.2b bitmap decision) ────────────────
+// ── Deep-repo fetch-incremental bench ───────────────────────────────────────
 
 /// Two versions of the `deep` repo: one plain (`bare`), one post-processed
 /// with `git repack -adb` so it has `.bitmap` + `.rev` side files
@@ -396,12 +354,9 @@ fn rev_parse(repo: &Path, rev: &str) -> gix::ObjectId {
 
 /// Drive `build_pack` on a backend and fully consume its streaming reader.
 ///
-/// The bench measures this directly (not via an HTTP server + `git fetch`)
-/// for two reasons: (1) `git fetch` short-circuits after the first iteration
-/// once the client's object DB already holds the target tip, so iteration
-/// after iteration the server never rebuilds the pack; (2) the bitmap
-/// question (roadmap 5.2b) is specifically about `objects_for_fetch_filtered`
-/// / `build_have_set` cost — the HTTP transport is orthogonal.
+/// Measures pack computation directly rather than through an HTTP `git fetch`
+/// because iterative fetch short-circuits once the client already has the
+/// target tip, and the HTTP transport layer is orthogonal to have-set cost.
 fn drive_build_pack<B>(backend: &B, repo: &B::Repo, want: &[gix::ObjectId], have: &[gix::ObjectId])
 where
     B: StorageBackend,

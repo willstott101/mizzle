@@ -52,9 +52,9 @@ pub fn objects_for_fetch_filtered(
     objects_for_fetch_with_have_set(odb, want, have, deepen, filter, have_set)
 }
 
-/// Like [`objects_for_fetch_filtered`] but uses a caller-supplied `have_set`
-/// rather than walking the have commits.  The `fs_gitoxide` backend uses
-/// this to plug in a pack-reachability-bitmap lookup when one is available.
+/// Like [`objects_for_fetch_filtered`] but uses a pre-computed `have_set`
+/// rather than walking the have commits.  Use this when the have-set is
+/// already available (e.g. from a reachability bitmap) to skip the walk.
 #[tracing::instrument(
     skip_all,
     fields(want = want.len(), have = have.len(), deepen, filter = ?filter, have_set_len = have_set.len())
