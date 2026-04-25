@@ -302,6 +302,38 @@ Extend `benches/backends.rs` to include the `medium` and `deep`
 reference repos.  The `deep`-repo incremental-fetch span data is the
 primary signal for whether roadmap 5.2b is needed.
 
+### Step 3.1 — Bitmap (5.2b) implementation + comparison bench
+
+Roadmap 5.2b is implemented.  `src/bitmap.rs` reads git's `.bitmap` +
+`.rev` files (format v1, sha1) directly — gitoxide 0.67/0.68 doesn't
+expose a reachability-bitmap reader, only the lower-level EWAH primitive
+in `gix-bitmap`.  `fs_gitoxide::try_bitmap_have_set` probes the repo's
+pack directory, loads each pack's bitmap if present, and returns a
+complete have-set when every have OID is covered.  On any miss the
+backend falls back to `pack::build_have_set` (the walker).
+
+The `fetch_incremental` bench in `benches/backends.rs` exercises both
+paths by building two copies of the `deep` repo (10,000 linear commits):
+one plain, one post-processed with `git repack -adb`.  Bench IDs encode
+the variant: `fetch_incremental/<backend>/{nobitmap,bitmap}/{1,100}_behind`.
+The span-totals subscriber emits per-span timings to
+`target/criterion/bitmap-spans.jsonl` and to stderr.
+
+Spans to watch:
+
+- `build_have_set` — fires only on the walker path; absent on the bitmap
+  path means `try_bitmap_have_set` covered all haves.
+- `try_bitmap_have_set` — ~60-100µs when no bitmap is present (directory
+  probe + early exit), hundreds of µs to low ms when it actually loads a
+  bitmap and answers.
+- `objects_for_fetch_with_have_set` — the shared tail work after the
+  have-set is resolved, identical code on both paths.
+
+FsGitCli uses git's native bitmap support via `git pack-objects --revs`.
+Its span totals are always empty (it doesn't go through `pack::*`), but
+its wall-clock delta across the two variants is a useful external
+reference for the gitoxide path.
+
 ### Step 4 — Concurrency harness
 
 Build a load generator that runs N concurrent git operations.  Start

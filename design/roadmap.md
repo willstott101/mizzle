@@ -54,16 +54,19 @@ trees) via zlib inflate just to extract OID, kind, and size.  Auth only
 needs commit/tag metadata.  Read the pack entry header to get type and
 size without inflating blob/tree data.
 
-#### 5.2b — Bitmap-accelerated have-set
+#### 5.2b — Bitmap-accelerated have-set ✓
 
 `build_have_set` materialises the entire reachable object graph from
 `have` tips into a `HashSet<ObjectId>`.  For large repos this is millions
 of OIDs.  Git solves this with `.bitmap` files alongside pack indexes —
-a single bitmap lookup replaces the full commit + tree walk.  gitoxide
-supports bitmaps via `gix_pack::Bundle`.
+a single bitmap lookup replaces the full commit + tree walk.
 
-Implement only if Phase 5.1 benchmark results show meaningful cost on
-the `deep` repo.
+Gitoxide 0.67/0.68 exposes the EWAH primitive (`gix-bitmap`) but not a
+reachability-bitmap reader, so `mizzle/src/bitmap.rs` parses the `.bitmap`
++ `.rev` files directly (v1 format, sha1 only).  `FsGitoxide::build_pack`
+calls `try_bitmap_have_set` first; on any uncovered have (or no bitmap)
+it falls back to the original walker.  See `design/performance-testing.md`
+§3.1 for the comparison bench and spans.
 
 #### 5.2c — Ship existing pack data as-is
 

@@ -37,6 +37,10 @@ pub struct PackObjects {
 ///
 /// When `filter` is provided, objects matching the filter are omitted from the
 /// pack (partial clone).
+#[tracing::instrument(
+    skip_all,
+    fields(want = want.len(), have = have.len(), deepen, filter = ?filter)
+)]
 pub fn objects_for_fetch_filtered(
     odb: impl Find + Clone,
     want: &[ObjectId],
@@ -45,7 +49,24 @@ pub fn objects_for_fetch_filtered(
     filter: Option<&Filter>,
 ) -> anyhow::Result<PackObjects> {
     let have_set = build_have_set(odb.clone(), have)?;
+    objects_for_fetch_with_have_set(odb, want, have, deepen, filter, have_set)
+}
 
+/// Like [`objects_for_fetch_filtered`] but uses a pre-computed `have_set`
+/// rather than walking the have commits.  Use this when the have-set is
+/// already available (e.g. from a reachability bitmap) to skip the walk.
+#[tracing::instrument(
+    skip_all,
+    fields(want = want.len(), have = have.len(), deepen, filter = ?filter, have_set_len = have_set.len())
+)]
+pub(crate) fn objects_for_fetch_with_have_set(
+    odb: impl Find + Clone,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    deepen: Option<u32>,
+    filter: Option<&Filter>,
+    have_set: HashSet<ObjectId>,
+) -> anyhow::Result<PackObjects> {
     // Separate wanted OIDs by type: commits go through graph traversal,
     // non-commits (blobs/trees requested directly, e.g. lazy fetch after
     // partial clone) are included as-is.
@@ -202,6 +223,7 @@ fn depth_limited_commits(
 
 /// Builds a set of all object IDs reachable from the `have` commits. Used to
 /// exclude already-known objects when building a pack for the want side.
+#[tracing::instrument(skip_all, fields(have = have.len()))]
 fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<HashSet<ObjectId>> {
     let mut have_set: HashSet<ObjectId> = HashSet::new();
     let mut state = gix::traverse::tree::breadthfirst::State::default();
@@ -246,6 +268,7 @@ fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<H
         }
     }
 
+    tracing::debug!(have_set_len = have_set.len(), "have-set built");
     Ok(have_set)
 }
 

@@ -11,13 +11,12 @@ use axum::{
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use log::info;
 use mizzle::serve::ProtocolLimits;
 use mizzle::servers::axum::serve;
 use mizzle::traits::{PackMetadata, PushRef, RepoAccess};
-use simple_logger::SimpleLogger;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
+use tracing::info;
 
 struct Access {
     repo_path: PathBuf,
@@ -71,10 +70,12 @@ struct Config {
 
 #[tokio::main]
 async fn main() {
-    SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .init()
-        .unwrap();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     let config = Arc::new(Config {
         repo_path: PathBuf::from("."),

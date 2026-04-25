@@ -191,13 +191,29 @@ impl StorageBackend for FsGitoxide {
     ) -> Result<PackOutput> {
         let handle = repo.repo.to_thread_local().objects;
 
-        let pack_objects = pack::objects_for_fetch_filtered(
-            handle.clone().into_inner(),
-            want,
-            have,
-            opts.deepen,
-            opts.filter.as_ref(),
-        )?;
+        // Try to answer the have-set via a pack reachability bitmap first.
+        // If unavailable (no `.bitmap` in any pack, or a have commit isn't
+        // covered) fall back to the full walker in `pack::build_have_set`.
+        let bitmap_have_set = try_bitmap_have_set(repo, have);
+
+        let pack_objects = if let Some(have_set) = bitmap_have_set {
+            pack::objects_for_fetch_with_have_set(
+                handle.clone().into_inner(),
+                want,
+                have,
+                opts.deepen,
+                opts.filter.as_ref(),
+                have_set,
+            )?
+        } else {
+            pack::objects_for_fetch_filtered(
+                handle.clone().into_inner(),
+                want,
+                have,
+                opts.deepen,
+                opts.filter.as_ref(),
+            )?
+        };
 
         let thin_pack = opts.thin_pack;
         let objects = pack_objects.objects;
@@ -594,6 +610,45 @@ impl gix_features::progress::NestedProgress for ChannelProgress {
     ) -> Self::SubProgress {
         self.add_child(name)
     }
+}
+
+/// Try to compute `build_have_set` via a pack reachability bitmap.  Returns
+/// `None` if no pack in the repo has a usable `.bitmap` / `.rev` sidecar,
+/// or if any have OID is not a bitmap entry — the caller then falls back
+/// to the walker.
+#[tracing::instrument(skip_all, fields(have = have.len()))]
+fn try_bitmap_have_set(
+    repo: &FsGitoxideRepo,
+    have: &[ObjectId],
+) -> Option<std::collections::HashSet<ObjectId>> {
+    if have.is_empty() {
+        return Some(std::collections::HashSet::new());
+    }
+
+    let pack_dir = repo.repo.objects_dir().join("pack");
+    let entries = std::fs::read_dir(&pack_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("idx") {
+            continue;
+        }
+        if let Some(set) = try_single_pack_bitmap(&path, have) {
+            tracing::debug!(have_set_len = set.len(), "have-set built (bitmap)");
+            return Some(set);
+        }
+    }
+    None
+}
+
+fn try_single_pack_bitmap(
+    idx_path: &Path,
+    have: &[ObjectId],
+) -> Option<std::collections::HashSet<ObjectId>> {
+    let pack_idx = gix_pack::index::File::at(idx_path, gix_hash::Kind::Sha1).ok()?;
+    let obj_count = pack_idx.num_objects();
+    let mut bitmap = crate::bitmap::PackBitmap::load(idx_path, obj_count).ok()??;
+    bitmap.build_oid_index(|pos| pack_idx.oid_at_index(pos).try_into().ok());
+    bitmap.have_reachable(have)
 }
 
 #[cfg(test)]

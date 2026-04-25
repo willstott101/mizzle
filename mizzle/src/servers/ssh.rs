@@ -3,10 +3,10 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use log::{error, info};
 use russh::server::{Auth, Msg, Server, Session};
 use russh::{Channel, ChannelId};
 use tokio_util::compat::TokioAsyncReadCompatExt;
+use tracing::{error, info};
 
 use crate::backend::fs_gitoxide::FsGitoxide;
 use crate::serve::{serve_receive_pack, serve_upload_pack, ProtocolLimits};
