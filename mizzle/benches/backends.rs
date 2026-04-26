@@ -445,12 +445,64 @@ fn bench_fetch_incremental(c: &mut Criterion) {
     group.finish();
 }
 
+/// Full-clone (empty `have`) of the `deep` repo against both variants.  On
+/// the `bitmap` variant `FsGitoxide` should hit the pack-reuse fast path
+/// (`pack_reuse::find_reusable_pack`) and stream the on-disk pack verbatim,
+/// skipping the count→compress→chunk pipeline entirely.  Wall-clock delta
+/// vs. the `nobitmap` variant is the headline number for roadmap 5.2c.
+fn bench_clone_full(c: &mut Criterion) {
+    span_totals::install();
+
+    let out_path = PathBuf::from("target/criterion/pack-reuse-spans.jsonl");
+    let _ = fs::remove_file(&out_path);
+
+    let repos = deep_repo();
+    let tip = rev_parse(&repos.bare, "HEAD");
+
+    let mut group = c.benchmark_group("clone_full");
+    group.sample_size(20);
+    group.measurement_time(Duration::from_secs(10));
+
+    let variants: [(&str, &PathBuf); 2] =
+        [("nobitmap", &repos.bare), ("bitmap", &repos.bare_bitmap)];
+
+    for (variant, bare_path) in variants {
+        {
+            let backend = FsGitoxide;
+            let repo = backend.open(bare_path).unwrap();
+            span_totals::reset();
+            group.bench_with_input(BenchmarkId::new("FsGitoxide", variant), &tip, |b, &tip| {
+                b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[]));
+            });
+            let snap = span_totals::snapshot(format!("deep/FsGitoxide/{variant}"));
+            let _ = span_totals::append_snapshot(&out_path, &snap);
+        }
+
+        // FsGitCli always shells out to git which uses native pack reuse
+        // when it can; our `pack::*` spans are never entered.  Wall-clock
+        // is the cross-check.
+        {
+            let backend = FsGitCli;
+            let repo = backend.open(bare_path).unwrap();
+            span_totals::reset();
+            group.bench_with_input(BenchmarkId::new("FsGitCli", variant), &tip, |b, &tip| {
+                b.iter(|| drive_build_pack(&backend, &repo, &[tip], &[]));
+            });
+            let snap = span_totals::snapshot(format!("deep/FsGitCli/{variant}"));
+            let _ = span_totals::append_snapshot(&out_path, &snap);
+        }
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_clone,
     bench_push,
     bench_fetch,
     bench_ls_remote,
-    bench_fetch_incremental
+    bench_fetch_incremental,
+    bench_clone_full
 );
 criterion_main!(benches);

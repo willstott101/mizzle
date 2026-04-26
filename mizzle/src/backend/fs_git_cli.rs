@@ -688,6 +688,7 @@ mod tests {
         git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "t@t.com"]);
         git(&work, &["config", "user.name", "T"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
         std::fs::write(work.join("README.md"), "# Demo\n").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "Initial"]);

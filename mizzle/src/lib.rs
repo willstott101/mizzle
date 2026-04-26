@@ -1,10 +1,11 @@
 pub mod backend;
-pub(crate) mod bitmap;
+pub mod bitmap;
 mod command;
 mod fetch;
 pub(crate) mod inspect;
 mod ls_refs;
 pub(crate) mod pack;
+pub mod pack_reuse;
 mod receive;
 pub mod serve;
 pub mod servers;
