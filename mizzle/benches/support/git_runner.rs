@@ -25,6 +25,10 @@ where
         .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
         .env("GIT_COMMITTER_DATE", FIXED_TIME)
         .env("TZ", "UTC")
+        // Disable commit signing regardless of the host's global config.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
