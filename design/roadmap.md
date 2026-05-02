@@ -47,12 +47,14 @@ is actually needed before committing to the implementation.
 
 ### Phase 5.2 — Optimisations
 
-#### 5.2a — Lazy pack inspection
+#### 5.2a — Lazy pack inspection ✓
 
-`inspect_pack` decodes every object in the pack (including blobs and
-trees) via zlib inflate just to extract OID, kind, and size.  Auth only
-needs commit/tag metadata.  Read the pack entry header to get type and
-size without inflating blob/tree data.
+`inspect_pack` previously decoded every object in the pack (including
+blobs and trees) via zlib inflate just to extract OID, kind, and size.
+Auth only needs commit/tag metadata.  `mizzle/src/inspect.rs` now reads
+the pack entry header for type + size on non-deltas, and `decode_header`
+(partial inflate of ~32 bytes per delta hop) for deltas — full inflate
+runs only for commits and tags.
 
 #### 5.2b — Bitmap-accelerated have-set ✓
 
@@ -68,12 +70,32 @@ calls `try_bitmap_have_set` first; on any uncovered have (or no bitmap)
 it falls back to the original walker.  See `design/performance-testing.md`
 §3.1 for the comparison bench and spans.
 
-#### 5.2c — Ship existing pack data as-is
+#### 5.2c — Ship existing pack data as-is ✓
 
-When a single on-disk pack already covers all wanted objects, skip the
-count → compress → chunk pipeline and stream the pack file directly.
+When an on-disk pack already covers exactly the request closure, skip
+the count → compress → chunk pipeline and stream the pack file directly.
 `PackCopyAndBaseObjects` mode already copies individual entries, but
 whole-pack bypass avoids the per-object overhead entirely.
+
+`mizzle/src/pack_reuse.rs` exposes `find_reusable_pack` and
+`pack_is_exactly_reusable` — public utilities any backend can call to
+test a candidate pack.  The check is conservative: a pack is reusable
+only when its `.bitmap` proves it contains *exactly* the closure of
+`want \ have` (no bandwidth-wasting extras, no missing objects).
+`PackBitmap::covers_exactly` is the underlying primitive in
+`mizzle/src/bitmap.rs`.
+
+`FsGitoxide::build_pack` calls `find_reusable_pack` first when no
+`filter` / `deepen` / `thin_pack` is requested; on a hit it returns a
+`PackOutput` whose reader is the on-disk `.pack` file.  The typical
+trigger is a clone against a `git repack -adb`'d repo.  Other backends
+with locally-cached packs (e.g. networked backends with an SSD pack
+cache) can use the same utilities directly rather than re-implementing
+the bitmap coverage check.
+
+The `clone_full/<backend>/{nobitmap,bitmap}` bench in
+`benches/backends.rs` exercises both paths against the `deep` repo;
+spans land in `target/criterion/pack-reuse-spans.jsonl`.
 
 #### 5.2d — Per-request repo handle ✓
 

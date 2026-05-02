@@ -16,6 +16,7 @@ use crate::backend::{
     StorageBackend,
 };
 use crate::pack;
+use crate::pack_reuse;
 use crate::traits::PushKind;
 
 /// Filesystem backend using gitoxide.
@@ -189,6 +190,17 @@ impl StorageBackend for FsGitoxide {
         have: &[ObjectId],
         opts: &PackOptions,
     ) -> Result<PackOutput> {
+        // Fast path: when no shallow / filter / thin-pack rewriting is
+        // requested and a local pack's bitmap proves it contains exactly the
+        // request closure, stream the pack file verbatim instead of running
+        // the count / compress / chunk pipeline.  See [`crate::pack_reuse`].
+        if opts.deepen.is_none() && opts.filter.is_none() && !opts.thin_pack {
+            let pack_dir = repo.repo.objects_dir().join("pack");
+            if let Some(pack_path) = pack_reuse::find_reusable_pack(&pack_dir, want, have)? {
+                return ship_pack_as_is(&pack_path);
+            }
+        }
+
         let handle = repo.repo.to_thread_local().objects;
 
         // Try to answer the have-set via a pack reachability bitmap first.
@@ -314,6 +326,24 @@ impl StorageBackend for FsGitoxide {
         let _ = std::fs::remove_file(&pack.index);
         let _ = std::fs::remove_file(&pack.pack);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pack reuse (whole-pack bypass)
+// ---------------------------------------------------------------------------
+
+/// Wrap an existing on-disk `.pack` file as a [`PackOutput`].  The pack is
+/// already in wire format (header + entries + trailing pack-hash), so the
+/// client can consume it identically to a freshly-generated pack.
+#[tracing::instrument(skip_all, fields(pack = %pack_path.display()))]
+fn ship_pack_as_is(pack_path: &Path) -> Result<PackOutput> {
+    let file = std::fs::File::open(pack_path)
+        .with_context(|| format!("opening reusable pack {}", pack_path.display()))?;
+    Ok(PackOutput {
+        reader: Box::new(io::BufReader::new(file)),
+        shallow: Vec::new(),
+        progress: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -694,6 +724,7 @@ mod tests {
         git(&work, &["init", "-b", "main"]);
         git(&work, &["config", "user.email", "t@t.com"]);
         git(&work, &["config", "user.name", "T"]);
+        git(&work, &["config", "commit.gpgsign", "false"]);
         std::fs::write(work.join("README.md"), "# Demo\n").unwrap();
         git(&work, &["add", "."]);
         git(&work, &["commit", "-m", "Initial"]);
@@ -1038,6 +1069,131 @@ mod tests {
             "incremental pack ({} bytes) should be smaller than full pack ({} bytes)",
             incr_data.len(),
             full_data.len()
+        );
+    }
+
+    /// On a `git repack -adb`'d bare repo, a clone-shaped `build_pack` must
+    /// take the reuse fast path and stream the on-disk pack verbatim — the
+    /// bytes returned must match the file in `objects/pack/`.
+    #[test]
+    fn build_pack_ships_existing_pack_as_is() {
+        let (_dir, bare) = test_bare_repo();
+        // Run `git repack -adb` on the bare repo so it has exactly one pack
+        // with `.bitmap` + `.rev` sidecars.
+        let out = Command::new("git")
+            .current_dir(&bare)
+            .args(["repack", "-adb"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git repack -adb failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        let repo = FsGitoxide.open(&bare).unwrap();
+        let main_oid = FsGitoxide
+            .resolve_ref(&repo, "refs/heads/main")
+            .unwrap()
+            .unwrap();
+        let dev_oid = FsGitoxide
+            .resolve_ref(&repo, "refs/heads/dev")
+            .unwrap()
+            .unwrap();
+        let tag_oid = FsGitoxide
+            .resolve_ref(&repo, "refs/tags/v1.0.0")
+            .unwrap()
+            .unwrap();
+
+        // Find the on-disk pack file.
+        let pack_dir = bare.join("objects").join("pack");
+        let on_disk_pack = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("pack"))
+            .expect("repacked bare repo should have one .pack")
+            .path();
+        let on_disk_bytes = std::fs::read(&on_disk_pack).unwrap();
+
+        // Want every tip — closure equals the entire repo, which equals the
+        // pack contents.
+        let mut output = FsGitoxide
+            .build_pack(
+                &repo,
+                &[main_oid, dev_oid, tag_oid],
+                &[],
+                &PackOptions {
+                    deepen: None,
+                    filter: None,
+                    thin_pack: false,
+                },
+            )
+            .unwrap();
+        let mut returned = Vec::new();
+        io::Read::read_to_end(&mut output.reader, &mut returned).unwrap();
+
+        assert_eq!(
+            returned, on_disk_bytes,
+            "reuse path must stream the pack file verbatim"
+        );
+        assert!(
+            output.progress.is_none(),
+            "reuse path emits no per-object progress"
+        );
+        assert!(output.shallow.is_empty());
+    }
+
+    /// Filter / depth / thin-pack must disable the reuse path: those
+    /// transformations require rewriting pack contents.
+    #[test]
+    fn build_pack_with_filter_does_not_reuse() {
+        use mizzle_proto::pack::Filter;
+
+        let (_dir, bare) = test_bare_repo();
+        let _ = Command::new("git")
+            .current_dir(&bare)
+            .args(["repack", "-adb"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+
+        let repo = FsGitoxide.open(&bare).unwrap();
+        let main_oid = FsGitoxide
+            .resolve_ref(&repo, "refs/heads/main")
+            .unwrap()
+            .unwrap();
+
+        // blob:none should produce a smaller pack than the on-disk pack —
+        // proves the reuse path bailed out.
+        let pack_dir = bare.join("objects").join("pack");
+        let on_disk_size = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("pack"))
+            .map(|e| e.metadata().unwrap().len())
+            .unwrap();
+
+        let mut output = FsGitoxide
+            .build_pack(
+                &repo,
+                &[main_oid],
+                &[],
+                &PackOptions {
+                    deepen: None,
+                    filter: Some(Filter::BlobNone),
+                    thin_pack: false,
+                },
+            )
+            .unwrap();
+        let mut data = Vec::new();
+        io::Read::read_to_end(&mut output.reader, &mut data).unwrap();
+
+        assert!(
+            (data.len() as u64) < on_disk_size,
+            "filtered pack ({} bytes) should be smaller than on-disk pack ({} bytes)",
+            data.len(),
+            on_disk_size
         );
     }
 

@@ -212,6 +212,11 @@ where
         .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
         .env("GIT_COMMITTER_DATE", FIXED_TIME)
         .env("TZ", "UTC")
+        // Disable commit signing regardless of the host's global config —
+        // tests issue commits in freshly-cloned repos that inherit it.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .env("GIT_TRACE_PACKET", "1")
         .env("GIT_TRACE", "2")
         .env("GIT_CURL_VERBOSE", "1")
@@ -248,6 +253,9 @@ where
         .env("GIT_COMMITTER_EMAIL", COMMITTER_EMAIL)
         .env("GIT_COMMITTER_DATE", FIXED_TIME)
         .env("TZ", "UTC")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false")
         .stdin(Stdio::null())
         .output()?;
 

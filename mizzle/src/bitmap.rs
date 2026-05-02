@@ -102,30 +102,18 @@ impl PackBitmap {
         }
     }
 
+    /// Number of objects in the pack this bitmap describes.
+    pub fn pack_object_count(&self) -> u32 {
+        self.pack_object_count
+    }
+
     /// If every `have` OID is covered by this bitmap, return the complete
     /// set of OIDs reachable from any of them.  Returns `None` if any have
     /// is missing from the bitmap (caller should fall back to the walker).
     ///
     /// Must be called after [`build_oid_index`].
     pub fn have_reachable(&self, haves: &[ObjectId]) -> Option<HashSet<ObjectId>> {
-        // Resolve each have to an entry index up front.
-        let mut entry_indices = Vec::with_capacity(haves.len());
-        for have in haves {
-            let idx = *self.oid_to_entry.get(have)?;
-            entry_indices.push(idx);
-        }
-
-        // Decode the union of the haves' reachability bitmaps, chasing XOR
-        // chains as we go.  `decoded` caches fully-decoded bitmaps keyed by
-        // entry index; the chain dependencies often overlap.
-        let mut decoded: HashMap<usize, DenseBitmap> = HashMap::new();
-        let mut union = DenseBitmap::new(self.pack_object_count as usize);
-        for entry_idx in entry_indices {
-            let bitmap = self.decode_entry(entry_idx, &mut decoded);
-            union.or_with(&bitmap);
-        }
-
-        // Map set bits back to OIDs using the index built by build_oid_index.
+        let union = self.union_bitmap(haves)?;
         let mut out: HashSet<ObjectId> = HashSet::with_capacity(union.popcount());
         union.for_each_set_bit(|bitmap_pos| {
             let oid = self.offset_pos_to_oid.get(bitmap_pos)?.as_ref()?;
@@ -133,6 +121,49 @@ impl PackBitmap {
             Some(())
         });
         Some(out)
+    }
+
+    /// Whether the pack contains *exactly* the closure of `want` minus the
+    /// closure of `have` — no extras (which would waste client bandwidth on
+    /// objects already known) and nothing missing.  Designed to gate the
+    /// "ship pack as-is" fast path in [`crate::pack_reuse`].
+    ///
+    /// Returns:
+    /// - `Some(true)` when the pack is exactly reusable for the request.
+    /// - `Some(false)` when every OID resolves but the bit set differs
+    ///   from the pack contents (pack is a strict superset or subset).
+    /// - `None` when any `want` or `have` OID is not a bitmap entry —
+    ///   coverage is undetermined and the caller must fall back.
+    ///
+    /// Must be called after [`build_oid_index`].
+    pub fn covers_exactly(&self, want: &[ObjectId], have: &[ObjectId]) -> Option<bool> {
+        if want.is_empty() {
+            return Some(false);
+        }
+        let mut covered = self.union_bitmap(want)?;
+        if !have.is_empty() {
+            let have_bitmap = self.union_bitmap(have)?;
+            covered.andnot_with(&have_bitmap);
+        }
+        let n = self.pack_object_count as usize;
+        Some(covered.popcount_in_range(n) == n)
+    }
+
+    /// OR the per-OID reachability bitmaps for every entry in `oids`.
+    /// Returns `None` if any OID is not a bitmap entry.
+    fn union_bitmap(&self, oids: &[ObjectId]) -> Option<DenseBitmap> {
+        let mut entry_indices = Vec::with_capacity(oids.len());
+        for oid in oids {
+            let idx = *self.oid_to_entry.get(oid)?;
+            entry_indices.push(idx);
+        }
+        let mut decoded: HashMap<usize, DenseBitmap> = HashMap::new();
+        let mut union = DenseBitmap::new(self.pack_object_count as usize);
+        for entry_idx in entry_indices {
+            let bitmap = self.decode_entry(entry_idx, &mut decoded);
+            union.or_with(&bitmap);
+        }
+        Some(union)
     }
 
     fn decode_entry(
@@ -291,6 +322,12 @@ impl DenseBitmap {
         }
     }
 
+    fn andnot_with(&mut self, other: &Self) {
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a &= !*b;
+        }
+    }
+
     fn extend_to(&mut self, num_bits: usize) {
         if num_bits > self.num_bits {
             self.num_bits = num_bits;
@@ -300,6 +337,25 @@ impl DenseBitmap {
 
     fn popcount(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Count set bits in positions `0..end`, ignoring any stale bits the
+    /// underlying word storage may carry past `end` from earlier OR/XOR
+    /// operations against bitmaps with a larger `num_bits`.
+    fn popcount_in_range(&self, end: usize) -> usize {
+        let full_words = end / 64;
+        let rem = end % 64;
+        let mut total: usize = 0;
+        for &w in self.words.iter().take(full_words) {
+            total += w.count_ones() as usize;
+        }
+        if rem > 0 {
+            if let Some(&w) = self.words.get(full_words) {
+                let mask = (1u64 << rem) - 1;
+                total += (w & mask).count_ones() as usize;
+            }
+        }
+        total
     }
 
     fn for_each_set_bit(&self, mut f: impl FnMut(usize) -> Option<()>) {
@@ -430,6 +486,88 @@ mod tests {
             s
         };
         assert_eq!(from_bitmap, walked, "multi-have mismatch");
+    }
+
+    /// On a freshly `repack -adb`'d single-pack repo, the pack must be
+    /// exactly reusable when the want is the tip and there are no haves —
+    /// every reachable object lives in this pack and only this pack.
+    #[test]
+    fn covers_exactly_true_for_full_clone_of_repacked_repo() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+        for i in 0..10 {
+            std::fs::write(p.join("f.txt"), format!("c{i}\n")).unwrap();
+            git(p, &["add", "f.txt"]);
+            git(p, &["commit", "-q", "-m", &format!("c{i}")]);
+        }
+        let tip = rev_parse(p, "HEAD");
+        git(p, &["repack", "-adb"]);
+
+        let idx_path = find_pack_idx(&p.join(".git/objects"));
+        let pack_idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).unwrap();
+        let mut bm = PackBitmap::load(&idx_path, pack_idx.num_objects())
+            .unwrap()
+            .unwrap();
+        bm.build_oid_index(|i| pack_idx.oid_at_index(i).try_into().ok());
+
+        assert_eq!(bm.covers_exactly(&[tip], &[]), Some(true));
+    }
+
+    /// Incremental fetch (have ancestor → want descendant) must return
+    /// `Some(false)` because the pack contains the full closure of the tip,
+    /// which is a strict superset of `want \ have`.
+    #[test]
+    fn covers_exactly_false_for_incremental_fetch() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+        let mut tips = Vec::new();
+        for i in 0..5 {
+            std::fs::write(p.join("f.txt"), format!("c{i}\n")).unwrap();
+            git(p, &["add", "f.txt"]);
+            git(p, &["commit", "-q", "-m", &format!("c{i}")]);
+            tips.push(rev_parse(p, "HEAD"));
+        }
+        git(p, &["repack", "-adb"]);
+
+        let idx_path = find_pack_idx(&p.join(".git/objects"));
+        let pack_idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).unwrap();
+        let mut bm = PackBitmap::load(&idx_path, pack_idx.num_objects())
+            .unwrap()
+            .unwrap();
+        bm.build_oid_index(|i| pack_idx.oid_at_index(i).try_into().ok());
+
+        // want=tip have=tip-1: pack contains everything reachable from tip,
+        // which is strictly more than tip alone after subtracting tip-1.
+        let result = bm.covers_exactly(&[*tips.last().unwrap()], &[tips[3]]);
+        assert_eq!(result, Some(false));
+    }
+
+    /// `want` containing an OID without a bitmap entry must yield `None` so
+    /// the caller falls back to the walker rather than skipping objects.
+    #[test]
+    fn covers_exactly_returns_none_for_uncovered_want() {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q", "-b", "main"]);
+        git(p, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(p.join("f.txt"), "x\n").unwrap();
+        git(p, &["add", "f.txt"]);
+        git(p, &["commit", "-q", "-m", "c0"]);
+        let tree = rev_parse(p, "HEAD^{tree}");
+        git(p, &["repack", "-adb"]);
+
+        let idx_path = find_pack_idx(&p.join(".git/objects"));
+        let pack_idx = gix_pack::index::File::at(&idx_path, gix_hash::Kind::Sha1).unwrap();
+        let mut bm = PackBitmap::load(&idx_path, pack_idx.num_objects())
+            .unwrap()
+            .unwrap();
+        bm.build_oid_index(|i| pack_idx.oid_at_index(i).try_into().ok());
+
+        assert!(bm.covers_exactly(&[tree], &[]).is_none());
     }
 
     /// A have that isn't a bitmap entry (e.g., an arbitrary tree OID) must
