@@ -12,32 +12,7 @@ unblock the more advanced rules later. Only the high-level shape and
 acceptance criteria are pinned here; specific crates, file paths, and
 feature names are implementation details to be settled at PR time.
 
-### Phase A — Enrich pack inspection
-
-**Goal:** pack inspection returns structured commit / tag metadata
-plus the reconstructed signed payload, so later phases can verify
-without re-reading objects.
-
-`CommitInfo` and `TagInfo` grow to carry: oid, parents, tree, author
-and committer (each with name + email), author and committer times,
-message, and an internal `signature` field carrying the raw bytes,
-detected format, and the canonical signed payload (commit object bytes
-with the `gpgsig` header — including any continuation lines —
-removed). The signed payload is produced once during parsing.
-
-The signature field stays internal to mizzle until Phase C; nothing
-new is exposed on `RepoAccess` yet.
-
-Tests:
-
-* extend the existing `inspect_pack_extracts_commit_metadata` test
-  to assert the new fields,
-* add a fixture PGP-signed commit and assert the signed payload
-  round-trips byte-identical to the commit object minus the `gpgsig`
-  header,
-* same for an annotated signed tag.
-
-### Phase B — `Comparison` handle and typed `PushContext`
+### Phase A — `Comparison` handle and typed `PushContext`
 
 **Goal:** the forge's `authorize_push` receives a lazy handle that
 exposes per-ref deltas, reachability walks, ref-diffs, and pack
@@ -48,11 +23,21 @@ Trait shape changes:
 
 * `RepoAccess` gains an associated `PushContext: Default` type.
 * `authorize_preliminary(refs) -> Result<Self::PushContext, String>`
-  replaces the preliminary call to `authorize_push(_, None)`. Default
+  replaces the preliminary `authorize_push(_, None)` call. Default
   impl returns `Ok(Default::default())`.
 * `authorize_push(ctx, push: &dyn Comparison<'_>) -> Result<(), String>`
   replaces the full call.
 * `post_receive` takes the same `Comparison` handle for symmetry.
+
+`CommitInfo` and `TagInfo` are restructured at the same time, since
+the rules that consume the `Comparison` accessors need real metadata:
+`oid`, `parents`, `tree`, `author` and `committer` (each with name +
+email), author/committer times, and message. No public signature
+field on `CommitInfo` — signature handling is lazy and lives behind
+`Comparison::verify` (see Phase B). This means commits whose
+signatures are never inspected pay zero verification cost, and
+nothing carries kilobytes of payload bytes around the trait surface
+unnecessarily.
 
 The `Comparison` trait itself exposes:
 
@@ -66,11 +51,12 @@ The `Comparison` trait itself exposes:
 * `ref_diff(ref)` — added / modified / removed paths with mode and
   oid, computed against the parent tree.
 * `verify(commit)` and `verify_tag(tag)` — lazy signature
-  verification (see Phase C).
+  verification (see Phase B); stub that returns `UnsupportedFormat`
+  until verifiers land.
 * `read_blob(oid, cap)` — bytes for a blob in the staged pack, capped
   to discourage forges from grepping gigabytes.
 * `pack_metadata()` and `tags()` — direct passthroughs to the
-  inspection results from Phase A.
+  inspection results.
 
 Backend additions:
 
@@ -86,22 +72,25 @@ same commit, it is assigned to the ref earliest in push order
 
 Tests in `tests/auth.rs`:
 
+* extend `inspect_pack_extracts_commit_metadata` to assert the new
+  structured fields on `CommitInfo` and `TagInfo`,
 * `new_commits_excludes_existing_branches` — push a branch whose tip
-  is reachable from an existing ref; assert empty.
-* `new_commits_topological_order` — assert parent-first ordering.
+  is reachable from an existing ref; assert empty,
+* `new_commits_topological_order` — assert parent-first ordering,
 * `multi_ref_push_dedupes_new_commits` — pushing two refs that both
-  introduce the same commit assigns it to the push-order-earlier ref.
+  introduce the same commit assigns it to the push-order-earlier ref,
 * `dropped_commits_on_force_push` — force-push that rewinds three
-  commits; assert they appear on `dropped_commits` for that ref.
-* `ref_diff_reports_added_modified_removed_paths`.
+  commits; assert they appear on `dropped_commits` for that ref,
+* `ref_diff_reports_added_modified_removed_paths`,
 * `comparison_accessor_cap_returns_structured_error`.
 
-### Phase C — Verification plumbing (no verifiers yet)
+### Phase B — Verification plumbing (no verifiers yet)
 
 **Goal:** wire `verification_keys` and `verify_external` through the
-`Comparison::verify` accessor. Without any native verifier present,
-every signed commit verifies as `UnknownKey` (or `UnsupportedFormat`
-for formats with no registered verifier).
+`Comparison::verify` accessor, and reconstruct the signed payload
+lazily at verify time. Without any native verifier present, every
+signed commit verifies as `UnknownKey` (or `UnsupportedFormat` for
+formats with no registered verifier).
 
 Changes:
 
@@ -110,22 +99,36 @@ Changes:
   `SignedIdentity` to the public surface (all `#[non_exhaustive]`
   where forward-compat matters).
 * Internal verifier-dispatch module with a placeholder that returns
-  `UnknownKey` for everything until Phase D.
-* `Comparison::verify` runs the dispatch on first access, then offers
-  the result to `verify_external` for override.
+  `UnknownKey` for everything until Phase C.
+* `Comparison::verify` is now functional: on first access for a
+  commit, mizzle re-reads the commit object from the staged pack,
+  produces the canonical signed payload by stripping the `gpgsig`
+  header (and any continuation lines), runs the dispatch, then offers
+  the result to `verify_external` for override. Result is cached on
+  the `Comparison`.
+
+Lazy signed-payload reconstruction matters: most commits in most
+pushes will never have their signatures inspected, so paying the
+gpgsig-strip + parse cost up front during `inspect_ingested` would
+be waste.
 
 Tests:
 
+* `signed_payload_strips_gpgsig_header` — fixture PGP-signed commit;
+  assert the canonical payload round-trips byte-identical to the
+  commit object minus the `gpgsig` header (and continuation lines),
+* `signed_tag_payload_strips_signature` — same for an annotated
+  signed tag,
 * `signed_commit_without_keys_is_unknown_key` — push a real
   PGP-signed commit, `verification_keys` returns empty, assert
-  `Comparison::verify` returns `UnknownKey`.
+  `Comparison::verify` returns `UnknownKey`,
 * `verify_external_overrides_status` — forge that always returns
   `Verified` from `verify_external`; assert it wins over the native
-  default.
+  default,
 * `verify_external_none_falls_through_to_native` — forge returns
   `None`; assert native verdict stands.
 
-### Phase D — Real verifiers
+### Phase C — Real verifiers
 
 **Goal:** mizzle natively verifies PGP, SSH, and static X.509 commit
 signatures.
@@ -143,9 +146,9 @@ decisions; constraints are:
   a non-default feature (network access in the verifier is a
   significant policy change).
 
-Tests: covered by Phase E examples.
+Tests: covered by Phase D examples.
 
-### Phase E — Example forge rules as integration tests
+### Phase D — Example forge rules as integration tests
 
 These are the proof that the trait surface is expressive enough. Each
 is a one-screen `RepoAccess` impl plus integration tests against both
@@ -153,7 +156,7 @@ storage backends (using `dual_backend_access_test!`).
 
 See [§ Example rules](#example-rules) below.
 
-### Phase F — Reference Sigstore adapter (out of tree)
+### Phase E — Reference Sigstore adapter (out of tree)
 
 A separate crate alongside mizzle wraps a Sigstore implementation to
 provide `verify_external` for X.509 CMS signatures with embedded Rekor
@@ -169,7 +172,7 @@ that exercises it end-to-end through `git push` against a live mizzle
 server. All examples live in `mizzle/tests/auth_rules.rs` and use the
 existing `axum_access_server_with_backend` helper from `tests/common`.
 
-The examples below show the `Comparison` handle pattern from Phase B.
+The examples below show the `Comparison` handle pattern from Phase A.
 They are written for clarity, not literal copy-paste — actual code may
 differ once the trait stabilises.
 
@@ -548,7 +551,7 @@ returns `Verified` to prove the dispatch wiring works.
 
 ## Done criteria
 
-Phases A–E are complete when:
+Phases A–D are complete when:
 
 1. The `RepoAccess` trait surface from auth.md is in place, including
    `PushContext` and the `Comparison` handle.
