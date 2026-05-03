@@ -12,9 +12,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use anyhow::{Context, Result};
 use gix::ObjectId;
 
+use crate::auth_types::{CommitInfo, RefDiff, RefDiffChange, RefDiffEntry};
 use crate::backend::{
-    HeadInfo, PackMetadata, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot,
-    StorageBackend,
+    HeadInfo, PackMetadata, PackOptions, PackOutput, ReachableError, RefInfo, RefUpdate,
+    RefsSnapshot, StorageBackend,
 };
 use crate::traits::PushKind;
 
@@ -508,6 +509,226 @@ impl StorageBackend for FsGitCli {
     fn rollback_ingest(&self, pack: CliWrittenPack) {
         let _ = std::fs::remove_file(&pack.index);
         let _ = std::fs::remove_file(&pack.pack);
+    }
+
+    fn reachable_excluding(
+        &self,
+        repo: &FsGitCliRepo,
+        from: &[ObjectId],
+        excluding: &[ObjectId],
+        cap: usize,
+    ) -> std::result::Result<Vec<ObjectId>, ReachableError> {
+        if from.is_empty() {
+            return Ok(Vec::new());
+        }
+        // git rev-list --topo-order <from...> ^<excluding...>
+        let mut args: Vec<String> = vec!["rev-list".into(), "--topo-order".into()];
+        for oid in from {
+            args.push(oid.to_hex().to_string());
+        }
+        for oid in excluding {
+            args.push(format!("^{}", oid.to_hex()));
+        }
+        // Cap the walk: --max-count is exact, but we want to detect overruns,
+        // so request cap+1 and treat that as the cap-exceeded signal.
+        args.push(format!("--max-count={}", cap + 1));
+
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let stdout = run_git(&repo.path, &arg_refs)
+            .map_err(|e| ReachableError::Other(anyhow::anyhow!("rev-list: {e:#}")))?;
+
+        let mut out = Vec::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let oid = ObjectId::from_hex(trimmed.as_bytes())
+                .map_err(|e| ReachableError::Other(anyhow::anyhow!("rev-list parse: {e}")))?;
+            if out.len() >= cap {
+                return Err(ReachableError::CapExceeded { limit: cap });
+            }
+            out.push(oid);
+        }
+        Ok(out)
+    }
+
+    fn tree_diff(
+        &self,
+        repo: &FsGitCliRepo,
+        parent_tree: Option<ObjectId>,
+        child_tree: ObjectId,
+    ) -> Result<RefDiff> {
+        // git diff-tree -r --raw <parent> <child>
+        // Output format: ":<mode_l> <mode_r> <oid_l> <oid_r> <STATUS>\t<path>"
+        let lhs = parent_tree
+            .map(|o| o.to_hex().to_string())
+            .unwrap_or_else(|| "4b825dc642cb6eb9a060e54bf8d69288fbee4904".to_string());
+        let rhs = child_tree.to_hex().to_string();
+
+        let stdout = run_git(&repo.path, &["diff-tree", "-r", "--raw", "-z", &lhs, &rhs])
+            .context("running git diff-tree")?;
+
+        let mut entries = Vec::new();
+        // -z output: each record terminated by NUL.  Adjacent records may be
+        // R/C with src+dst paths but we don't ask for rename detection so each
+        // record is a single change: ":mode_l mode_r oid_l oid_r STATUS\0path\0".
+        let bytes = stdout.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            // Read one record: header (terminated by \0), path (terminated by \0).
+            let header_end = match bytes[i..].iter().position(|&b| b == 0) {
+                Some(p) => i + p,
+                None => break,
+            };
+            let header = std::str::from_utf8(&bytes[i..header_end])?;
+            i = header_end + 1;
+            let path_end = match bytes[i..].iter().position(|&b| b == 0) {
+                Some(p) => i + p,
+                None => bytes.len(),
+            };
+            let path = bstr::BString::from(&bytes[i..path_end]);
+            i = path_end + 1;
+
+            // Header parse
+            let header = header.strip_prefix(':').unwrap_or(header);
+            let mut parts = header.split_whitespace();
+            let mode_l = parts.next().unwrap_or("0");
+            let mode_r = parts.next().unwrap_or("0");
+            let oid_l = parts.next().unwrap_or("");
+            let oid_r = parts.next().unwrap_or("");
+            let status = parts.next().unwrap_or("M");
+
+            let (change, oid_hex, mode_str) = match status.chars().next() {
+                Some('A') => (RefDiffChange::Added, oid_r, mode_r),
+                Some('D') => (RefDiffChange::Removed, oid_l, mode_l),
+                _ => (RefDiffChange::Modified, oid_r, mode_r),
+            };
+
+            let oid = ObjectId::from_hex(oid_hex.as_bytes()).context("parsing diff-tree oid")?;
+            let mode = u32::from_str_radix(mode_str, 8).unwrap_or(0);
+
+            entries.push(RefDiffEntry {
+                path,
+                change,
+                mode,
+                oid,
+            });
+        }
+
+        Ok(RefDiff { entries })
+    }
+
+    fn read_commit_info(&self, repo: &FsGitCliRepo, oid: ObjectId) -> Result<CommitInfo> {
+        let output = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "commit", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .context("running git cat-file")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "git cat-file failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        crate::inspect::parse_commit_info(&output.stdout, oid)
+    }
+
+    fn read_blob(&self, repo: &FsGitCliRepo, oid: ObjectId, cap: u64) -> Result<Option<Vec<u8>>> {
+        // Check size first to avoid reading huge blobs into memory.
+        let size_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-s", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let size: u64 = match size_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(u64::MAX),
+            _ => return Ok(None),
+        };
+        if size > cap {
+            return Ok(None);
+        }
+
+        let kind_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-t", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let kind = match kind_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => return Ok(None),
+        };
+        if kind != "blob" {
+            return Ok(None);
+        }
+
+        let output = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "blob", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .context("running git cat-file blob")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout))
+    }
+
+    fn read_object_raw(
+        &self,
+        repo: &FsGitCliRepo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Check size first to bound memory.
+        let size_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-s", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let size: u64 = match size_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(u64::MAX),
+            _ => return Ok(None),
+        };
+        if size > cap {
+            return Ok(None);
+        }
+
+        // Need the kind to pick the right cat-file mode (commit/tree/blob/tag).
+        let kind_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-t", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let kind = match kind_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => return Ok(None),
+        };
+
+        let output = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", kind.as_str(), &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .context("running git cat-file")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout))
     }
 }
 

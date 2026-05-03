@@ -1,3 +1,5 @@
+pub mod auth;
+pub mod auth_types;
 pub mod backend;
 pub mod bitmap;
 mod command;
@@ -9,4 +11,5 @@ pub mod pack_reuse;
 mod receive;
 pub mod serve;
 pub mod servers;
+pub(crate) mod sigverify;
 pub mod traits;

@@ -13,8 +13,10 @@ use std::sync::mpsc;
 use anyhow::Result;
 use gix::ObjectId;
 
+use crate::auth_types::{CommitInfo, RefDiff};
 use crate::traits::PushKind;
 
+pub use crate::auth_types::TagInfo;
 pub use mizzle_proto::pack::Filter;
 pub use mizzle_proto::receive::RefUpdate;
 
@@ -25,6 +27,29 @@ pub use mizzle_proto::receive::RefUpdate;
 /// Metadata extracted from an ingested pack for auth inspection.
 pub struct PackMetadata {
     pub objects: Vec<PackObject>,
+}
+
+impl PackMetadata {
+    /// Iterate parsed commits in the order they appear in the pack.
+    pub fn commits(&self) -> impl Iterator<Item = &CommitInfo> {
+        self.objects.iter().filter_map(|o| match &o.kind {
+            ObjectKind::Commit(c) => Some(c),
+            _ => None,
+        })
+    }
+
+    /// Iterate parsed tags in the order they appear in the pack.
+    pub fn tags(&self) -> impl Iterator<Item = &TagInfo> {
+        self.objects.iter().filter_map(|o| match &o.kind {
+            ObjectKind::Tag(t) => Some(t),
+            _ => None,
+        })
+    }
+
+    /// O(n) lookup of a commit by oid.
+    pub fn find_commit(&self, oid: &ObjectId) -> Option<&CommitInfo> {
+        self.commits().find(|c| &c.oid == oid)
+    }
 }
 
 /// A single object from an ingested pack.
@@ -40,25 +65,6 @@ pub enum ObjectKind {
     Tree,
     Commit(CommitInfo),
     Tag(TagInfo),
-}
-
-/// Metadata extracted from a commit object.
-pub struct CommitInfo {
-    pub author: String,
-    pub committer: String,
-    pub message: String,
-    /// Raw GPG/SSH signature bytes, if present.
-    pub signature: Option<Vec<u8>>,
-}
-
-/// Metadata extracted from an annotated tag object.
-pub struct TagInfo {
-    pub target: ObjectId,
-    pub name: String,
-    pub tagger: Option<String>,
-    pub message: String,
-    /// Raw GPG/SSH signature bytes, if present.
-    pub signature: Option<Vec<u8>>,
 }
 
 /// Snapshot of a repository's refs.
@@ -202,6 +208,87 @@ pub trait StorageBackend: Send + Sync + 'static {
 
     /// Roll back a previously ingested pack (e.g. on auth failure).
     fn rollback_ingest(&self, pack: Self::IngestedPack);
+
+    /// Walk commits reachable from `from`, stopping at any commit reachable
+    /// from `excluding`.  Returns oids in parent-first topological order.
+    ///
+    /// Used by both `Comparison::new_commits` (walk from new tip excluding
+    /// pre-existing refs and earlier same-push refs) and
+    /// `Comparison::dropped_commits` (walk from old tip excluding new tip).
+    ///
+    /// Returns [`ReachableLimitExceeded`] if the walk hits `cap` before
+    /// terminating.  Implementations must observe the cap as a hard ceiling.
+    fn reachable_excluding(
+        &self,
+        repo: &Self::Repo,
+        from: &[ObjectId],
+        excluding: &[ObjectId],
+        cap: usize,
+    ) -> Result<Vec<ObjectId>, ReachableError>;
+
+    /// Compute the path-level diff between two trees.
+    ///
+    /// `parent_tree` may be `None` to mean "the empty tree" (e.g. the diff
+    /// for a root commit).
+    fn tree_diff(
+        &self,
+        repo: &Self::Repo,
+        parent_tree: Option<ObjectId>,
+        child_tree: ObjectId,
+    ) -> Result<RefDiff>;
+
+    /// Read commit metadata for a commit already in the repository (used by
+    /// `Comparison::dropped_commits`, since dropped commits are not in the
+    /// staged pack).
+    fn read_commit_info(&self, repo: &Self::Repo, oid: ObjectId) -> Result<CommitInfo>;
+
+    /// Read raw blob bytes, capped at `cap`.  Returns `Ok(None)` if the blob
+    /// is larger than the cap, not found, or the OID points at a non-blob
+    /// object (commit, tree, tag).
+    fn read_blob(&self, repo: &Self::Repo, oid: ObjectId, cap: u64) -> Result<Option<Vec<u8>>>;
+
+    /// Read raw object bytes regardless of kind, capped at `cap`.  Returns
+    /// `Ok(None)` if the object is larger than the cap or not found.
+    ///
+    /// Used by signature-verification reconstruction
+    /// ([`Comparison::verify`](crate::auth::Comparison::verify)) which needs
+    /// the canonical commit/tag bytes; callers that genuinely need a blob
+    /// should use [`read_blob`](Self::read_blob) so non-blob OIDs are
+    /// rejected.
+    fn read_object_raw(
+        &self,
+        repo: &Self::Repo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>>;
+}
+
+/// Error type for [`StorageBackend::reachable_excluding`].
+#[derive(Debug)]
+pub enum ReachableError {
+    /// The walk hit its configured cap before terminating.
+    CapExceeded { limit: usize },
+    /// The backend itself returned an error.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for ReachableError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CapExceeded { limit } => {
+                write!(f, "reachability walk exceeded cap of {limit} commits")
+            }
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for ReachableError {}
+
+impl From<anyhow::Error> for ReachableError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Other(e)
+    }
 }
 
 /// Full-bypass trait for backends that handle the entire git protocol.

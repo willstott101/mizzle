@@ -23,6 +23,9 @@ tokio = { version = "1.49.0", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7.18", features = ["compat", "io"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 gix-hash = "0.22.1"
+gix-diff = "0.60"
+gix-traverse = "0.54"
+bstr = "1"
 axum = { version = "0.8.8", features = ["macros"], optional = true }
 russh = { version = "0.58", optional = true }
 tempfile = "3.25.0"

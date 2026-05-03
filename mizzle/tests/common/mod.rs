@@ -280,6 +280,7 @@ pub struct Config {
 
 impl RepoAccess for Config {
     type RepoId = PathBuf;
+    type PushContext = ();
     fn repo_id(&self) -> &PathBuf {
         &self.bare_repo_path
     }

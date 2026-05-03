@@ -1,3 +1,5 @@
+use crate::auth::{run_comparison, ComparisonOptions};
+use crate::auth_types::PushRef;
 use crate::backend::{PackMetadata, StorageBackend};
 use crate::command::{read_command, Command};
 use crate::traits::RepoAccess;
@@ -78,6 +80,49 @@ where
     }
 }
 
+/// Build a `Vec<PushRef<'_>>` from `RefUpdate`s using the supplied kind classifier.
+fn build_push_refs<'a>(
+    updates: &'a [crate::backend::RefUpdate],
+    mut kind: impl FnMut(&crate::backend::RefUpdate) -> crate::auth_types::PushKind,
+) -> Vec<PushRef<'a>> {
+    updates
+        .iter()
+        .map(|u| PushRef {
+            refname: &u.refname,
+            kind: kind(u),
+            old_oid: u.old_oid,
+            new_oid: u.new_oid,
+        })
+        .collect()
+}
+
+/// Existing ref tips, used as exclusion set when computing `new_commits`.
+fn existing_ref_tips<B: StorageBackend>(
+    backend: &B,
+    repo: &B::Repo,
+    push_refs: &[PushRef<'_>],
+) -> Vec<ObjectId> {
+    let snapshot = match backend.list_refs(repo) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let pushed: std::collections::HashSet<&str> = push_refs.iter().map(|r| r.refname).collect();
+    let mut out = Vec::new();
+    for r in &snapshot.refs {
+        if pushed.contains(r.name.as_str()) {
+            // The push is updating this ref — we must NOT include the
+            // existing tip in the exclusion set, otherwise the new commits
+            // walk would always be empty for fast-forwards.
+            continue;
+        }
+        out.push(r.oid);
+        if let Some(p) = r.peeled {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Shared receive-pack POST response (protocol-version-agnostic).
 async fn recv_pack_post<T, A, B>(
     spawn: impl Fn(SpawnFut),
@@ -94,32 +139,12 @@ where
 {
     let (ref_updates, body) = res_try!(receive::read_receive_request(body, limits).await);
 
-    // Preliminary auth check before touching the disk.
-    let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
-        .iter()
-        .map(|u| crate::traits::PushRef {
-            refname: &u.refname,
-            kind: receive::preliminary_push_kind(u),
-        })
-        .collect();
-    if let Err(msg) = access.authorize_push(&preliminary_refs, None) {
-        let (reader, writer) = piper::pipe(4096);
-        spawn(Box::pin(async move {
-            let mut w = writer;
-            text_to_write(b"unpack ok", &mut w).await.unwrap();
-            for update in &ref_updates {
-                let line = format!("ng {} {}", update.refname, msg);
-                text_to_write(line.as_bytes(), &mut w).await.unwrap();
-            }
-            flush_to_write(&mut w).await.unwrap();
-        }));
-        return GitResponse {
-            status_code: 200,
-            content_type: Some("application/x-git-receive-pack-result".to_string()),
-            reader: Some(reader),
-            body: None,
-        };
-    }
+    // Preliminary auth check: refnames + old/new oid + cheap PushKind.
+    let preliminary_refs = build_push_refs(&ref_updates, receive::preliminary_push_kind);
+    let push_ctx = match access.authorize_preliminary(&preliminary_refs) {
+        Ok(c) => c,
+        Err(msg) => return reject_response(spawn, ref_updates, msg),
+    };
 
     // Open the repo handle once for the remainder of this request.
     let repo = res_try!(backend.open(&repo_id));
@@ -143,56 +168,47 @@ where
                 if let Some(pack) = written_pack {
                     backend.rollback_ingest(pack);
                 }
-                let msg = format!("pack inspection failed: {e:#}");
-                let (reader, writer) = piper::pipe(4096);
-                spawn(Box::pin(async move {
-                    let mut w = writer;
-                    let result: anyhow::Result<()> = async {
-                        text_to_write(b"unpack ok", &mut w).await?;
-                        for update in &ref_updates {
-                            let line = format!("ng {} {}", update.refname, msg);
-                            text_to_write(line.as_bytes(), &mut w).await?;
-                        }
-                        flush_to_write(&mut w).await?;
-                        Ok(())
-                    }
-                    .await;
-                    if let Err(e) = result {
-                        error!("inspection rejection write error: {:#}", e);
-                    }
-                }));
-                return GitResponse {
-                    status_code: 200,
-                    content_type: Some("application/x-git-receive-pack-result".to_string()),
-                    reader: Some(reader),
-                    body: None,
-                };
+                return reject_response(
+                    spawn,
+                    ref_updates,
+                    format!("pack inspection failed: {e:#}"),
+                );
             }
         }
     } else {
         None
     };
 
-    let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
-        .iter()
-        .map(|u| crate::traits::PushRef {
-            refname: &u.refname,
-            kind: backend.compute_push_kind(&repo, u),
-        })
-        .collect();
-    let rejected: Vec<(String, String)> =
-        match access.authorize_push(&push_refs, pack_meta.as_ref()) {
-            Err(msg) => {
-                if let Some(pack) = written_pack {
-                    backend.rollback_ingest(pack);
-                }
-                ref_updates
-                    .iter()
-                    .map(|u| (u.refname.clone(), msg.clone()))
-                    .collect()
+    let push_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
+    let existing = existing_ref_tips(&backend, &repo, &push_refs);
+    let empty_meta = PackMetadata {
+        objects: Vec::new(),
+    };
+    let pack_ref = pack_meta.as_ref().unwrap_or(&empty_meta);
+
+    let auth_result = run_comparison(
+        &access,
+        &backend,
+        &repo,
+        pack_ref,
+        push_refs.clone(),
+        existing.clone(),
+        ComparisonOptions::default(),
+        |comp| access.authorize_push(&push_ctx, comp),
+    );
+
+    let rejected: Vec<(String, String)> = match auth_result {
+        Err(msg) => {
+            if let Some(pack) = written_pack {
+                backend.rollback_ingest(pack);
             }
-            Ok(()) => Vec::new(),
-        };
+            ref_updates
+                .iter()
+                .map(|u| (u.refname.clone(), msg.clone()))
+                .collect()
+        }
+        Ok(()) => Vec::new(),
+    };
 
     let (reader, writer) = piper::pipe(4096);
 
@@ -214,29 +230,82 @@ where
             }
         }));
     } else {
-        let owned_kinds: Vec<(String, crate::traits::PushKind)> = push_refs
+        let owned_kinds: Vec<(String, crate::auth_types::PushKind)> = push_refs
             .iter()
             .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
             .collect();
+        let owned_old_new: Vec<(ObjectId, ObjectId)> = push_refs
+            .iter()
+            .map(|pr| (pr.old_oid, pr.new_oid))
+            .collect();
+        let pack_meta_owned = pack_meta;
+        let existing_owned = existing;
         let b = backend.clone();
         spawn(Box::pin(async move {
             let mut w = writer;
             match receive::update_refs_and_report(&b, &repo, &ref_updates, &mut w).await {
                 Ok(()) => {
-                    let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
+                    let post_refs: Vec<PushRef<'_>> = owned_kinds
                         .iter()
-                        .map(|(name, kind)| crate::traits::PushRef {
+                        .zip(owned_old_new.iter())
+                        .map(|((name, kind), (old, new))| PushRef {
                             refname: name.as_str(),
                             kind: kind.clone(),
+                            old_oid: *old,
+                            new_oid: *new,
                         })
                         .collect();
-                    access.post_receive(&post_refs).await;
+                    let empty = PackMetadata {
+                        objects: Vec::new(),
+                    };
+                    let pack_ref = pack_meta_owned.as_ref().unwrap_or(&empty);
+                    run_comparison(
+                        &access,
+                        &b,
+                        &repo,
+                        pack_ref,
+                        post_refs,
+                        existing_owned,
+                        ComparisonOptions::default(),
+                        |comp| access.post_receive(comp),
+                    )
+                    .await;
                 }
                 Err(e) => error!("update_refs_and_report error: {:#}", e),
             }
         }));
     }
 
+    GitResponse {
+        status_code: 200,
+        content_type: Some("application/x-git-receive-pack-result".to_string()),
+        reader: Some(reader),
+        body: None,
+    }
+}
+
+fn reject_response(
+    spawn: impl Fn(SpawnFut),
+    ref_updates: Vec<crate::backend::RefUpdate>,
+    msg: String,
+) -> GitResponse {
+    let (reader, writer) = piper::pipe(4096);
+    spawn(Box::pin(async move {
+        let mut w = writer;
+        let result: anyhow::Result<()> = async {
+            text_to_write(b"unpack ok", &mut w).await?;
+            for update in &ref_updates {
+                let line = format!("ng {} {}", update.refname, msg);
+                text_to_write(line.as_bytes(), &mut w).await?;
+            }
+            flush_to_write(&mut w).await?;
+            Ok(())
+        }
+        .await;
+        if let Err(e) = result {
+            error!("rejection write error: {:#}", e);
+        }
+    }));
     GitResponse {
         status_code: 200,
         content_type: Some("application/x-git-receive-pack-result".to_string()),
@@ -666,22 +735,19 @@ where
     let (ref_updates, reader) = receive::read_receive_request(reader, limits).await?;
 
     // Preliminary auth check.
-    let preliminary_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
-        .iter()
-        .map(|u| crate::traits::PushRef {
-            refname: &u.refname,
-            kind: receive::preliminary_push_kind(u),
-        })
-        .collect();
-    if let Err(msg) = access.authorize_push(&preliminary_refs, None) {
-        text_to_write(b"unpack ok", &mut *writer).await?;
-        for update in &ref_updates {
-            let line = format!("ng {} {}", update.refname, msg);
-            text_to_write(line.as_bytes(), &mut *writer).await?;
+    let preliminary_refs = build_push_refs(&ref_updates, receive::preliminary_push_kind);
+    let push_ctx = match access.authorize_preliminary(&preliminary_refs) {
+        Ok(c) => c,
+        Err(msg) => {
+            text_to_write(b"unpack ok", &mut *writer).await?;
+            for update in &ref_updates {
+                let line = format!("ng {} {}", update.refname, msg);
+                text_to_write(line.as_bytes(), &mut *writer).await?;
+            }
+            flush_to_write(&mut *writer).await?;
+            return Ok(());
         }
-        flush_to_write(&mut *writer).await?;
-        return Ok(());
-    }
+    };
 
     // Stage pack data to a temp file (streamed, not buffered in memory).
     let staged = receive::stage_pack(reader, None).await?;
@@ -715,14 +781,25 @@ where
         None
     };
 
-    let push_refs: Vec<crate::traits::PushRef<'_>> = ref_updates
-        .iter()
-        .map(|u| crate::traits::PushRef {
-            refname: &u.refname,
-            kind: backend.compute_push_kind(&repo, u),
-        })
-        .collect();
-    if let Err(msg) = access.authorize_push(&push_refs, pack_meta.as_ref()) {
+    let push_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
+    let existing = existing_ref_tips(backend, &repo, &push_refs);
+    let empty_meta = PackMetadata {
+        objects: Vec::new(),
+    };
+    let pack_ref = pack_meta.as_ref().unwrap_or(&empty_meta);
+
+    let auth_result = run_comparison(
+        &access,
+        backend,
+        &repo,
+        pack_ref,
+        push_refs.clone(),
+        existing.clone(),
+        ComparisonOptions::default(),
+        |comp| access.authorize_push(&push_ctx, comp),
+    );
+
+    if let Err(msg) = auth_result {
         if let Some(pack) = written_pack {
             backend.rollback_ingest(pack);
         }
@@ -737,18 +814,21 @@ where
 
     receive::update_refs_and_report(backend, &repo, &ref_updates, writer).await?;
 
-    let owned_kinds: Vec<(String, crate::traits::PushKind)> = push_refs
-        .iter()
-        .map(|pr| (pr.refname.to_string(), pr.kind.clone()))
-        .collect();
-    let post_refs: Vec<crate::traits::PushRef<'_>> = owned_kinds
-        .iter()
-        .map(|(name, kind)| crate::traits::PushRef {
-            refname: name.as_str(),
-            kind: kind.clone(),
-        })
-        .collect();
-    access.post_receive(&post_refs).await;
+    // post_receive uses a fresh Comparison (the moved push_refs were
+    // consumed by run_comparison above; rebuild from the same data).
+    let post_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
+    let pack_ref2 = pack_meta.as_ref().unwrap_or(&empty_meta);
+    run_comparison(
+        &access,
+        backend,
+        &repo,
+        pack_ref2,
+        post_refs,
+        existing,
+        ComparisonOptions::default(),
+        |comp| access.post_receive(comp),
+    )
+    .await;
 
     Ok(())
 }
