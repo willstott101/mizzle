@@ -3,9 +3,11 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use bstr::BString;
 use gix::ObjectId;
 
-use crate::backend::{CommitInfo, ObjectKind, PackMetadata, PackObject, TagInfo};
+use crate::auth_types::{CommitInfo, Identity, SignatureBlob, SignatureFormat, TagInfo};
+use crate::backend::{ObjectKind, PackMetadata, PackObject};
 
 /// Inspect an ingested pack file and extract metadata for each object.
 ///
@@ -83,9 +85,9 @@ pub fn inspect_pack(pack_path: &Path) -> Result<PackMetadata> {
                     .context("decoding pack object")?;
 
                 let kind = if resolved_kind == gix_object::Kind::Commit {
-                    ObjectKind::Commit(parse_commit_info(data.data, &oid)?)
+                    ObjectKind::Commit(parse_commit_info(data.data, oid)?)
                 } else {
-                    ObjectKind::Tag(parse_tag_info(data.data, &oid)?)
+                    ObjectKind::Tag(parse_tag_info(data.data, oid)?)
                 };
 
                 objects.push(PackObject {
@@ -100,37 +102,81 @@ pub fn inspect_pack(pack_path: &Path) -> Result<PackMetadata> {
     Ok(PackMetadata { objects })
 }
 
-fn parse_commit_info(data: &[u8], _oid: &ObjectId) -> Result<CommitInfo> {
+pub(crate) fn parse_commit_info(data: &[u8], oid: ObjectId) -> Result<CommitInfo> {
     let commit = gix_object::CommitRef::from_bytes(data).context("parsing commit object")?;
+
+    let tree = ObjectId::from_hex(commit.tree.as_ref()).context("parsing commit tree oid")?;
+    let parents = commit
+        .parents
+        .iter()
+        .map(|p| ObjectId::from_hex(p.as_ref()))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("parsing commit parent oids")?;
 
     let signature = commit
         .extra_headers()
         .pgp_signature()
         .map(|sig| sig.to_vec());
+    let signature = signature.map(|bytes| {
+        let format = SignatureFormat::detect(&bytes);
+        SignatureBlob { format, bytes }
+    });
+
+    let author = commit.author().context("parsing commit author")?;
+    let committer = commit.committer().context("parsing commit committer")?;
 
     Ok(CommitInfo {
-        author: commit.author.to_string(),
-        committer: commit.committer.to_string(),
-        message: commit.message.to_string(),
+        oid,
+        tree,
+        parents,
+        author: identity_from(&author),
+        committer: identity_from(&committer),
+        message: commit.message.to_owned(),
+        encoding: commit.encoding.map(|e| e.to_owned()),
         signature,
     })
 }
 
-fn parse_tag_info(data: &[u8], _oid: &ObjectId) -> Result<TagInfo> {
+pub(crate) fn parse_tag_info(data: &[u8], oid: ObjectId) -> Result<TagInfo> {
     let tag = gix_object::TagRef::from_bytes(data).context("parsing tag object")?;
 
+    let signature = tag.pgp_signature.map(|s| s.to_vec());
+    let signature = signature.map(|bytes| {
+        let format = SignatureFormat::detect(&bytes);
+        SignatureBlob { format, bytes }
+    });
+
+    let tagger = match tag.tagger {
+        Some(raw) => {
+            let s = gix::actor::SignatureRef::from_bytes::<()>(raw)
+                .map_err(|e| anyhow::anyhow!("parsing tag tagger: {e:?}"))?;
+            Some(identity_from(&s))
+        }
+        None => None,
+    };
+
     Ok(TagInfo {
+        oid,
         target: ObjectId::from_hex(tag.target.as_ref()).context("parsing tag target")?,
-        name: tag.name.to_string(),
-        tagger: tag.tagger.as_ref().map(|t| t.to_string()),
-        message: tag.message.to_string(),
-        signature: tag.pgp_signature.map(|s| s.to_vec()),
+        name: tag.name.to_owned(),
+        tagger,
+        message: tag.message.to_owned(),
+        signature,
     })
+}
+
+fn identity_from(s: &gix::actor::SignatureRef<'_>) -> Identity {
+    Identity {
+        name: s.name.to_owned(),
+        email: s.email.to_owned(),
+        time: BString::from(s.time),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_types::SignatureFormat;
     use crate::backend::fs_gitoxide::FsGitoxide;
     use crate::backend::{PackOptions, StorageBackend};
     use std::path::Path;
@@ -214,32 +260,65 @@ mod tests {
             meta.objects.len()
         );
 
-        // Find the commit and check its metadata.
-        let commit = meta
-            .objects
-            .iter()
-            .find(|o| matches!(o.kind, ObjectKind::Commit(_)))
-            .expect("should contain a commit");
-
-        if let ObjectKind::Commit(ref info) = commit.kind {
-            assert!(
-                info.author.contains("Test Author"),
-                "author should contain 'Test Author', got: {}",
-                info.author
-            );
-            assert!(
-                info.committer.contains("Test Committer"),
-                "committer should contain 'Test Committer', got: {}",
-                info.committer
-            );
-            assert_eq!(info.message, "Initial commit\n");
-            assert!(
-                info.signature.is_none(),
-                "unsigned commit should have no signature"
-            );
-        }
+        // Find the commit and check the new structured metadata.
+        let commit = meta.commits().next().expect("should contain a commit");
+        assert_eq!(commit.oid, main_oid);
+        assert_eq!(commit.parents.len(), 0, "initial commit has no parents");
+        assert_eq!(commit.author.name, "Test Author");
+        assert_eq!(commit.author.email, "author@example.com");
+        assert_eq!(commit.committer.name, "Test Committer");
+        assert_eq!(commit.committer.email, "committer@example.com");
+        assert_eq!(commit.message, "Initial commit\n");
+        assert!(
+            commit.signature.is_none(),
+            "unsigned commit should have no signature"
+        );
 
         backend.rollback_ingest(written);
+    }
+
+    #[test]
+    fn signature_format_detection() {
+        assert_eq!(
+            SignatureFormat::detect(b"-----BEGIN PGP SIGNATURE-----\nfoo"),
+            SignatureFormat::OpenPgp
+        );
+        assert_eq!(
+            SignatureFormat::detect(b"-----BEGIN SSH SIGNATURE-----\nfoo"),
+            SignatureFormat::Ssh
+        );
+        assert_eq!(
+            SignatureFormat::detect(b"-----BEGIN SIGNED MESSAGE-----\nfoo"),
+            SignatureFormat::X509Cms
+        );
+        assert_eq!(SignatureFormat::detect(b"junk"), SignatureFormat::Unknown);
+    }
+
+    #[test]
+    fn signed_payload_strips_gpgsig_header() {
+        // A minimal commit object with a fake gpgsig header.
+        let raw = b"tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n\
+                    author A <a@x> 1700000000 +0000\n\
+                    committer A <a@x> 1700000000 +0000\n\
+                    gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQE...\n \n -----END PGP SIGNATURE-----\n\
+                    \n\
+                    Hello\n";
+
+        let stripped = crate::sigverify::strip_gpgsig(raw);
+        assert!(
+            !stripped.windows(b"gpgsig".len()).any(|w| w == b"gpgsig"),
+            "gpgsig header should be stripped"
+        );
+        assert!(
+            stripped.windows(b"Hello".len()).any(|w| w == b"Hello"),
+            "message body must remain"
+        );
+        assert!(
+            stripped
+                .windows(b"author A".len())
+                .any(|w| w == b"author A"),
+            "author header must remain"
+        );
     }
 
     #[test]

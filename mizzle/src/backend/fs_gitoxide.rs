@@ -11,9 +11,10 @@ use gix::parallel::InOrderIter;
 use gix::ObjectId;
 use gix_ref::file::ReferenceExt;
 
+use crate::auth_types::{CommitInfo, RefDiff, RefDiffChange, RefDiffEntry};
 use crate::backend::{
-    HeadInfo, PackMetadata, PackOptions, PackOutput, RefInfo, RefUpdate, RefsSnapshot,
-    StorageBackend,
+    HeadInfo, PackMetadata, PackOptions, PackOutput, ReachableError, RefInfo, RefUpdate,
+    RefsSnapshot, StorageBackend,
 };
 use crate::pack;
 use crate::pack_reuse;
@@ -325,6 +326,139 @@ impl StorageBackend for FsGitoxide {
     fn rollback_ingest(&self, pack: FsWrittenPack) {
         let _ = std::fs::remove_file(&pack.index);
         let _ = std::fs::remove_file(&pack.pack);
+    }
+
+    fn reachable_excluding(
+        &self,
+        repo: &FsGitoxideRepo,
+        from: &[ObjectId],
+        excluding: &[ObjectId],
+        cap: usize,
+    ) -> std::result::Result<Vec<ObjectId>, ReachableError> {
+        let local = repo.repo.to_thread_local();
+        let odb = local.objects.into_inner();
+
+        let walk = gix_traverse::commit::topo::Builder::new(odb)
+            .sorting(gix_traverse::commit::topo::Sorting::TopoOrder)
+            .with_tips(from.iter().copied())
+            .with_ends(excluding.iter().copied())
+            .build()
+            .map_err(|e| ReachableError::Other(anyhow::anyhow!("topo walk init: {e}")))?;
+
+        let mut out = Vec::new();
+        for r in walk {
+            let info = r.map_err(|e| ReachableError::Other(anyhow::anyhow!("topo walk: {e}")))?;
+            if out.len() >= cap {
+                return Err(ReachableError::CapExceeded { limit: cap });
+            }
+            out.push(info.id);
+        }
+        Ok(out)
+    }
+
+    fn tree_diff(
+        &self,
+        repo: &FsGitoxideRepo,
+        parent_tree: Option<ObjectId>,
+        child_tree: ObjectId,
+    ) -> Result<RefDiff> {
+        use gix_diff::tree::{
+            recorder::{Change as RecChange, Location},
+            Recorder,
+        };
+        use gix_object::FindExt;
+
+        let store = repo.repo.objects.to_handle();
+
+        // Empty tree object id (well-known) for the "no parent" case.
+        let empty_tree = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+        let lhs = parent_tree.unwrap_or(empty_tree);
+        let rhs = child_tree;
+
+        let mut buf_l = Vec::new();
+        let mut buf_r = Vec::new();
+        let lhs_iter = store
+            .find_tree_iter(&lhs, &mut buf_l)
+            .with_context(|| format!("reading parent tree {lhs}"))?;
+        let rhs_iter = store
+            .find_tree_iter(&rhs, &mut buf_r)
+            .with_context(|| format!("reading child tree {rhs}"))?;
+
+        let mut state = gix_diff::tree::State::default();
+        let mut recorder = Recorder::default().track_location(Some(Location::Path));
+
+        gix_diff::tree(lhs_iter, rhs_iter, &mut state, &store, &mut recorder)
+            .context("running tree diff")?;
+
+        let mut entries = Vec::with_capacity(recorder.records.len());
+        for rec in recorder.records {
+            entries.push(match rec {
+                RecChange::Addition {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Added,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+                RecChange::Deletion {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Removed,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+                RecChange::Modification {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Modified,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+            });
+        }
+
+        Ok(RefDiff { entries })
+    }
+
+    fn read_commit_info(&self, repo: &FsGitoxideRepo, oid: ObjectId) -> Result<CommitInfo> {
+        use gix_object::Find;
+        let mut buf: Vec<u8> = Vec::new();
+        let store = repo.repo.objects.to_handle();
+        let object = store
+            .try_find(&oid, &mut buf)
+            .map_err(|e| anyhow::anyhow!("looking up commit {oid}: {e}"))?
+            .with_context(|| format!("commit {oid} not in object store"))?;
+        if object.kind != gix_object::Kind::Commit {
+            anyhow::bail!("object {oid} is not a commit");
+        }
+        crate::inspect::parse_commit_info(object.data, oid)
+    }
+
+    fn read_blob(&self, repo: &FsGitoxideRepo, oid: ObjectId, cap: u64) -> Result<Option<Vec<u8>>> {
+        use gix_object::Find;
+        let mut buf: Vec<u8> = Vec::new();
+        let store = repo.repo.objects.to_handle();
+        let object = match store.try_find(&oid, &mut buf) {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(anyhow::anyhow!("looking up blob {oid}: {e}")),
+        };
+        if (object.data.len() as u64) > cap {
+            return Ok(None);
+        }
+        Ok(Some(object.data.to_vec()))
     }
 }
 

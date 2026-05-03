@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use tempfile::tempdir;
 
-use mizzle::traits::{PackMetadata, PostReceiveFut, PushKind, PushRef, RepoAccess};
+use mizzle::traits::{Comparison, PostReceiveFut, PushKind, RepoAccess};
 
 // ── Access types ─────────────────────────────────────────────────────────────
 
@@ -17,6 +17,7 @@ struct AutoInitAccess {
 
 impl RepoAccess for AutoInitAccess {
     type RepoId = PathBuf;
+    type PushContext = ();
 
     fn repo_id(&self) -> &PathBuf {
         &self.repo_path
@@ -35,24 +36,22 @@ struct RecordingAccess {
 
 impl RepoAccess for RecordingAccess {
     type RepoId = PathBuf;
+    type PushContext = ();
 
     fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
-    fn authorize_push(
-        &self,
-        _refs: &[PushRef<'_>],
-        _pack: Option<&PackMetadata>,
-    ) -> Result<(), String> {
+    fn authorize_push(&self, _ctx: &(), _push: &dyn Comparison<'_>) -> Result<(), String> {
         match &self.reject_with {
             Some(msg) => Err(msg.clone()),
             None => Ok(()),
         }
     }
 
-    fn post_receive<'a>(&'a self, refs: &'a [PushRef<'a>]) -> PostReceiveFut<'a> {
-        let data = refs
+    fn post_receive(&self, push: &dyn Comparison<'_>) -> PostReceiveFut {
+        let data: Vec<(String, PushKind)> = push
+            .refs()
             .iter()
             .map(|r| (r.refname.to_string(), r.kind.clone()))
             .collect();

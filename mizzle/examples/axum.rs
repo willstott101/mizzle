@@ -13,7 +13,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use mizzle::serve::ProtocolLimits;
 use mizzle::servers::axum::serve;
-use mizzle::traits::{PackMetadata, PushRef, RepoAccess};
+use mizzle::traits::{PushRef, RepoAccess};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use tracing::info;
@@ -24,16 +24,13 @@ struct Access {
 
 impl RepoAccess for Access {
     type RepoId = PathBuf;
+    type PushContext = ();
 
     fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
-    fn authorize_push(
-        &self,
-        refs: &[PushRef<'_>],
-        _pack: Option<&PackMetadata>,
-    ) -> Result<(), String> {
+    fn authorize_preliminary(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
         for r in refs {
             if !r.refname.starts_with("refs/heads/") {
                 return Err(format!("pushes to {} are not allowed", r.refname));

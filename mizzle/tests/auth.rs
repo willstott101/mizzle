@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::thread;
 use tempfile::tempdir;
 
-use mizzle::traits::{PackMetadata, PushKind, PushRef, RepoAccess};
+use std::sync::{Arc, Mutex};
+
+use mizzle::traits::{Comparison, PushKind, PushRef, RepoAccess};
 
 /// Spin up an axum server whose handler always returns 403 before calling mizzle.
 fn deny_all_server() -> common::ServerHandle {
@@ -48,16 +50,13 @@ struct DenyPushAccess {
 
 impl RepoAccess for DenyPushAccess {
     type RepoId = PathBuf;
+    type PushContext = ();
 
     fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
-    fn authorize_push(
-        &self,
-        _refs: &[PushRef<'_>],
-        _pack: Option<&PackMetadata>,
-    ) -> Result<(), String> {
+    fn authorize_preliminary(&self, _refs: &[PushRef<'_>]) -> Result<(), String> {
         Err("permission denied".into())
     }
 }
@@ -71,17 +70,27 @@ struct KindFilterAccess {
 
 impl RepoAccess for KindFilterAccess {
     type RepoId = PathBuf;
+    type PushContext = ();
 
     fn repo_id(&self) -> &PathBuf {
         &self.repo_path
     }
 
-    fn authorize_push(
-        &self,
-        refs: &[PushRef<'_>],
-        _pack: Option<&PackMetadata>,
-    ) -> Result<(), String> {
+    fn authorize_preliminary(&self, refs: &[PushRef<'_>]) -> Result<(), String> {
+        // Create / Delete are detected at the preliminary stage; ForcePush
+        // can only be classified after pack ingestion.
         for r in refs {
+            if r.kind == self.denied
+                && (self.denied == PushKind::Create || self.denied == PushKind::Delete)
+            {
+                return Err(format!("{:?} pushes are not allowed", self.denied));
+            }
+        }
+        Ok(())
+    }
+
+    fn authorize_push(&self, _ctx: &(), push: &dyn Comparison<'_>) -> Result<(), String> {
+        for r in push.refs() {
             if r.kind == self.denied {
                 return Err(format!("{:?} pushes are not allowed", self.denied));
             }
@@ -257,6 +266,175 @@ dual_backend_access_test!(test_create_denied, |backend| {
     server.stop();
     Ok(())
 });
+
+// ── Comparison accessor tests ───────────────────────────────────────────────
+//
+// These exercise `Comparison::new_commits` / `dropped_commits` / `ref_diff`
+// end-to-end against both backends through a real `git push`.
+
+#[derive(Default, Clone)]
+struct CapturedPush {
+    /// (refname, [oid, oid, ...]) for new_commits per ref.
+    new_commits: Vec<(String, Vec<gix::ObjectId>)>,
+    /// (refname, [oid, oid, ...]) for dropped_commits per ref.
+    dropped_commits: Vec<(String, Vec<gix::ObjectId>)>,
+    /// (refname, [path, path, ...]) for the ref_diff touched paths.
+    diff_paths: Vec<(String, Vec<Vec<u8>>)>,
+}
+
+#[derive(Clone)]
+struct CaptureAccess {
+    repo: PathBuf,
+    captured: Arc<Mutex<CapturedPush>>,
+}
+
+impl RepoAccess for CaptureAccess {
+    type RepoId = PathBuf;
+    type PushContext = ();
+
+    fn repo_id(&self) -> &PathBuf {
+        &self.repo
+    }
+
+    fn authorize_push(&self, _ctx: &(), push: &dyn Comparison<'_>) -> Result<(), String> {
+        let mut cap = self.captured.lock().unwrap();
+        for r in push.refs() {
+            cap.new_commits.push((
+                r.refname.to_string(),
+                push.new_commits(r)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .map(|c| c.oid)
+                    .collect(),
+            ));
+            cap.dropped_commits.push((
+                r.refname.to_string(),
+                push.dropped_commits(r)
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .map(|c| c.oid)
+                    .collect(),
+            ));
+            let diff = push.ref_diff(r).map_err(|e| e.to_string())?;
+            cap.diff_paths.push((
+                r.refname.to_string(),
+                diff.touched_paths().map(|p| p.to_vec()).collect(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+dual_backend_access_test!(comparison_new_commits_excludes_existing, |backend| {
+    let temprepo = common::temprepo()?;
+    let captured = Arc::new(Mutex::new(CapturedPush::default()));
+    let cap2 = captured.clone();
+    let server = common::axum_access_server_with_backend(temprepo.path(), backend, move |rp| {
+        CaptureAccess {
+            repo: PathBuf::from(rp.as_ref()),
+            captured: cap2.clone(),
+        }
+    });
+
+    let clone_dir = tempdir()?;
+    let repo_dir = clone_repo_main(server.port, clone_dir.path());
+
+    fs::write(repo_dir.join("new.txt"), "hi")?;
+    common::run_git(&repo_dir, ["add", "."])?;
+    common::run_git(&repo_dir, ["commit", "-m", "added"])?;
+    let new_oid = common::run_git(&repo_dir, ["rev-parse", "HEAD"])?;
+
+    common::run_git(&repo_dir, ["push", "origin", "main"])?;
+
+    let cap = captured.lock().unwrap();
+    assert_eq!(cap.new_commits.len(), 1, "one ref pushed");
+    let (ref_name, commits) = &cap.new_commits[0];
+    assert_eq!(ref_name, "refs/heads/main");
+    assert_eq!(commits.len(), 1, "one new commit introduced");
+    assert_eq!(commits[0].to_hex().to_string(), new_oid);
+
+    server.stop();
+    Ok(())
+});
+
+dual_backend_access_test!(comparison_dropped_commits_on_force_push, |backend| {
+    let temprepo = common::temprepo()?;
+    let captured = Arc::new(Mutex::new(CapturedPush::default()));
+    let cap2 = captured.clone();
+    let server = common::axum_access_server_with_backend(temprepo.path(), backend, move |rp| {
+        CaptureAccess {
+            repo: PathBuf::from(rp.as_ref()),
+            captured: cap2.clone(),
+        }
+    });
+
+    let clone_dir = tempdir()?;
+    let repo_dir = clone_repo_main(server.port, clone_dir.path());
+
+    let dropped_oid = common::run_git(&repo_dir, ["rev-parse", "HEAD"])?;
+    common::run_git(&repo_dir, ["reset", "--hard", "HEAD~1"])?;
+    fs::write(repo_dir.join("d.txt"), "d")?;
+    common::run_git(&repo_dir, ["add", "."])?;
+    common::run_git(&repo_dir, ["commit", "-m", "diverging"])?;
+
+    common::run_git(&repo_dir, ["push", "--force", "origin", "main"])?;
+
+    let cap = captured.lock().unwrap();
+    let (_, dropped) = &cap.dropped_commits[0];
+    assert_eq!(dropped.len(), 1, "force-push drops one commit");
+    assert_eq!(dropped[0].to_hex().to_string(), dropped_oid);
+
+    server.stop();
+    Ok(())
+});
+
+dual_backend_access_test!(comparison_ref_diff_lists_added_paths, |backend| {
+    let temprepo = common::temprepo()?;
+    let captured = Arc::new(Mutex::new(CapturedPush::default()));
+    let cap2 = captured.clone();
+    let server = common::axum_access_server_with_backend(temprepo.path(), backend, move |rp| {
+        CaptureAccess {
+            repo: PathBuf::from(rp.as_ref()),
+            captured: cap2.clone(),
+        }
+    });
+
+    let clone_dir = tempdir()?;
+    let repo_dir = clone_repo_main(server.port, clone_dir.path());
+
+    fs::write(repo_dir.join("brand-new.txt"), "yay")?;
+    common::run_git(&repo_dir, ["add", "."])?;
+    common::run_git(&repo_dir, ["commit", "-m", "add brand-new.txt"])?;
+    common::run_git(&repo_dir, ["push", "origin", "main"])?;
+
+    let cap = captured.lock().unwrap();
+    let (_, paths) = &cap.diff_paths[0];
+    assert!(
+        paths.iter().any(|p| p.as_slice() == b"brand-new.txt"),
+        "ref_diff should report brand-new.txt as touched, got: {:?}",
+        paths
+            .iter()
+            .map(|p| String::from_utf8_lossy(p).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    server.stop();
+    Ok(())
+});
+
+fn clone_repo_main(server_port: u16, dir: &std::path::Path) -> PathBuf {
+    common::run_git(
+        dir,
+        [
+            "clone",
+            "--branch",
+            "main",
+            &format!("http://localhost:{}/test.git", server_port),
+        ],
+    )
+    .unwrap();
+    dir.join("test")
+}
 
 dual_backend_access_test!(test_delete_denied, |backend| {
     let temprepo = common::temprepo()?;
