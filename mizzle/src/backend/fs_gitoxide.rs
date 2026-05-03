@@ -127,19 +127,78 @@ impl StorageBackend for FsGitoxide {
     }
 
     fn update_refs(&self, repo: &FsGitoxideRepo, updates: &[RefUpdate]) -> Result<()> {
-        use gix_ref::transaction::PreviousValue;
+        use gix_ref::{
+            transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
+            Target,
+        };
 
         let local = repo.repo.to_thread_local();
-        for update in updates {
-            local
-                .reference(
-                    update.refname.as_str(),
-                    update.new_oid,
-                    PreviousValue::Any,
-                    "push",
-                )
-                .with_context(|| format!("updating ref {}", update.refname))?;
-        }
+
+        let edits: Vec<RefEdit> = updates
+            .iter()
+            .map(|u| {
+                let name = u
+                    .refname
+                    .as_str()
+                    .try_into()
+                    .with_context(|| format!("invalid ref name {}", u.refname))?;
+
+                let change = if u.new_oid.is_null() {
+                    // Delete: require the ref to exist and match old_oid (or just exist if
+                    // old_oid is null, which the protocol shouldn't send but is defensive).
+                    let expected = if u.old_oid.is_null() {
+                        PreviousValue::MustExist
+                    } else {
+                        PreviousValue::MustExistAndMatch(Target::Object(u.old_oid))
+                    };
+                    Change::Delete {
+                        expected,
+                        log: RefLog::AndReference,
+                    }
+                } else if u.old_oid.is_null() {
+                    // Create: ref must not already exist.
+                    Change::Update {
+                        log: LogChange {
+                            message: "push".into(),
+                            ..Default::default()
+                        },
+                        expected: PreviousValue::MustNotExist,
+                        new: Target::Object(u.new_oid),
+                    }
+                } else {
+                    // Update: ref must exist and match old_oid (CAS).
+                    Change::Update {
+                        log: LogChange {
+                            message: "push".into(),
+                            ..Default::default()
+                        },
+                        expected: PreviousValue::MustExistAndMatch(Target::Object(u.old_oid)),
+                        new: Target::Object(u.new_oid),
+                    }
+                };
+
+                Ok(RefEdit {
+                    change,
+                    name,
+                    deref: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Use Fail::Immediately so a concurrent push holding the same ref's lock
+        // gets an instant error rather than stalling the request for 100ms.
+        local
+            .refs
+            .transaction()
+            .prepare(
+                edits,
+                gix_lock::acquire::Fail::Immediately,
+                gix_lock::acquire::Fail::Immediately,
+            )
+            .context("preparing ref transaction")?
+            .commit(local.committer().transpose().context("reading committer")?)
+            .context("committing ref transaction")?;
+
         Ok(())
     }
 

@@ -29,6 +29,7 @@ bstr = "1"
 axum = { version = "0.8.8", features = ["macros"], optional = true }
 russh = { version = "0.58", optional = true }
 tempfile = "3.25.0"
+gix-lock = "21"
 
 [features]
 default = ["axum"]
