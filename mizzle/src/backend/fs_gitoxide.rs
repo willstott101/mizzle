@@ -455,6 +455,29 @@ impl StorageBackend for FsGitoxide {
             Ok(None) => return Ok(None),
             Err(e) => return Err(anyhow::anyhow!("looking up blob {oid}: {e}")),
         };
+        if object.kind != gix_object::Kind::Blob {
+            return Ok(None);
+        }
+        if (object.data.len() as u64) > cap {
+            return Ok(None);
+        }
+        Ok(Some(object.data.to_vec()))
+    }
+
+    fn read_object_raw(
+        &self,
+        repo: &FsGitoxideRepo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        use gix_object::Find;
+        let mut buf: Vec<u8> = Vec::new();
+        let store = repo.repo.objects.to_handle();
+        let object = match store.try_find(&oid, &mut buf) {
+            Ok(Some(o)) => o,
+            Ok(None) => return Ok(None),
+            Err(e) => return Err(anyhow::anyhow!("looking up object {oid}: {e}")),
+        };
         if (object.data.len() as u64) > cap {
             return Ok(None);
         }

@@ -243,8 +243,24 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn read_commit_info(&self, repo: &Self::Repo, oid: ObjectId) -> Result<CommitInfo>;
 
     /// Read raw blob bytes, capped at `cap`.  Returns `Ok(None)` if the blob
-    /// is larger than the cap or not found.
+    /// is larger than the cap, not found, or the OID points at a non-blob
+    /// object (commit, tree, tag).
     fn read_blob(&self, repo: &Self::Repo, oid: ObjectId, cap: u64) -> Result<Option<Vec<u8>>>;
+
+    /// Read raw object bytes regardless of kind, capped at `cap`.  Returns
+    /// `Ok(None)` if the object is larger than the cap or not found.
+    ///
+    /// Used by signature-verification reconstruction
+    /// ([`Comparison::verify`](crate::auth::Comparison::verify)) which needs
+    /// the canonical commit/tag bytes; callers that genuinely need a blob
+    /// should use [`read_blob`](Self::read_blob) so non-blob OIDs are
+    /// rejected.
+    fn read_object_raw(
+        &self,
+        repo: &Self::Repo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>>;
 }
 
 /// Error type for [`StorageBackend::reachable_excluding`].

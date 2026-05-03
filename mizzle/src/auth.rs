@@ -133,7 +133,7 @@ struct ConcreteComparison<'a, A: RepoAccess + ?Sized, B: StorageBackend> {
     refs: Vec<PushRef<'a>>,
     existing_ref_tips: Vec<ObjectId>,
     opts: ComparisonOptions,
-    new_commits: Vec<OnceCell<Result<Vec<ObjectId>, ComparisonError>>>,
+    new_commits: Vec<OnceCell<Result<Vec<CommitInfo>, ComparisonError>>>,
     dropped_commits: Vec<OnceCell<Result<Vec<CommitInfo>, ComparisonError>>>,
     ref_diffs: Vec<OnceCell<Result<RefDiff, ComparisonError>>>,
     verify_cache: RefCell<HashMap<ObjectId, VerificationStatus>>,
@@ -224,7 +224,7 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
     fn new_commits<'b>(&'b self, r: &PushRef<'_>) -> Result<Vec<&'b CommitInfo>, ComparisonError> {
         let idx = self.ref_index(r);
 
-        let oids = self.new_commits[idx].get_or_init(|| {
+        let cached = self.new_commits[idx].get_or_init(|| {
             // Tips: the new oid of this ref (skip if delete).
             if r.new_oid.is_null() {
                 return Ok(Vec::new());
@@ -242,7 +242,8 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
                 }
             }
 
-            self.backend
+            let oids = self
+                .backend
                 .reachable_excluding(
                     self.repo,
                     &from,
@@ -255,19 +256,31 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
                         limit,
                     },
                     ReachableError::Other(e) => ComparisonError::Backend(format!("{e:#}")),
-                })
+                })?;
+
+            // Prefer the staged-pack metadata (already parsed) and fall back
+            // to a backend read for OIDs that exist in the ODB but were not
+            // shipped in this push (thin-pack omissions, or pushes that point
+            // a ref at a commit already present on the server).  Without the
+            // fallback, those commits would be silently dropped here, letting
+            // any commit-content rule (committer email, DCO, merges-only, …)
+            // be bypassed.
+            let mut out = Vec::with_capacity(oids.len());
+            for oid in oids {
+                let info = match self.pack.find_commit(&oid) {
+                    Some(c) => c.clone(),
+                    None => self
+                        .backend
+                        .read_commit_info(self.repo, oid)
+                        .map_err(|e| ComparisonError::Backend(format!("{e:#}")))?,
+                };
+                out.push(info);
+            }
+            Ok(out)
         });
 
-        match oids {
-            Ok(oids) => {
-                let mut out = Vec::with_capacity(oids.len());
-                for oid in oids {
-                    if let Some(c) = self.pack.find_commit(oid) {
-                        out.push(c);
-                    }
-                }
-                Ok(out)
-            }
+        match cached {
+            Ok(commits) => Ok(commits.iter().collect()),
             Err(e) => Err(e.clone()),
         }
     }
@@ -391,7 +404,10 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
             Some(blob) => {
                 // Re-read the raw commit object to reconstruct the canonical
                 // signed payload (object bytes minus the gpgsig header).
-                let raw = match self.backend.read_blob(self.repo, c.oid, 16 * 1024 * 1024) {
+                let raw = match self
+                    .backend
+                    .read_object_raw(self.repo, c.oid, 16 * 1024 * 1024)
+                {
                     Ok(Some(b)) => b,
                     _ => {
                         return VerificationStatus::BadSignature;
@@ -417,7 +433,10 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
         }
         let status = match (&t.signature, &t.tagger) {
             (Some(blob), Some(tagger)) => {
-                let raw = match self.backend.read_blob(self.repo, t.oid, 16 * 1024 * 1024) {
+                let raw = match self
+                    .backend
+                    .read_object_raw(self.repo, t.oid, 16 * 1024 * 1024)
+                {
                     Ok(Some(b)) => b,
                     _ => return VerificationStatus::BadSignature,
                 };

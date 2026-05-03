@@ -681,6 +681,55 @@ impl StorageBackend for FsGitCli {
         }
         Ok(Some(output.stdout))
     }
+
+    fn read_object_raw(
+        &self,
+        repo: &FsGitCliRepo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        // Check size first to bound memory.
+        let size_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-s", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let size: u64 = match size_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(u64::MAX),
+            _ => return Ok(None),
+        };
+        if size > cap {
+            return Ok(None);
+        }
+
+        // Need the kind to pick the right cat-file mode (commit/tree/blob/tag).
+        let kind_out = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", "-t", &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output();
+        let kind = match kind_out {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => return Ok(None),
+        };
+
+        let output = Command::new("git")
+            .current_dir(&repo.path)
+            .args(["cat-file", kind.as_str(), &oid.to_hex().to_string()])
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .output()
+            .context("running git cat-file")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        Ok(Some(output.stdout))
+    }
 }
 
 // ---------------------------------------------------------------------------
