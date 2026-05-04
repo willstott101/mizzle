@@ -158,6 +158,15 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn open(&self, id: &Self::RepoId) -> Result<Self::Repo>;
 
     /// List all refs in the repository.
+    ///
+    /// # Consistency
+    ///
+    /// The returned snapshot is **not** linearisable against concurrent writers.
+    /// Each individual ref is read atomically, but the iteration is not
+    /// snapshot-isolated: a concurrent `update_refs` that commits during the
+    /// walk may cause some refs to reflect the pre-commit state and others to
+    /// reflect the post-commit state.  Callers must not derive cross-ref
+    /// invariants from a single `list_refs` result.
     fn list_refs(&self, repo: &Self::Repo) -> Result<RefsSnapshot>;
 
     /// Resolve a single ref name to its OID. Returns `None` if the ref does
@@ -165,6 +174,25 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn resolve_ref(&self, repo: &Self::Repo, refname: &str) -> Result<Option<ObjectId>>;
 
     /// Update refs after a successful push.
+    ///
+    /// # Atomicity and CAS
+    ///
+    /// Implementations must apply `updates` as a single all-or-nothing
+    /// transaction: either every edit lands or none do.
+    ///
+    /// Each `RefUpdate` carries an `old_oid` that represents the ref value the
+    /// client observed at the start of the push (from `list_refs`).
+    /// Implementations must enforce compare-and-swap semantics:
+    ///
+    /// - `old_oid` is the null OID → ref must not yet exist (create).
+    /// - `new_oid` is the null OID → ref must exist and match `old_oid`
+    ///   (delete with CAS).
+    /// - both non-null → ref must exist and currently equal `old_oid` (update
+    ///   with CAS).
+    ///
+    /// If any CAS check fails the entire batch must be rolled back and an error
+    /// returned.  The protocol layer translates the error into `ng <ref> stale
+    /// info` lines for the client.
     fn update_refs(&self, repo: &Self::Repo, updates: &[RefUpdate]) -> Result<()>;
 
     /// Initialize a bare repository if it does not already exist.

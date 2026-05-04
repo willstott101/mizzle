@@ -40,11 +40,11 @@ pub struct FsGitoxideRepo {
 pub struct FsWrittenPack {
     pack: PathBuf,
     index: PathBuf,
+    /// Whether *this* ingest moved the pack file into place.
+    /// False when a concurrent ingest of identical content already installed it.
+    pack_owned: bool,
+    index_owned: bool,
 }
-
-/// Maximum number of commits to walk when determining fast-forward status.
-/// If exceeded, the push is conservatively classified as a force-push.
-const MAX_FF_WALK: usize = 10_000;
 
 impl StorageBackend for FsGitoxide {
     type RepoId = PathBuf;
@@ -203,11 +203,17 @@ impl StorageBackend for FsGitoxide {
     }
 
     fn init_repo(&self, repo_path: &PathBuf) -> Result<()> {
-        if !repo_path.exists() {
-            gix::init_bare(repo_path)
-                .with_context(|| format!("initialising bare repo at {}", repo_path.display()))?;
+        match gix::init_bare(repo_path) {
+            Ok(_) => Ok(()),
+            // gix::init_bare rejects non-empty directories.  A concurrent
+            // init_repo call (TOCTOU) may have already created the repo while
+            // we were past the old exists() check.  If HEAD is present the
+            // race was won by another task and the repo is ready to use.
+            Err(_) if repo_path.join("HEAD").exists() => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("initialising bare repo at {}", repo_path.display()))
+            }
         }
-        Ok(())
     }
 
     fn has_object(&self, repo: &FsGitoxideRepo, oid: &ObjectId) -> Result<bool> {
@@ -230,11 +236,11 @@ impl StorageBackend for FsGitoxide {
         let local = repo.repo.to_thread_local();
         let odb = local.objects.into_inner();
 
-        let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb)
-            .take(MAX_FF_WALK)
-            .any(|r: Result<gix::traverse::commit::Info, _>| {
+        let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb).any(
+            |r: Result<gix::traverse::commit::Info, _>| {
                 r.map(|info| info.id == update.old_oid).unwrap_or(false)
-            });
+            },
+        );
 
         if is_ff {
             PushKind::FastForward
@@ -369,12 +375,29 @@ impl StorageBackend for FsGitoxide {
 
         let pack_dst = pack_dir.join(pack_src.file_name().unwrap());
         let idx_dst = pack_dir.join(idx_src.file_name().unwrap());
-        move_file(&pack_src, &pack_dst).context("moving pack file")?;
-        move_file(&idx_src, &idx_dst).context("moving index file")?;
+
+        // Pack filenames embed the content hash, so if the destination already
+        // exists it contains identical bytes.  Skip the move and leave
+        // ownership with whoever installed it first; rollback must not unlink
+        // a pack we didn't install.
+        let pack_owned = if pack_dst.exists() {
+            false
+        } else {
+            move_file(&pack_src, &pack_dst).context("moving pack file")?;
+            true
+        };
+        let index_owned = if idx_dst.exists() {
+            false
+        } else {
+            move_file(&idx_src, &idx_dst).context("moving index file")?;
+            true
+        };
 
         Ok(Some(FsWrittenPack {
             pack: pack_dst,
             index: idx_dst,
+            pack_owned,
+            index_owned,
         }))
     }
 
@@ -383,8 +406,12 @@ impl StorageBackend for FsGitoxide {
     }
 
     fn rollback_ingest(&self, pack: FsWrittenPack) {
-        let _ = std::fs::remove_file(&pack.index);
-        let _ = std::fs::remove_file(&pack.pack);
+        if pack.index_owned {
+            let _ = std::fs::remove_file(&pack.index);
+        }
+        if pack.pack_owned {
+            let _ = std::fs::remove_file(&pack.pack);
+        }
     }
 
     fn reachable_excluding(
