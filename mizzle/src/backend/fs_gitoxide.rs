@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
+use bstr::ByteSlice as _;
 use gix::objs::Exists;
 use gix::parallel::InOrderIter;
 use gix::ObjectId;
@@ -185,8 +186,29 @@ impl StorageBackend for FsGitoxide {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        // Use Fail::Immediately so a concurrent push holding the same ref's lock
-        // gets an instant error rather than stalling the request for 100ms.
+        // Use Fail::Immediately to avoid blocking on the per-repo
+        // core.filesRefLockTimeout backoff when a concurrent push holds the same lock.
+        let time_str;
+        let committer = match local.committer().transpose().context("reading committer")? {
+            Some(sig) => sig,
+            None => {
+                // Always supply a committer so that commit() never enters the
+                // partially-applied code path that fires when reflog writes are
+                // enabled (core.logAllRefUpdates=true) but no committer is provided.
+                time_str = format!(
+                    "{} +0000",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                );
+                gix::actor::SignatureRef {
+                    name: b"mizzle".as_bstr(),
+                    email: b"noreply@mizzle".as_bstr(),
+                    time: &time_str,
+                }
+            }
+        };
         local
             .refs
             .transaction()
@@ -196,7 +218,7 @@ impl StorageBackend for FsGitoxide {
                 gix_lock::acquire::Fail::Immediately,
             )
             .context("preparing ref transaction")?
-            .commit(local.committer().transpose().context("reading committer")?)
+            .commit(Some(committer))
             .context("committing ref transaction")?;
 
         Ok(())

@@ -199,12 +199,15 @@ A subtlety: `compute_push_kind` walks at most `MAX_FF_WALK` commits from
 `new_oid` looking for `old_oid`
 ([fs_gitoxide.rs:174-178](../mizzle/src/backend/fs_gitoxide.rs#L174)).
 A legitimate fast-forward whose ancestry chain is longer than the cap
-will be misclassified as a force-push.  Today that just affects which
-authorisation path runs.  Once CAS lands, it would also cause the gix
-transaction to reject the update with `ReferenceOutOfDate` even though
-the client had the right `old_oid`, so the cap should either be lifted
-for this check or the misclassification accepted as a known false
-negative documented in the trait.
+will be misclassified as a force-push.  This is a **false negative for
+authorisation only**: the `compute_push_kind` misclassification may
+cause the authoriser to reject a legitimate fast-forward as if it were
+a force-push.  It does *not* affect the CAS outcome — the gix-ref CAS
+check (`MustExistAndMatch`) is a direct OID equality between the
+on-disk ref value and the supplied `old_oid`; it contains no
+reachability walk and will pass regardless of how `compute_push_kind`
+classified the update.  The cap should be lifted or documented as a
+known false negative on the trait.
 
 ### Non-atomic multi-ref updates (FsGitoxide)
 
