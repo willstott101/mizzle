@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
+use bstr::ByteSlice as _;
 use gix::objs::Exists;
 use gix::parallel::InOrderIter;
 use gix::ObjectId;
@@ -40,11 +41,11 @@ pub struct FsGitoxideRepo {
 pub struct FsWrittenPack {
     pack: PathBuf,
     index: PathBuf,
+    /// Whether *this* ingest moved the pack file into place.
+    /// False when a concurrent ingest of identical content already installed it.
+    pack_owned: bool,
+    index_owned: bool,
 }
-
-/// Maximum number of commits to walk when determining fast-forward status.
-/// If exceeded, the push is conservatively classified as a force-push.
-const MAX_FF_WALK: usize = 10_000;
 
 impl StorageBackend for FsGitoxide {
     type RepoId = PathBuf;
@@ -127,28 +128,114 @@ impl StorageBackend for FsGitoxide {
     }
 
     fn update_refs(&self, repo: &FsGitoxideRepo, updates: &[RefUpdate]) -> Result<()> {
-        use gix_ref::transaction::PreviousValue;
+        use gix_ref::{
+            transaction::{Change, LogChange, PreviousValue, RefEdit, RefLog},
+            Target,
+        };
 
         let local = repo.repo.to_thread_local();
-        for update in updates {
-            local
-                .reference(
-                    update.refname.as_str(),
-                    update.new_oid,
-                    PreviousValue::Any,
-                    "push",
-                )
-                .with_context(|| format!("updating ref {}", update.refname))?;
-        }
+
+        let edits: Vec<RefEdit> = updates
+            .iter()
+            .map(|u| {
+                let name = u
+                    .refname
+                    .as_str()
+                    .try_into()
+                    .with_context(|| format!("invalid ref name {}", u.refname))?;
+
+                let change = if u.new_oid.is_null() {
+                    // Delete: require the ref to exist and match old_oid (or just exist if
+                    // old_oid is null, which the protocol shouldn't send but is defensive).
+                    let expected = if u.old_oid.is_null() {
+                        PreviousValue::MustExist
+                    } else {
+                        PreviousValue::MustExistAndMatch(Target::Object(u.old_oid))
+                    };
+                    Change::Delete {
+                        expected,
+                        log: RefLog::AndReference,
+                    }
+                } else if u.old_oid.is_null() {
+                    // Create: ref must not already exist.
+                    Change::Update {
+                        log: LogChange {
+                            message: "push".into(),
+                            ..Default::default()
+                        },
+                        expected: PreviousValue::MustNotExist,
+                        new: Target::Object(u.new_oid),
+                    }
+                } else {
+                    // Update: ref must exist and match old_oid (CAS).
+                    Change::Update {
+                        log: LogChange {
+                            message: "push".into(),
+                            ..Default::default()
+                        },
+                        expected: PreviousValue::MustExistAndMatch(Target::Object(u.old_oid)),
+                        new: Target::Object(u.new_oid),
+                    }
+                };
+
+                Ok(RefEdit {
+                    change,
+                    name,
+                    deref: false,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Use Fail::Immediately to avoid blocking on the per-repo
+        // core.filesRefLockTimeout backoff when a concurrent push holds the same lock.
+        let time_str;
+        let committer = match local.committer().transpose().context("reading committer")? {
+            Some(sig) => sig,
+            None => {
+                // Always supply a committer so that commit() never enters the
+                // partially-applied code path that fires when reflog writes are
+                // enabled (core.logAllRefUpdates=true) but no committer is provided.
+                time_str = format!(
+                    "{} +0000",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                );
+                gix::actor::SignatureRef {
+                    name: b"mizzle".as_bstr(),
+                    email: b"noreply@mizzle".as_bstr(),
+                    time: &time_str,
+                }
+            }
+        };
+        local
+            .refs
+            .transaction()
+            .prepare(
+                edits,
+                gix_lock::acquire::Fail::Immediately,
+                gix_lock::acquire::Fail::Immediately,
+            )
+            .context("preparing ref transaction")?
+            .commit(Some(committer))
+            .context("committing ref transaction")?;
+
         Ok(())
     }
 
     fn init_repo(&self, repo_path: &PathBuf) -> Result<()> {
-        if !repo_path.exists() {
-            gix::init_bare(repo_path)
-                .with_context(|| format!("initialising bare repo at {}", repo_path.display()))?;
+        match gix::init_bare(repo_path) {
+            Ok(_) => Ok(()),
+            // gix::init_bare rejects non-empty directories.  A concurrent
+            // init_repo call (TOCTOU) may have already created the repo while
+            // we were past the old exists() check.  If HEAD is present the
+            // race was won by another task and the repo is ready to use.
+            Err(_) if repo_path.join("HEAD").exists() => Ok(()),
+            Err(e) => {
+                Err(e).with_context(|| format!("initialising bare repo at {}", repo_path.display()))
+            }
         }
-        Ok(())
     }
 
     fn has_object(&self, repo: &FsGitoxideRepo, oid: &ObjectId) -> Result<bool> {
@@ -171,11 +258,11 @@ impl StorageBackend for FsGitoxide {
         let local = repo.repo.to_thread_local();
         let odb = local.objects.into_inner();
 
-        let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb)
-            .take(MAX_FF_WALK)
-            .any(|r: Result<gix::traverse::commit::Info, _>| {
+        let is_ff = gix::traverse::commit::Simple::new(std::iter::once(update.new_oid), odb).any(
+            |r: Result<gix::traverse::commit::Info, _>| {
                 r.map(|info| info.id == update.old_oid).unwrap_or(false)
-            });
+            },
+        );
 
         if is_ff {
             PushKind::FastForward
@@ -310,12 +397,29 @@ impl StorageBackend for FsGitoxide {
 
         let pack_dst = pack_dir.join(pack_src.file_name().unwrap());
         let idx_dst = pack_dir.join(idx_src.file_name().unwrap());
-        move_file(&pack_src, &pack_dst).context("moving pack file")?;
-        move_file(&idx_src, &idx_dst).context("moving index file")?;
+
+        // Pack filenames embed the content hash, so if the destination already
+        // exists it contains identical bytes.  Skip the move and leave
+        // ownership with whoever installed it first; rollback must not unlink
+        // a pack we didn't install.
+        let pack_owned = if pack_dst.exists() {
+            false
+        } else {
+            move_file(&pack_src, &pack_dst).context("moving pack file")?;
+            true
+        };
+        let index_owned = if idx_dst.exists() {
+            false
+        } else {
+            move_file(&idx_src, &idx_dst).context("moving index file")?;
+            true
+        };
 
         Ok(Some(FsWrittenPack {
             pack: pack_dst,
             index: idx_dst,
+            pack_owned,
+            index_owned,
         }))
     }
 
@@ -324,8 +428,12 @@ impl StorageBackend for FsGitoxide {
     }
 
     fn rollback_ingest(&self, pack: FsWrittenPack) {
-        let _ = std::fs::remove_file(&pack.index);
-        let _ = std::fs::remove_file(&pack.pack);
+        if pack.index_owned {
+            let _ = std::fs::remove_file(&pack.index);
+        }
+        if pack.pack_owned {
+            let _ = std::fs::remove_file(&pack.pack);
+        }
     }
 
     fn reachable_excluding(
