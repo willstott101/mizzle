@@ -75,6 +75,11 @@ impl SqlBackend {
             pack_cache_dir,
         })
     }
+
+    /// Returns the pack cache directory.  Intended for test assertions.
+    pub fn pack_cache_dir(&self) -> &Path {
+        &self.pack_cache_dir
+    }
 }
 
 // ---------------------------------------------------------------------------
