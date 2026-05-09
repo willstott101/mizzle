@@ -42,7 +42,7 @@ macro_rules! res_try {
 pub type SpawnFut = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 /// Shared receive-pack info/refs response (protocol-version-agnostic).
-fn recv_pack_info_refs<A, B>(
+async fn recv_pack_info_refs<A, B>(
     spawn: &impl Fn(SpawnFut),
     access: &A,
     backend: &B,
@@ -53,10 +53,10 @@ where
     B: StorageBackend<RepoId = A::RepoId>,
 {
     if access.auto_init() {
-        res_try!(backend.init_repo(repo_id));
+        res_try!(backend.init_repo(repo_id).await);
     }
-    let repo = res_try!(backend.open(repo_id));
-    let snapshot = res_try!(backend.list_refs(&repo));
+    let repo = res_try!(backend.open(repo_id).await);
+    let snapshot = res_try!(backend.list_refs(&repo).await);
     let refs = snapshot.as_receive_pack();
     let (reader, writer) = piper::pipe(4096);
     spawn(Box::pin(async move {
@@ -96,13 +96,33 @@ fn build_push_refs<'a>(
         .collect()
 }
 
+/// Async variant of [`build_push_refs`] that queries the backend for each
+/// ref's [`PushKind`](crate::auth_types::PushKind).
+async fn build_push_refs_async<'a, B: StorageBackend>(
+    updates: &'a [crate::backend::RefUpdate],
+    backend: &B,
+    repo: &B::Repo,
+) -> Vec<PushRef<'a>> {
+    let mut out = Vec::with_capacity(updates.len());
+    for u in updates {
+        let kind = backend.compute_push_kind(repo, u).await;
+        out.push(PushRef {
+            refname: &u.refname,
+            kind,
+            old_oid: u.old_oid,
+            new_oid: u.new_oid,
+        });
+    }
+    out
+}
+
 /// Existing ref tips, used as exclusion set when computing `new_commits`.
-fn existing_ref_tips<B: StorageBackend>(
+async fn existing_ref_tips<B: StorageBackend>(
     backend: &B,
     repo: &B::Repo,
     push_refs: &[PushRef<'_>],
 ) -> Vec<ObjectId> {
-    let snapshot = match backend.list_refs(repo) {
+    let snapshot = match backend.list_refs(repo).await {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -147,12 +167,12 @@ where
     };
 
     // Open the repo handle once for the remainder of this request.
-    let repo = res_try!(backend.open(&repo_id));
+    let repo = res_try!(backend.open(&repo_id).await);
 
     // Stage pack data to a temp file (streamed, not buffered in memory).
     let staged = res_try!(receive::stage_pack(body, None).await);
     let written_pack = if let Some(ref staged) = staged {
-        res_try!(backend.ingest_pack(&repo, staged.path()))
+        res_try!(backend.ingest_pack(&repo, staged.path()).await)
     } else {
         None
     };
@@ -161,12 +181,12 @@ where
     // reject the push — proceeding without metadata could let a crafted
     // pack bypass metadata-based auth checks.
     let pack_meta: Option<PackMetadata> = if let Some(ref pack) = written_pack {
-        match backend.inspect_ingested(pack) {
+        match backend.inspect_ingested(pack).await {
             Ok(meta) => Some(meta),
             Err(e) => {
                 error!("pack inspection failed: {:#}", e);
                 if let Some(pack) = written_pack {
-                    backend.rollback_ingest(pack);
+                    backend.rollback_ingest(pack).await;
                 }
                 return reject_response(
                     spawn,
@@ -179,8 +199,8 @@ where
         None
     };
 
-    let push_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
-    let existing = existing_ref_tips(&backend, &repo, &push_refs);
+    let push_refs = build_push_refs_async(&ref_updates, &backend, &repo).await;
+    let existing = existing_ref_tips(&backend, &repo, &push_refs).await;
     let empty_meta = PackMetadata {
         objects: Vec::new(),
     };
@@ -200,7 +220,7 @@ where
     let rejected: Vec<(String, String)> = match auth_result {
         Err(msg) => {
             if let Some(pack) = written_pack {
-                backend.rollback_ingest(pack);
+                backend.rollback_ingest(pack).await;
             }
             ref_updates
                 .iter()
@@ -387,7 +407,7 @@ where
             .split('&')
             .any(|kv| kv == "service=git-receive-pack")
     {
-        return recv_pack_info_refs(&spawn, &access, &backend, &repo_id);
+        return recv_pack_info_refs(&spawn, &access, &backend, &repo_id).await;
     }
 
     // Upload-pack discovery: GET /info/refs?service=git-upload-pack
@@ -397,10 +417,10 @@ where
             .any(|kv| kv == "service=git-upload-pack")
     {
         if access.auto_init() {
-            res_try!(backend.init_repo(&repo_id));
+            res_try!(backend.init_repo(&repo_id).await);
         }
-        let repo = res_try!(backend.open(&repo_id));
-        let snapshot = res_try!(backend.list_refs(&repo));
+        let repo = res_try!(backend.open(&repo_id).await);
+        let snapshot = res_try!(backend.list_refs(&repo).await);
         let refs = snapshot.as_upload_pack_v1();
         let (reader, writer) = piper::pipe(4096);
         spawn(Box::pin(info_refs_upload_pack_v1_task(refs, writer)));
@@ -439,10 +459,10 @@ where
                 ),
             };
         }
-        let repo = res_try!(backend.open(&repo_id));
+        let repo = res_try!(backend.open(&repo_id).await);
         let mut args = res_try!(fetch::read_fetch_args_v1(body, limits).await);
         for refname in &args.want_refs {
-            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
+            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()).await {
                 args.want.push(oid);
             }
         }
@@ -495,7 +515,7 @@ where
             .split('&')
             .any(|kv| kv == "service=git-receive-pack")
     {
-        return recv_pack_info_refs(&spawn, &access, &backend, &repo_id);
+        return recv_pack_info_refs(&spawn, &access, &backend, &repo_id).await;
     }
 
     // Upload-pack discovery: GET /info/refs
@@ -543,8 +563,8 @@ where
         match command {
             Command::ListRefs => {
                 let args = res_try!(ls_refs::read_lsrefs_args(&mut parser, limits).await);
-                let repo = res_try!(backend.open(&repo_id));
-                let snapshot = res_try!(backend.list_refs(&repo));
+                let repo = res_try!(backend.open(&repo_id).await);
+                let snapshot = res_try!(backend.list_refs(&repo).await);
                 let (reader, writer) = piper::pipe(4096);
                 spawn(Box::pin(async move {
                     let mut w = writer;
@@ -561,11 +581,11 @@ where
             }
             Command::Empty => (),
             Command::Fetch => {
-                let repo = res_try!(backend.open(&repo_id));
+                let repo = res_try!(backend.open(&repo_id).await);
                 let mut args = res_try!(fetch::read_fetch_args(&mut parser, limits).await);
                 // Resolve any want-ref names to OIDs and add to wants.
                 for refname in &args.want_refs {
-                    if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
+                    if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()).await {
                         args.want.push(oid);
                     }
                 }
@@ -647,10 +667,10 @@ where
     let repo_id = access.repo_id().clone();
 
     if access.auto_init() {
-        backend.init_repo(&repo_id)?;
+        backend.init_repo(&repo_id).await?;
     }
 
-    let repo = backend.open(&repo_id)?;
+    let repo = backend.open(&repo_id).await?;
 
     if version >= 2 {
         info!("upload-pack v2 {:?}", repo_id);
@@ -665,13 +685,13 @@ where
             match command {
                 Command::ListRefs => {
                     let args = ls_refs::read_lsrefs_args(&mut parser, limits).await?;
-                    let snapshot = backend.list_refs(&repo)?;
+                    let snapshot = backend.list_refs(&repo).await?;
                     ls_refs::perform_listrefs(&snapshot, &args, writer).await?;
                 }
                 Command::Fetch => {
                     let mut args = fetch::read_fetch_args(&mut parser, limits).await?;
                     for refname in &args.want_refs {
-                        if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
+                        if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()).await {
                             args.want.push(oid);
                         }
                     }
@@ -683,13 +703,13 @@ where
         }
     } else {
         info!("upload-pack v1 {:?}", repo_id);
-        let snapshot = backend.list_refs(&repo)?;
+        let snapshot = backend.list_refs(&repo).await?;
         let refs = snapshot.as_upload_pack_v1();
         upload_pack_v1_refs(&refs, writer).await?;
 
         let mut args = fetch::read_fetch_args_v1(reader, limits).await?;
         for refname in &args.want_refs {
-            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()) {
+            if let Ok(Some(oid)) = backend.resolve_ref(&repo, refname.as_str()).await {
                 args.want.push(oid);
             }
         }
@@ -721,13 +741,13 @@ where
     info!("receive-pack {:?}", repo_id);
 
     if access.auto_init() {
-        backend.init_repo(&repo_id)?;
+        backend.init_repo(&repo_id).await?;
     }
 
-    let repo = backend.open(&repo_id)?;
+    let repo = backend.open(&repo_id).await?;
 
     // Advertise refs (no HTTP preamble).
-    let snapshot = backend.list_refs(&repo)?;
+    let snapshot = backend.list_refs(&repo).await?;
     let refs = snapshot.as_receive_pack();
     receive::info_refs_receive_pack_task(refs, writer).await?;
 
@@ -752,7 +772,7 @@ where
     // Stage pack data to a temp file (streamed, not buffered in memory).
     let staged = receive::stage_pack(reader, None).await?;
     let written_pack = if let Some(ref staged) = staged {
-        backend.ingest_pack(&repo, staged.path())?
+        backend.ingest_pack(&repo, staged.path()).await?
     } else {
         None
     };
@@ -760,12 +780,12 @@ where
     // Inspect the ingested pack for auth metadata.  If inspection fails,
     // reject the push rather than proceeding without metadata.
     let pack_meta: Option<PackMetadata> = if let Some(ref pack) = written_pack {
-        match backend.inspect_ingested(pack) {
+        match backend.inspect_ingested(pack).await {
             Ok(meta) => Some(meta),
             Err(e) => {
                 error!("pack inspection failed: {:#}", e);
                 if let Some(pack) = written_pack {
-                    backend.rollback_ingest(pack);
+                    backend.rollback_ingest(pack).await;
                 }
                 let msg = format!("pack inspection failed: {e:#}");
                 text_to_write(b"unpack ok", &mut *writer).await?;
@@ -781,8 +801,8 @@ where
         None
     };
 
-    let push_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
-    let existing = existing_ref_tips(backend, &repo, &push_refs);
+    let push_refs = build_push_refs_async(&ref_updates, backend, &repo).await;
+    let existing = existing_ref_tips(backend, &repo, &push_refs).await;
     let empty_meta = PackMetadata {
         objects: Vec::new(),
     };
@@ -801,7 +821,7 @@ where
 
     if let Err(msg) = auth_result {
         if let Some(pack) = written_pack {
-            backend.rollback_ingest(pack);
+            backend.rollback_ingest(pack).await;
         }
         text_to_write(b"unpack ok", &mut *writer).await?;
         for update in &ref_updates {
@@ -816,7 +836,7 @@ where
 
     // post_receive uses a fresh Comparison (the moved push_refs were
     // consumed by run_comparison above; rebuild from the same data).
-    let post_refs = build_push_refs(&ref_updates, |u| backend.compute_push_kind(&repo, u));
+    let post_refs = build_push_refs_async(&ref_updates, backend, &repo).await;
     let pack_ref2 = pack_meta.as_ref().unwrap_or(&empty_meta);
     run_comparison(
         &access,

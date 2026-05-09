@@ -29,7 +29,7 @@ pub async fn perform_fetch<B: StorageBackend>(
     //   packfile flush-pkt
 
     if !args.done {
-        let known = backend.has_objects(repo, &args.have)?;
+        let known = backend.has_objects(repo, &args.have).await?;
         let acks: Vec<ObjectId> = args
             .have
             .iter()
@@ -66,7 +66,9 @@ pub async fn perform_fetch<B: StorageBackend>(
         filter,
         thin_pack: args.thin_pack,
     };
-    let mut pack_output = backend.build_pack(repo, &args.want, &args.have, &opts)?;
+    let mut pack_output = backend
+        .build_pack(repo, &args.want, &args.have, &opts)
+        .await?;
 
     // shallow-info section: tell the client which commits are shallow
     // boundaries so it knows not to expect their parents.
@@ -106,7 +108,9 @@ pub async fn perform_fetch_v1<B: StorageBackend>(
         filter,
         thin_pack: args.thin_pack,
     };
-    let mut pack_output = backend.build_pack(repo, &args.want, &args.have, &opts)?;
+    let mut pack_output = backend
+        .build_pack(repo, &args.want, &args.have, &opts)
+        .await?;
 
     // In v1, shallow boundaries are sent before the NAK.
     for id in &pack_output.shallow {
@@ -265,7 +269,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo = backend.open(&p.to_path_buf()).unwrap();
+        let repo = futures_lite::future::block_on(backend.open(&p.to_path_buf())).unwrap();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -332,7 +336,7 @@ mod tests {
         let c2 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo = backend.open(&p.to_path_buf()).unwrap();
+        let repo = futures_lite::future::block_on(backend.open(&p.to_path_buf())).unwrap();
         let args = FetchArgs {
             want: vec![c2],
             want_refs: Vec::new(),
@@ -397,7 +401,7 @@ mod tests {
         let c3 = rev_parse(p, "HEAD");
 
         let backend = FsGitoxide;
-        let repo = backend.open(&p.to_path_buf()).unwrap();
+        let repo = futures_lite::future::block_on(backend.open(&p.to_path_buf())).unwrap();
         let args = FetchArgs {
             want: vec![c3],
             want_refs: Vec::new(),

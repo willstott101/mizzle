@@ -36,21 +36,23 @@ impl RepoAccess for NoopAccess {
 // dropping the commit and letting any commit-content rule (committer email,
 // DCO, merges-only, …) be bypassed.
 
-#[test]
-fn new_commits_includes_odb_only_commit_gitoxide() -> anyhow::Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_commits_includes_odb_only_commit_gitoxide() -> anyhow::Result<()> {
     new_commits_includes_odb_only_commit(mizzle::backend::fs_gitoxide::FsGitoxide)
 }
 
-#[test]
-fn new_commits_includes_odb_only_commit_git_cli() -> anyhow::Result<()> {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_commits_includes_odb_only_commit_git_cli() -> anyhow::Result<()> {
     new_commits_includes_odb_only_commit(mizzle::backend::fs_git_cli::FsGitCli)
 }
 
 fn new_commits_includes_odb_only_commit<B: StorageBackend<RepoId = PathBuf>>(
     backend: B,
 ) -> anyhow::Result<()> {
+    use futures_lite::future::block_on;
+
     let temprepo = common::temprepo()?;
-    let repo = backend.open(&temprepo.path())?;
+    let repo = block_on(backend.open(&temprepo.path()))?;
 
     // The temprepo has main (2 commits) and dev (3 commits, sharing 2 with main).
     // Pick the dev tip — it's in the ODB but not reachable from main.
@@ -116,11 +118,13 @@ fn read_blob_returns_none_for_commit_oid_git_cli() -> anyhow::Result<()> {
 fn read_blob_returns_none_for_commit_oid<B: StorageBackend<RepoId = PathBuf>>(
     backend: B,
 ) -> anyhow::Result<()> {
+    use futures_lite::future::block_on;
+
     let temprepo = common::temprepo()?;
-    let repo = backend.open(&temprepo.path())?;
+    let repo = block_on(backend.open(&temprepo.path()))?;
     let head: ObjectId =
         common::run_git(temprepo.path().as_path(), ["rev-parse", "HEAD"])?.parse()?;
-    let result = backend.read_blob(&repo, head, 16 * 1024 * 1024)?;
+    let result = block_on(backend.read_blob(&repo, head, 16 * 1024 * 1024))?;
     assert!(
         result.is_none(),
         "read_blob on a commit OID must return None, got {} bytes",
@@ -142,11 +146,13 @@ fn read_blob_returns_none_for_tree_oid_git_cli() -> anyhow::Result<()> {
 fn read_blob_returns_none_for_tree_oid<B: StorageBackend<RepoId = PathBuf>>(
     backend: B,
 ) -> anyhow::Result<()> {
+    use futures_lite::future::block_on;
+
     let temprepo = common::temprepo()?;
-    let repo = backend.open(&temprepo.path())?;
+    let repo = block_on(backend.open(&temprepo.path()))?;
     let tree: ObjectId =
         common::run_git(temprepo.path().as_path(), ["rev-parse", "HEAD^{tree}"])?.parse()?;
-    let result = backend.read_blob(&repo, tree, 16 * 1024 * 1024)?;
+    let result = block_on(backend.read_blob(&repo, tree, 16 * 1024 * 1024))?;
     assert!(
         result.is_none(),
         "read_blob on a tree OID must return None, got {} bytes",

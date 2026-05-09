@@ -205,8 +205,8 @@ mod tests {
     }
 
     /// Build a pack, ingest it into a fresh repo, and inspect it.
-    #[test]
-    fn inspect_pack_extracts_commit_metadata() {
+    #[tokio::test]
+    async fn inspect_pack_extracts_commit_metadata() {
         let dir = tempdir().unwrap();
         let p = dir.path();
 
@@ -223,35 +223,36 @@ mod tests {
 
         // Build a pack from the repo.
         let backend = FsGitoxide;
-        let repo = backend.open(&p.to_path_buf()).unwrap();
-        let mut output = backend
-            .build_pack(
-                &repo,
-                &[main_oid],
-                &[],
-                &PackOptions {
-                    deepen: None,
-                    filter: None,
-                    thin_pack: false,
-                },
-            )
-            .unwrap();
+        let repo = futures_lite::future::block_on(backend.open(&p.to_path_buf())).unwrap();
+        let mut output = futures_lite::future::block_on(backend.build_pack(
+            &repo,
+            &[main_oid],
+            &[],
+            &PackOptions {
+                deepen: None,
+                filter: None,
+                thin_pack: false,
+            },
+        ))
+        .unwrap();
         let mut pack_data = Vec::new();
         std::io::Read::read_to_end(&mut output.reader, &mut pack_data).unwrap();
 
         // Create a fresh bare repo and ingest the pack.
         let target_dir = tempdir().unwrap();
         let target = target_dir.path().join("target.git");
-        backend.init_repo(&target).unwrap();
-        let target_repo = backend.open(&target).unwrap();
+        futures_lite::future::block_on(backend.init_repo(&target)).unwrap();
+        let target_repo = futures_lite::future::block_on(backend.open(&target)).unwrap();
 
         let staged = target_dir.path().join("staged.pack");
         std::fs::write(&staged, &pack_data).unwrap();
 
-        let written = backend.ingest_pack(&target_repo, &staged).unwrap().unwrap();
+        let written = futures_lite::future::block_on(backend.ingest_pack(&target_repo, &staged))
+            .unwrap()
+            .unwrap();
 
         // Inspect the pack.
-        let meta = backend.inspect_ingested(&written).unwrap();
+        let meta = futures_lite::future::block_on(backend.inspect_ingested(&written)).unwrap();
 
         // Should contain at least the commit, a tree, and a blob.
         assert!(
@@ -274,7 +275,7 @@ mod tests {
             "unsigned commit should have no signature"
         );
 
-        backend.rollback_ingest(written);
+        futures_lite::future::block_on(backend.rollback_ingest(written));
     }
 
     #[test]

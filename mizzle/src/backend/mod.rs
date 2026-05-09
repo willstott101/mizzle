@@ -7,6 +7,7 @@
 pub mod fs_git_cli;
 pub mod fs_gitoxide;
 
+use std::future::Future;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -137,9 +138,11 @@ pub struct PackOutput {
 
 /// Thin storage trait abstracting over repository backends.
 ///
-/// Every method is synchronous (CPU-bound for the filesystem backend).
-/// Callers should use `spawn_blocking` for heavy operations like
-/// [`build_pack`](StorageBackend::build_pack).
+/// Every method is async, returning `impl Future<…> + Send`.  Filesystem
+/// backends compute results synchronously and wrap them in ready futures;
+/// network-backed backends (SQL, distributed KV) are natively async.
+///
+/// Follows the same RPITIT convention as [`SshAuth::authorize`](crate::servers::ssh::SshAuth::authorize).
 pub trait StorageBackend: Send + Sync + 'static {
     /// Identifier for a repository (e.g. [`PathBuf`](std::path::PathBuf) for
     /// filesystem backends).
@@ -155,7 +158,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     type IngestedPack: Send;
 
     /// Open a repository, returning a reusable handle.
-    fn open(&self, id: &Self::RepoId) -> Result<Self::Repo>;
+    fn open(&self, id: &Self::RepoId) -> impl Future<Output = Result<Self::Repo>> + Send;
 
     /// List all refs in the repository.
     ///
@@ -167,11 +170,15 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// walk may cause some refs to reflect the pre-commit state and others to
     /// reflect the post-commit state.  Callers must not derive cross-ref
     /// invariants from a single `list_refs` result.
-    fn list_refs(&self, repo: &Self::Repo) -> Result<RefsSnapshot>;
+    fn list_refs(&self, repo: &Self::Repo) -> impl Future<Output = Result<RefsSnapshot>> + Send;
 
     /// Resolve a single ref name to its OID. Returns `None` if the ref does
     /// not exist.
-    fn resolve_ref(&self, repo: &Self::Repo, refname: &str) -> Result<Option<ObjectId>>;
+    fn resolve_ref(
+        &self,
+        repo: &Self::Repo,
+        refname: &str,
+    ) -> impl Future<Output = Result<Option<ObjectId>>> + Send;
 
     /// Update refs after a successful push.
     ///
@@ -193,24 +200,49 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// If any CAS check fails the entire batch must be rolled back and an error
     /// returned.  The protocol layer translates the error into `ng <ref> stale
     /// info` lines for the client.
-    fn update_refs(&self, repo: &Self::Repo, updates: &[RefUpdate]) -> Result<()>;
+    fn update_refs(
+        &self,
+        repo: &Self::Repo,
+        updates: &[RefUpdate],
+    ) -> impl Future<Output = Result<()>> + Send;
 
     /// Initialize a bare repository if it does not already exist.
-    fn init_repo(&self, repo: &Self::RepoId) -> Result<()>;
+    fn init_repo(&self, repo: &Self::RepoId) -> impl Future<Output = Result<()>> + Send;
 
     /// Check whether an object exists in the repository.
-    fn has_object(&self, repo: &Self::Repo, oid: &ObjectId) -> Result<bool>;
+    fn has_object(
+        &self,
+        repo: &Self::Repo,
+        oid: &ObjectId,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     /// Check which of the given OIDs exist in the repository.
     ///
     /// The default implementation calls [`has_object`](StorageBackend::has_object)
     /// in a loop.
-    fn has_objects(&self, repo: &Self::Repo, oids: &[ObjectId]) -> Result<Vec<bool>> {
-        oids.iter().map(|oid| self.has_object(repo, oid)).collect()
+    fn has_objects(
+        &self,
+        repo: &Self::Repo,
+        oids: &[ObjectId],
+    ) -> impl Future<Output = Result<Vec<bool>>> + Send
+    where
+        Self: Sized,
+    {
+        async move {
+            let mut results = Vec::with_capacity(oids.len());
+            for oid in oids {
+                results.push(self.has_object(repo, oid).await?);
+            }
+            Ok(results)
+        }
     }
 
     /// Classify a ref update as create / delete / fast-forward / force-push.
-    fn compute_push_kind(&self, repo: &Self::Repo, update: &RefUpdate) -> PushKind;
+    fn compute_push_kind(
+        &self,
+        repo: &Self::Repo,
+        update: &RefUpdate,
+    ) -> impl Future<Output = PushKind> + Send;
 
     /// Build a pack containing objects reachable from `want` but not from
     /// `have`.
@@ -220,7 +252,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         want: &[ObjectId],
         have: &[ObjectId],
         opts: &PackOptions,
-    ) -> Result<PackOutput>;
+    ) -> impl Future<Output = Result<PackOutput>> + Send;
 
     /// Index a staged pack file into the repository's object store.
     /// Returns `None` if the pack contained no objects.
@@ -228,14 +260,17 @@ pub trait StorageBackend: Send + Sync + 'static {
         &self,
         repo: &Self::Repo,
         staged_pack: &Path,
-    ) -> Result<Option<Self::IngestedPack>>;
+    ) -> impl Future<Output = Result<Option<Self::IngestedPack>>> + Send;
 
     /// Inspect an ingested pack and extract metadata (object types, commit
     /// signatures, etc.) for auth decisions.
-    fn inspect_ingested(&self, pack: &Self::IngestedPack) -> Result<PackMetadata>;
+    fn inspect_ingested(
+        &self,
+        pack: &Self::IngestedPack,
+    ) -> impl Future<Output = Result<PackMetadata>> + Send;
 
     /// Roll back a previously ingested pack (e.g. on auth failure).
-    fn rollback_ingest(&self, pack: Self::IngestedPack);
+    fn rollback_ingest(&self, pack: Self::IngestedPack) -> impl Future<Output = ()> + Send;
 
     /// Walk commits reachable from `from`, stopping at any commit reachable
     /// from `excluding`.  Returns oids in parent-first topological order.
@@ -244,7 +279,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     /// pre-existing refs and earlier same-push refs) and
     /// `Comparison::dropped_commits` (walk from old tip excluding new tip).
     ///
-    /// Returns [`ReachableLimitExceeded`] if the walk hits `cap` before
+    /// Returns [`ReachableError::CapExceeded`] if the walk hits `cap` before
     /// terminating.  Implementations must observe the cap as a hard ceiling.
     fn reachable_excluding(
         &self,
@@ -252,7 +287,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         from: &[ObjectId],
         excluding: &[ObjectId],
         cap: usize,
-    ) -> Result<Vec<ObjectId>, ReachableError>;
+    ) -> impl Future<Output = Result<Vec<ObjectId>, ReachableError>> + Send;
 
     /// Compute the path-level diff between two trees.
     ///
@@ -263,17 +298,26 @@ pub trait StorageBackend: Send + Sync + 'static {
         repo: &Self::Repo,
         parent_tree: Option<ObjectId>,
         child_tree: ObjectId,
-    ) -> Result<RefDiff>;
+    ) -> impl Future<Output = Result<RefDiff>> + Send;
 
     /// Read commit metadata for a commit already in the repository (used by
     /// `Comparison::dropped_commits`, since dropped commits are not in the
     /// staged pack).
-    fn read_commit_info(&self, repo: &Self::Repo, oid: ObjectId) -> Result<CommitInfo>;
+    fn read_commit_info(
+        &self,
+        repo: &Self::Repo,
+        oid: ObjectId,
+    ) -> impl Future<Output = Result<CommitInfo>> + Send;
 
     /// Read raw blob bytes, capped at `cap`.  Returns `Ok(None)` if the blob
     /// is larger than the cap, not found, or the OID points at a non-blob
     /// object (commit, tree, tag).
-    fn read_blob(&self, repo: &Self::Repo, oid: ObjectId, cap: u64) -> Result<Option<Vec<u8>>>;
+    fn read_blob(
+        &self,
+        repo: &Self::Repo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
 
     /// Read raw object bytes regardless of kind, capped at `cap`.  Returns
     /// `Ok(None)` if the object is larger than the cap or not found.
@@ -288,7 +332,7 @@ pub trait StorageBackend: Send + Sync + 'static {
         repo: &Self::Repo,
         oid: ObjectId,
         cap: u64,
-    ) -> Result<Option<Vec<u8>>>;
+    ) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
 }
 
 /// Error type for [`StorageBackend::reachable_excluding`].

@@ -30,35 +30,34 @@ fn null_oid() -> ObjectId {
 /// Currently **fails** on FsGitoxide: `PreviousValue::Any` accepts any value.
 /// Passes on FsGitCli: `git update-ref` enforces CAS under the per-ref lock.
 fn scenario_stale_oid_rejected<B: StorageBackend<RepoId = PathBuf>>(backend: B) {
+    use futures_lite::future::block_on;
+
     let repo_tmp = common::temprepo().unwrap();
     let bare = repo_tmp.path();
-    let repo = backend.open(&bare).unwrap();
+    let repo = block_on(backend.open(&bare)).unwrap();
 
-    let main_oid = backend
-        .resolve_ref(&repo, "refs/heads/main")
+    let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
         .unwrap()
         .unwrap();
-    let dev_oid = backend
-        .resolve_ref(&repo, "refs/heads/dev")
+    let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
         .unwrap()
         .unwrap();
 
     // Claim old_oid = dev_oid, but main actually points to main_oid.
-    let result = backend.update_refs(
+    let result = block_on(backend.update_refs(
         &repo,
         &[RefUpdate {
             old_oid: dev_oid,
             new_oid: dev_oid,
             refname: "refs/heads/main".to_string(),
         }],
-    );
+    ));
     assert!(
         result.is_err(),
         "update_refs with wrong old_oid must fail; main is at {main_oid}, claimed {dev_oid}"
     );
 
-    let after = backend
-        .resolve_ref(&repo, "refs/heads/main")
+    let after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
         .unwrap()
         .unwrap();
     assert_eq!(
@@ -74,23 +73,23 @@ fn scenario_stale_oid_rejected<B: StorageBackend<RepoId = PathBuf>>(backend: B) 
 /// before the second fails, leaving the repo in a partial state.
 /// Passes on FsGitCli: `git update-ref --stdin` is a single transaction.
 fn scenario_multi_ref_atomicity<B: StorageBackend<RepoId = PathBuf>>(backend: B) {
+    use futures_lite::future::block_on;
+
     let repo_tmp = common::temprepo().unwrap();
     let bare = repo_tmp.path();
-    let repo = backend.open(&bare).unwrap();
+    let repo = block_on(backend.open(&bare)).unwrap();
 
-    let main_oid = backend
-        .resolve_ref(&repo, "refs/heads/main")
+    let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
         .unwrap()
         .unwrap();
-    let dev_oid = backend
-        .resolve_ref(&repo, "refs/heads/dev")
+    let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
         .unwrap()
         .unwrap();
 
     // Batch of two edits:
     //   1. Create refs/heads/feature → dev_oid  (valid)
     //   2. Update refs/heads/main: dev_oid → dev_oid  (stale; main is at main_oid)
-    let result = backend.update_refs(
+    let result = block_on(backend.update_refs(
         &repo,
         &[
             RefUpdate {
@@ -104,16 +103,15 @@ fn scenario_multi_ref_atomicity<B: StorageBackend<RepoId = PathBuf>>(backend: B)
                 refname: "refs/heads/main".to_string(),
             },
         ],
-    );
+    ));
     assert!(result.is_err(), "batch with a stale edit must fail");
 
-    let main_after = backend
-        .resolve_ref(&repo, "refs/heads/main")
+    let main_after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
         .unwrap()
         .unwrap();
     assert_eq!(main_after, main_oid, "main must be unchanged");
 
-    let feature_after = backend.resolve_ref(&repo, "refs/heads/feature").unwrap();
+    let feature_after = block_on(backend.resolve_ref(&repo, "refs/heads/feature")).unwrap();
     assert!(
         feature_after.is_none(),
         "feature must not have been created; got {feature_after:?}"
@@ -144,19 +142,19 @@ where
     B: StorageBackend<RepoId = PathBuf>,
     F: Fn() -> B + Sync,
 {
+    use futures_lite::future::block_on;
+
     const RACERS: usize = 8;
 
     let repo_tmp = common::temprepo().unwrap();
     let bare = repo_tmp.path();
 
     let setup_backend = make_backend();
-    let setup_repo = setup_backend.open(&bare).unwrap();
-    let main_oid = setup_backend
-        .resolve_ref(&setup_repo, "refs/heads/main")
+    let setup_repo = block_on(setup_backend.open(&bare)).unwrap();
+    let main_oid = block_on(setup_backend.resolve_ref(&setup_repo, "refs/heads/main"))
         .unwrap()
         .unwrap();
-    let dev_oid = setup_backend
-        .resolve_ref(&setup_repo, "refs/heads/dev")
+    let dev_oid = block_on(setup_backend.resolve_ref(&setup_repo, "refs/heads/dev"))
         .unwrap()
         .unwrap();
     drop(setup_repo);
@@ -170,15 +168,15 @@ where
             handles.push(s.spawn(|| {
                 barrier.wait();
                 let backend = make_backend();
-                let repo = backend.open(&bare).unwrap();
-                let result = backend.update_refs(
+                let repo = block_on(backend.open(&bare)).unwrap();
+                let result = block_on(backend.update_refs(
                     &repo,
                     &[RefUpdate {
                         old_oid: main_oid,
                         new_oid: dev_oid,
                         refname: "refs/heads/main".to_string(),
                     }],
-                );
+                ));
                 if result.is_ok() {
                     *successes.lock().unwrap() += 1;
                 }

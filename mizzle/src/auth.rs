@@ -19,6 +19,14 @@ use crate::backend::{PackMetadata, ReachableError, StorageBackend};
 use crate::sigverify;
 use crate::traits::RepoAccess;
 
+/// Bridge an async [`StorageBackend`] call from within a sync
+/// [`Comparison`] method.  Uses [`tokio::task::block_in_place`] so the
+/// current worker thread temporarily becomes a blocking thread, then
+/// runs the future on the existing runtime.
+fn block_on_backend<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
 /// Configurable caps for [`Comparison`] accessors.
 ///
 /// Forges that need different caps construct their own `ComparisonOptions`
@@ -242,21 +250,19 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
                 }
             }
 
-            let oids = self
-                .backend
-                .reachable_excluding(
-                    self.repo,
-                    &from,
-                    &excluding,
-                    self.opts.max_reachable_commits,
-                )
-                .map_err(|e| match e {
-                    ReachableError::CapExceeded { limit } => ComparisonError::CapExceeded {
-                        what: "new_commits walk",
-                        limit,
-                    },
-                    ReachableError::Other(e) => ComparisonError::Backend(format!("{e:#}")),
-                })?;
+            let oids = block_on_backend(self.backend.reachable_excluding(
+                self.repo,
+                &from,
+                &excluding,
+                self.opts.max_reachable_commits,
+            ))
+            .map_err(|e| match e {
+                ReachableError::CapExceeded { limit } => ComparisonError::CapExceeded {
+                    what: "new_commits walk",
+                    limit,
+                },
+                ReachableError::Other(e) => ComparisonError::Backend(format!("{e:#}")),
+            })?;
 
             // Prefer the staged-pack metadata (already parsed) and fall back
             // to a backend read for OIDs that exist in the ODB but were not
@@ -269,9 +275,7 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
             for oid in oids {
                 let info = match self.pack.find_commit(&oid) {
                     Some(c) => c.clone(),
-                    None => self
-                        .backend
-                        .read_commit_info(self.repo, oid)
+                    None => block_on_backend(self.backend.read_commit_info(self.repo, oid))
                         .map_err(|e| ComparisonError::Backend(format!("{e:#}")))?,
                 };
                 out.push(info);
@@ -302,27 +306,23 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
                 vec![r.new_oid]
             };
 
-            let oids = self
-                .backend
-                .reachable_excluding(
-                    self.repo,
-                    &from,
-                    &excluding,
-                    self.opts.max_reachable_commits,
-                )
-                .map_err(|e| match e {
-                    ReachableError::CapExceeded { limit } => ComparisonError::CapExceeded {
-                        what: "dropped_commits walk",
-                        limit,
-                    },
-                    ReachableError::Other(e) => ComparisonError::Backend(format!("{e:#}")),
-                })?;
+            let oids = block_on_backend(self.backend.reachable_excluding(
+                self.repo,
+                &from,
+                &excluding,
+                self.opts.max_reachable_commits,
+            ))
+            .map_err(|e| match e {
+                ReachableError::CapExceeded { limit } => ComparisonError::CapExceeded {
+                    what: "dropped_commits walk",
+                    limit,
+                },
+                ReachableError::Other(e) => ComparisonError::Backend(format!("{e:#}")),
+            })?;
 
             let mut out = Vec::with_capacity(oids.len());
             for oid in oids {
-                let info = self
-                    .backend
-                    .read_commit_info(self.repo, oid)
+                let info = block_on_backend(self.backend.read_commit_info(self.repo, oid))
                     .map_err(|e| ComparisonError::Backend(format!("{e:#}")))?;
                 out.push(info);
             }
@@ -344,18 +344,14 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
             // is from old tree to None — modelled as flipped lhs/rhs.
             if r.new_oid.is_null() {
                 // Delete: child is the empty tree, lhs is the old commit's tree.
-                let old = self
-                    .backend
-                    .read_commit_info(self.repo, r.old_oid)
+                let old = block_on_backend(self.backend.read_commit_info(self.repo, r.old_oid))
                     .map_err(|e| ComparisonError::Backend(format!("{e:#}")))?;
-                return self
-                    .backend
-                    .tree_diff(
-                        self.repo,
-                        Some(old.tree),
-                        ObjectId::empty_tree(gix_hash::Kind::Sha1),
-                    )
-                    .map_err(|e| ComparisonError::Backend(format!("{e:#}")));
+                return block_on_backend(self.backend.tree_diff(
+                    self.repo,
+                    Some(old.tree),
+                    ObjectId::empty_tree(gix_hash::Kind::Sha1),
+                ))
+                .map_err(|e| ComparisonError::Backend(format!("{e:#}")));
             }
 
             let new_tree = self
@@ -364,8 +360,7 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
                 .map(|c| c.tree)
                 .or_else(|| {
                     // Maybe new tip is already in the repo and not in the pack.
-                    self.backend
-                        .read_commit_info(self.repo, r.new_oid)
+                    block_on_backend(self.backend.read_commit_info(self.repo, r.new_oid))
                         .ok()
                         .map(|c| c.tree)
                 })
@@ -376,15 +371,12 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
             let parent_tree = if r.old_oid.is_null() {
                 None
             } else {
-                let old = self
-                    .backend
-                    .read_commit_info(self.repo, r.old_oid)
+                let old = block_on_backend(self.backend.read_commit_info(self.repo, r.old_oid))
                     .map_err(|e| ComparisonError::Backend(format!("{e:#}")))?;
                 Some(old.tree)
             };
 
-            self.backend
-                .tree_diff(self.repo, parent_tree, new_tree)
+            block_on_backend(self.backend.tree_diff(self.repo, parent_tree, new_tree))
                 .map_err(|e| ComparisonError::Backend(format!("{e:#}")))
         });
 
@@ -404,10 +396,11 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
             Some(blob) => {
                 // Re-read the raw commit object to reconstruct the canonical
                 // signed payload (object bytes minus the gpgsig header).
-                let raw = match self
-                    .backend
-                    .read_object_raw(self.repo, c.oid, 16 * 1024 * 1024)
-                {
+                let raw = match block_on_backend(self.backend.read_object_raw(
+                    self.repo,
+                    c.oid,
+                    16 * 1024 * 1024,
+                )) {
                     Ok(Some(b)) => b,
                     _ => {
                         return VerificationStatus::BadSignature;
@@ -433,10 +426,11 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
         }
         let status = match (&t.signature, &t.tagger) {
             (Some(blob), Some(tagger)) => {
-                let raw = match self
-                    .backend
-                    .read_object_raw(self.repo, t.oid, 16 * 1024 * 1024)
-                {
+                let raw = match block_on_backend(self.backend.read_object_raw(
+                    self.repo,
+                    t.oid,
+                    16 * 1024 * 1024,
+                )) {
                     Ok(Some(b)) => b,
                     _ => return VerificationStatus::BadSignature,
                 };
@@ -450,7 +444,9 @@ impl<'a, A: RepoAccess + ?Sized, B: StorageBackend> Comparison<'a>
     }
 
     fn read_blob(&self, oid: ObjectId, cap: u64) -> Option<Vec<u8>> {
-        self.backend.read_blob(self.repo, oid, cap).ok().flatten()
+        block_on_backend(self.backend.read_blob(self.repo, oid, cap))
+            .ok()
+            .flatten()
     }
 
     fn pack_metadata(&self) -> &PackMetadata {

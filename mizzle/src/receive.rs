@@ -59,6 +59,7 @@ pub async fn update_refs_and_report<B: StorageBackend>(
 ) -> Result<()> {
     backend
         .update_refs(repo, ref_updates)
+        .await
         .context("updating refs")?;
 
     text_to_write(b"unpack ok", &mut *writer).await?;
