@@ -32,6 +32,7 @@ use crate::traits::PushKind;
 ///
 /// `RepoId` is [`PathBuf`] for test-harness compatibility — the path has no
 /// filesystem meaning; it is a unique key in the `repositories` table.
+#[derive(Clone)]
 pub struct SqlBackend {
     pool: SqlitePool,
     /// Directory for cached pack files (see Phase 6).
