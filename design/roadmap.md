@@ -122,13 +122,26 @@ After this phase every subsequent backend gets full coverage for free.
 libfuzzer/AFL harness over the protocol parsing layer. Seed corpus from
 traffic captures. Run against a minimal in-memory stub.
 
-### Phase 8 — SQL backend (PoC)
+### Phase 7.1 — Async `StorageBackend` migration
 
-SQLite first, then Postgres. Schema:
-- `objects(repo, oid, type, data)`
-- `refs(repo, name, oid)`
-- `commit_parents(repo, commit_oid, parent_oid)` — materialised for
-  graph traversal
+Standalone MR.  Convert all `StorageBackend` methods to
+`-> impl Future<…> + Send`.  Filesystem backends wrap CPU-bound work
+in `spawn_blocking`.  Fix `stream_pack_sideband` blocking read.
+`Comparison` trait goes async.  See
+[sql-backend-plan.md](sql-backend-plan.md) Phase 0 for full scope.
+
+### Phase 8 — SQL backend
+
+SQLite first (via `sqlx::Sqlite`), then CockroachDB/Postgres.
+Full plan in [sql-backend-plan.md](sql-backend-plan.md).
+
+Schema: `repositories`, `objects`, `refs`, `commit_parents`.
+`build_pack` initially uses a temp gitoxide repo populated from SQL
+— intentionally naive, correctness over performance.  Local
+filesystem pack cache (keyed by want/have sets) covers the cost
+after first build.  Future optimisation: `gix_object::Find` impl
+backed by SQL or an in-memory prefetch, eliminating the temp repo
+round-trip.
 
 The cross-backend harness from Phase 6 immediately validates correctness
 and surfaces performance characteristics.
