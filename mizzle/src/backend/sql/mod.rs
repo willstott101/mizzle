@@ -13,7 +13,7 @@ pub(crate) mod schema;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gix::ObjectId;
 use sqlx::SqlitePool;
 
@@ -31,15 +31,14 @@ use crate::traits::PushKind;
 ///
 /// `RepoId` is [`PathBuf`] for test-harness compatibility — the path has no
 /// filesystem meaning; it is a unique key in the `repositories` table.
-#[allow(dead_code)] // fields used starting in Phase 2
 pub struct SqlBackend {
     pool: SqlitePool,
     /// Directory for cached pack files (see Phase 6).
+    #[allow(dead_code)] // used in Phase 6
     pack_cache_dir: PathBuf,
 }
 
 /// Per-request handle for an opened repository.
-#[allow(dead_code)] // fields used starting in Phase 2
 pub struct SqlRepo {
     pool: SqlitePool,
     /// Row id in the `repositories` table.
@@ -73,7 +72,7 @@ impl SqlBackend {
 }
 
 // ---------------------------------------------------------------------------
-// StorageBackend impl — stubs (filled in Phases 2–6)
+// StorageBackend impl
 // ---------------------------------------------------------------------------
 
 impl StorageBackend for SqlBackend {
@@ -81,44 +80,129 @@ impl StorageBackend for SqlBackend {
     type Repo = SqlRepo;
     type IngestedPack = SqlIngestedPack;
 
-    fn open(&self, _id: &PathBuf) -> impl std::future::Future<Output = Result<SqlRepo>> + Send {
-        async { todo!("Phase 2") }
+    fn open(&self, id: &PathBuf) -> impl std::future::Future<Output = Result<SqlRepo>> + Send {
+        let pool = self.pool.clone();
+        let path = id.to_string_lossy().to_string();
+        async move {
+            let row: Option<(i64,)> = sqlx::query_as("SELECT id FROM repositories WHERE path = ?")
+                .bind(&path)
+                .fetch_optional(&pool)
+                .await
+                .context("looking up repository")?;
+
+            match row {
+                Some((db_id,)) => Ok(SqlRepo {
+                    pool,
+                    repo_db_id: db_id,
+                }),
+                None => anyhow::bail!("{path:?} does not appear to be a git repository"),
+            }
+        }
+    }
+
+    fn init_repo(&self, repo: &PathBuf) -> impl std::future::Future<Output = Result<()>> + Send {
+        let pool = self.pool.clone();
+        let path = repo.to_string_lossy().to_string();
+        async move {
+            sqlx::query("INSERT OR IGNORE INTO repositories (path) VALUES (?)")
+                .bind(&path)
+                .execute(&pool)
+                .await
+                .context("initialising repository")?;
+            Ok(())
+        }
     }
 
     fn list_refs(
         &self,
-        _repo: &SqlRepo,
+        repo: &SqlRepo,
     ) -> impl std::future::Future<Output = Result<RefsSnapshot>> + Send {
-        async { todo!("Phase 2") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { refs::list_refs(&pool, db_id).await }
     }
 
     fn resolve_ref(
         &self,
-        _repo: &SqlRepo,
-        _refname: &str,
+        repo: &SqlRepo,
+        refname: &str,
     ) -> impl std::future::Future<Output = Result<Option<ObjectId>>> + Send {
-        async { todo!("Phase 2") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let refname = refname.to_string();
+        async move { refs::resolve_ref(&pool, db_id, &refname).await }
     }
 
     fn update_refs(
         &self,
-        _repo: &SqlRepo,
-        _updates: &[RefUpdate],
+        repo: &SqlRepo,
+        updates: &[RefUpdate],
     ) -> impl std::future::Future<Output = Result<()>> + Send {
-        async { todo!("Phase 2") }
-    }
-
-    fn init_repo(&self, _repo: &PathBuf) -> impl std::future::Future<Output = Result<()>> + Send {
-        async { todo!("Phase 2") }
+        // Copy the update data into owned tuples so the future is 'static + Send.
+        let owned: Vec<(ObjectId, ObjectId, String)> = updates
+            .iter()
+            .map(|u| (u.old_oid, u.new_oid, u.refname.clone()))
+            .collect();
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { refs::update_refs_owned(&pool, db_id, &owned).await }
     }
 
     fn has_object(
         &self,
-        _repo: &SqlRepo,
-        _oid: &ObjectId,
+        repo: &SqlRepo,
+        oid: &ObjectId,
     ) -> impl std::future::Future<Output = Result<bool>> + Send {
-        async { todo!("Phase 2") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let oid = *oid;
+        async move { objects::has_object(&pool, db_id, &oid).await }
     }
+
+    fn has_objects(
+        &self,
+        repo: &SqlRepo,
+        oids: &[ObjectId],
+    ) -> impl std::future::Future<Output = Result<Vec<bool>>> + Send {
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let oids = oids.to_vec();
+        async move { objects::has_objects(&pool, db_id, &oids).await }
+    }
+
+    fn read_commit_info(
+        &self,
+        repo: &SqlRepo,
+        oid: ObjectId,
+    ) -> impl std::future::Future<Output = Result<CommitInfo>> + Send {
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { objects::read_commit_info(&pool, db_id, oid).await }
+    }
+
+    fn read_blob(
+        &self,
+        repo: &SqlRepo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { objects::read_blob(&pool, db_id, oid, cap).await }
+    }
+
+    fn read_object_raw(
+        &self,
+        repo: &SqlRepo,
+        oid: ObjectId,
+        cap: u64,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { objects::read_object_raw(&pool, db_id, oid, cap).await }
+    }
+
+    // --- Phase 3+ stubs ---
 
     fn compute_push_kind(
         &self,
@@ -178,31 +262,5 @@ impl StorageBackend for SqlBackend {
         _child_tree: ObjectId,
     ) -> impl std::future::Future<Output = Result<RefDiff>> + Send {
         async { todo!("Phase 4") }
-    }
-
-    fn read_commit_info(
-        &self,
-        _repo: &SqlRepo,
-        _oid: ObjectId,
-    ) -> impl std::future::Future<Output = Result<CommitInfo>> + Send {
-        async { todo!("Phase 2") }
-    }
-
-    fn read_blob(
-        &self,
-        _repo: &SqlRepo,
-        _oid: ObjectId,
-        _cap: u64,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
-        async { todo!("Phase 2") }
-    }
-
-    fn read_object_raw(
-        &self,
-        _repo: &SqlRepo,
-        _oid: ObjectId,
-        _cap: u64,
-    ) -> impl std::future::Future<Output = Result<Option<Vec<u8>>>> + Send {
-        async { todo!("Phase 2") }
     }
 }
