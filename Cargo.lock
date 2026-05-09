@@ -3332,6 +3332,7 @@ dependencies = [
  "axum",
  "bstr",
  "criterion",
+ "flate2",
  "form_urlencoded",
  "futures-lite 2.6.1",
  "futures-util",

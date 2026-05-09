@@ -219,16 +219,18 @@ impl StorageBackend for SqlBackend {
         async move { graph::compute_push_kind(&pool, db_id, old_oid, new_oid).await }
     }
 
-    // --- Phase 5+ stubs ---
-
     fn build_pack(
         &self,
-        _repo: &SqlRepo,
-        _want: &[ObjectId],
-        _have: &[ObjectId],
+        repo: &SqlRepo,
+        want: &[ObjectId],
+        have: &[ObjectId],
         _opts: &PackOptions,
     ) -> impl std::future::Future<Output = Result<PackOutput>> + Send {
-        async { todo!("Phase 5") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let want = want.to_vec();
+        let have = have.to_vec();
+        async move { objects::build_pack(&pool, db_id, &want, &have).await }
     }
 
     fn ingest_pack(

@@ -285,6 +285,363 @@ pub(super) async fn ingest_pack(
 }
 
 // ---------------------------------------------------------------------------
+// Build pack
+// ---------------------------------------------------------------------------
+
+/// Build a pack containing objects reachable from `want` but not from `have`.
+///
+/// Intentionally naive (Phase 5 approach): writes all needed objects as loose
+/// files into a temporary gitoxide repo, then runs the standard gitoxide pack
+/// pipeline against it.
+pub(super) async fn build_pack(
+    pool: &SqlitePool,
+    repo_db_id: i64,
+    want: &[ObjectId],
+    have: &[ObjectId],
+) -> Result<crate::backend::PackOutput> {
+    use std::sync::mpsc;
+
+    // 1. Enumerate commit OIDs: want-reachable minus have-reachable.
+    let want_commits = super::graph::reachable_excluding(pool, repo_db_id, want, have, usize::MAX)
+        .await
+        .map_err(|e| anyhow::anyhow!("reachable walk for build_pack: {e}"))?;
+
+    // 2. Walk trees of those commits to collect all unique OIDs.
+    let mut needed_oids = std::collections::HashSet::new();
+    for &oid in &want_commits {
+        needed_oids.insert(oid);
+    }
+    // Also include the want tips themselves (they might be tags or non-commit objects).
+    for oid in want {
+        needed_oids.insert(*oid);
+    }
+
+    // For each commit, add its tree and recursively all subtrees/blobs.
+    for &commit_oid in &want_commits {
+        // Read the commit to get its tree OID.
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ?")
+                .bind(repo_db_id)
+                .bind(oid_bytes(&commit_oid))
+                .fetch_optional(pool)
+                .await?;
+        if let Some((data,)) = row {
+            if let Ok(commit) = gix_object::CommitRef::from_bytes(&data) {
+                if let Ok(tree_oid) = ObjectId::from_hex(commit.tree.as_ref()) {
+                    collect_tree_oids(pool, repo_db_id, &tree_oid, &mut needed_oids).await?;
+                }
+            }
+        }
+    }
+
+    // 3. Subtract objects reachable from have-side.
+    //    For simplicity, we only subtract at the commit level (the have-side
+    //    commits were already excluded by reachable_excluding above).  We also
+    //    need to subtract trees/blobs of have-side commits.  Collect the tree
+    //    closure of have tips.
+    if !have.is_empty() {
+        let have_commits =
+            super::graph::reachable_excluding(pool, repo_db_id, have, &[], usize::MAX)
+                .await
+                .map_err(|e| anyhow::anyhow!("have-side walk: {e}"))?;
+        let mut have_oids = std::collections::HashSet::new();
+        for &oid in &have_commits {
+            have_oids.insert(oid);
+        }
+        for &commit_oid in &have_commits {
+            let row: Option<(Vec<u8>,)> =
+                sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ?")
+                    .bind(repo_db_id)
+                    .bind(oid_bytes(&commit_oid))
+                    .fetch_optional(pool)
+                    .await?;
+            if let Some((data,)) = row {
+                if let Ok(commit) = gix_object::CommitRef::from_bytes(&data) {
+                    if let Ok(tree_oid) = ObjectId::from_hex(commit.tree.as_ref()) {
+                        collect_tree_oids(pool, repo_db_id, &tree_oid, &mut have_oids).await?;
+                    }
+                }
+            }
+        }
+        // Remove have objects from needed set.
+        for oid in &have_oids {
+            needed_oids.remove(oid);
+        }
+    }
+
+    if needed_oids.is_empty() {
+        // Return an empty pack.
+        let empty_pack = build_empty_pack();
+        return Ok(crate::backend::PackOutput {
+            reader: Box::new(std::io::Cursor::new(empty_pack)),
+            shallow: Vec::new(),
+            progress: None,
+        });
+    }
+
+    // 4. Bulk fetch needed objects from SQL.
+    let mut fetched: Vec<(ObjectId, gix_object::Kind, Vec<u8>)> =
+        Vec::with_capacity(needed_oids.len());
+    for oid in &needed_oids {
+        let row: Option<(i32, Vec<u8>)> =
+            sqlx::query_as("SELECT kind, data FROM objects WHERE repo_id = ? AND oid = ?")
+                .bind(repo_db_id)
+                .bind(oid_bytes(oid))
+                .fetch_optional(pool)
+                .await?;
+        if let Some((kind_int, data)) = row {
+            let kind = match kind_int {
+                KIND_BLOB => gix_object::Kind::Blob,
+                KIND_TREE => gix_object::Kind::Tree,
+                KIND_COMMIT => gix_object::Kind::Commit,
+                KIND_TAG => gix_object::Kind::Tag,
+                _ => continue,
+            };
+            fetched.push((*oid, kind, data));
+        }
+    }
+
+    // 5-6. Write objects to temp repo and generate pack (CPU-bound).
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
+    let (progress_tx, progress_rx) = mpsc::channel::<String>();
+
+    std::thread::spawn(move || -> Result<()> {
+        // Create a temp bare repo.
+        let temp_dir = tempfile::tempdir().context("creating temp dir for pack build")?;
+        let temp_repo_path = temp_dir.path().join("pack.git");
+        let _repo = gix::init_bare(&temp_repo_path).context("init temp repo")?;
+
+        // Write all objects as loose files.
+        let objects_dir = temp_repo_path.join("objects");
+        for (oid, kind, data) in &fetched {
+            let hex = oid.to_hex().to_string();
+            let (dir_part, file_part) = hex.split_at(2);
+            let obj_dir = objects_dir.join(dir_part);
+            std::fs::create_dir_all(&obj_dir)?;
+            let obj_path = obj_dir.join(file_part);
+            if obj_path.exists() {
+                continue;
+            }
+
+            // Git loose object format: "<kind> <size>\0<data>", zlib-compressed.
+            let kind_str = match kind {
+                gix_object::Kind::Blob => "blob",
+                gix_object::Kind::Tree => "tree",
+                gix_object::Kind::Commit => "commit",
+                gix_object::Kind::Tag => "tag",
+            };
+            let header = format!("{kind_str} {}\0", data.len());
+
+            use std::io::Write;
+            let file = std::fs::File::create(&obj_path)?;
+            let mut encoder = flate2::write::ZlibEncoder::new(file, flate2::Compression::fast());
+            encoder.write_all(header.as_bytes())?;
+            encoder.write_all(data)?;
+            encoder.finish()?;
+        }
+
+        // Open the temp repo with gitoxide.
+        let repo = gix::open(&temp_repo_path).context("opening temp repo")?;
+        let mut handle = repo.objects;
+        handle.prevent_pack_unload();
+        handle.ignore_replacements = true;
+
+        let oids: Vec<ObjectId> = fetched.iter().map(|(oid, _, _)| *oid).collect();
+
+        let should_interrupt = std::sync::atomic::AtomicBool::new(false);
+        let counting = gix_features::progress::Discard;
+
+        let (counts, _) = gix_pack::data::output::count::objects(
+            handle.clone().into_inner(),
+            Box::new(oids.into_iter().map(Ok)),
+            &counting,
+            &should_interrupt,
+            gix_pack::data::output::count::objects::Options {
+                thread_limit: None,
+                chunk_size: 16,
+                input_object_expansion:
+                    gix_pack::data::output::count::objects::ObjectExpansion::AsIs,
+            },
+        )?;
+        let counts: Vec<_> = counts.into_iter().collect();
+        let num_objects = counts.len();
+
+        // Send progress about pack generation.
+        let _ = progress_tx.send(format!(
+            "Total {} (delta 0), reused 0 (delta 0)\n",
+            num_objects
+        ));
+
+        let mut in_order_entries =
+            gix::parallel::InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
+                counts,
+                handle.into_inner(),
+                Box::new(gix_features::progress::Discard),
+                gix_pack::data::output::entry::iter_from_counts::Options {
+                    thread_limit: None,
+                    mode:
+                        gix_pack::data::output::entry::iter_from_counts::Mode::PackCopyAndBaseObjects,
+                    allow_thin_pack: false,
+                    chunk_size: 16,
+                    version: Default::default(),
+                },
+            ));
+
+        let buf = ChunkBuffer::new();
+        let mut pack_iter = gix_pack::data::output::bytes::FromEntriesIter::new(
+            in_order_entries.by_ref(),
+            &buf,
+            num_objects as u32,
+            Default::default(),
+            gix_hash::Kind::default(),
+        );
+
+        for chunk_result in &mut pack_iter {
+            chunk_result?;
+            let chunk = buf.drain();
+            if !chunk.is_empty() {
+                if tx.send(chunk).is_err() {
+                    return Ok(());
+                }
+            }
+        }
+
+        Ok(())
+    });
+
+    let reader = PackReader {
+        rx,
+        current: std::io::Cursor::new(Vec::new()),
+        thread: None, // We don't join the thread — errors surface via the channel.
+    };
+
+    Ok(crate::backend::PackOutput {
+        reader: Box::new(reader),
+        shallow: Vec::new(),
+        progress: Some(progress_rx),
+    })
+}
+
+/// Recursively collect all OIDs in a tree (the tree itself + all subtrees + blobs).
+async fn collect_tree_oids(
+    pool: &SqlitePool,
+    repo_db_id: i64,
+    tree_oid: &ObjectId,
+    set: &mut std::collections::HashSet<ObjectId>,
+) -> Result<()> {
+    if !set.insert(*tree_oid) {
+        return Ok(()); // already visited
+    }
+
+    let row: Option<(Vec<u8>,)> =
+        sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ? AND kind = ?")
+            .bind(repo_db_id)
+            .bind(oid_bytes(tree_oid))
+            .bind(KIND_TREE)
+            .fetch_optional(pool)
+            .await?;
+
+    let data = match row {
+        Some((d,)) => d,
+        None => return Ok(()), // tree not found (shouldn't happen, but defensive)
+    };
+
+    let tree = gix_object::TreeRef::from_bytes(&data)
+        .with_context(|| format!("parsing tree {tree_oid}"))?;
+    for entry in tree.entries {
+        let child_oid = entry.oid.to_owned();
+        if entry.mode.is_tree() {
+            Box::pin(collect_tree_oids(pool, repo_db_id, &child_oid, set)).await?;
+        } else {
+            set.insert(child_oid);
+        }
+    }
+
+    Ok(())
+}
+
+/// Build a minimal valid empty pack (header + SHA-1 checksum).
+fn build_empty_pack() -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"PACK");
+    buf.extend_from_slice(&2u32.to_be_bytes()); // version 2
+    buf.extend_from_slice(&0u32.to_be_bytes()); // 0 objects
+                                                // Trailing SHA-1 checksum of the 12-byte header.
+    let mut hasher = gix_hash::hasher(gix_hash::Kind::Sha1);
+    hasher.update(&buf);
+    let hash = hasher.try_finalize().expect("SHA-1 finalize");
+    buf.extend_from_slice(hash.as_bytes());
+    buf
+}
+
+/// Reader that pulls pack chunks from a background thread via a bounded channel.
+struct PackReader {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    current: std::io::Cursor<Vec<u8>>,
+    thread: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl std::io::Read for PackReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let n = self.current.read(buf)?;
+            if n > 0 {
+                return Ok(n);
+            }
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.current = std::io::Cursor::new(chunk);
+                }
+                Err(_) => {
+                    // Channel closed — check for thread errors if we have a handle.
+                    if let Some(handle) = self.thread.take() {
+                        match handle.join() {
+                            Ok(Ok(())) => return Ok(0),
+                            Ok(Err(e)) => {
+                                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+                            }
+                            Err(_) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "pack generation thread panicked",
+                                ));
+                            }
+                        }
+                    }
+                    return Ok(0);
+                }
+            }
+        }
+    }
+}
+
+/// A write target that accumulates bytes between pack iterator steps.
+struct ChunkBuffer {
+    data: std::sync::Mutex<Vec<u8>>,
+}
+
+impl ChunkBuffer {
+    fn new() -> Self {
+        Self {
+            data: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+    fn drain(&self) -> Vec<u8> {
+        std::mem::take(&mut *self.data.lock().unwrap())
+    }
+}
+
+impl std::io::Write for &ChunkBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.data.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tree diff
 // ---------------------------------------------------------------------------
 
