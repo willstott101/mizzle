@@ -231,7 +231,8 @@ impl StorageBackend for SqlBackend {
         let db_id = repo.repo_db_id;
         let want = want.to_vec();
         let have = have.to_vec();
-        async move { objects::build_pack(&pool, db_id, &want, &have).await }
+        let cache_dir = self.pack_cache_dir.clone();
+        async move { objects::build_pack(&pool, db_id, &want, &have, &cache_dir).await }
     }
 
     fn ingest_pack(

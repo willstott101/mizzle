@@ -288,18 +288,94 @@ pub(super) async fn ingest_pack(
 // Build pack
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pack cache
+// ---------------------------------------------------------------------------
+
+/// Compute a deterministic cache key from wants and haves.
+///
+/// `SHA-256(sorted_wants || 0x00 || sorted_haves)` as a hex string.
+fn pack_cache_key(repo_db_id: i64, want: &[ObjectId], have: &[ObjectId]) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(repo_db_id.to_le_bytes());
+
+    let mut sorted_wants: Vec<_> = want.to_vec();
+    sorted_wants.sort();
+    for oid in &sorted_wants {
+        hasher.update(oid.as_bytes());
+    }
+
+    hasher.update([0x00]);
+
+    let mut sorted_haves: Vec<_> = have.to_vec();
+    sorted_haves.sort();
+    for oid in &sorted_haves {
+        hasher.update(oid.as_bytes());
+    }
+
+    format!("{:x}", hasher.finalize())
+}
+
+/// Try to serve a pack from cache.  Returns `Some(PackOutput)` on cache hit.
+fn try_cache_hit(
+    pack_cache_dir: &std::path::Path,
+    repo_db_id: i64,
+    want: &[ObjectId],
+    have: &[ObjectId],
+) -> Option<crate::backend::PackOutput> {
+    let key = pack_cache_key(repo_db_id, want, have);
+    let cache_path = pack_cache_dir
+        .join(repo_db_id.to_string())
+        .join(format!("{key}.pack"));
+
+    if cache_path.exists() {
+        let file = std::fs::File::open(&cache_path).ok()?;
+        Some(crate::backend::PackOutput {
+            reader: Box::new(std::io::BufReader::new(file)),
+            shallow: Vec::new(),
+            progress: None,
+        })
+    } else {
+        None
+    }
+}
+
+/// Write pack bytes to the cache.  Best-effort — errors are silently ignored.
+fn write_to_cache(
+    pack_cache_dir: &std::path::Path,
+    repo_db_id: i64,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    data: &[u8],
+) {
+    let key = pack_cache_key(repo_db_id, want, have);
+    let dir = pack_cache_dir.join(repo_db_id.to_string());
+    let _ = std::fs::create_dir_all(&dir);
+    let cache_path = dir.join(format!("{key}.pack"));
+    let _ = std::fs::write(&cache_path, data);
+}
+
+// ---------------------------------------------------------------------------
+// Build pack
+// ---------------------------------------------------------------------------
+
 /// Build a pack containing objects reachable from `want` but not from `have`.
 ///
-/// Intentionally naive (Phase 5 approach): writes all needed objects as loose
-/// files into a temporary gitoxide repo, then runs the standard gitoxide pack
-/// pipeline against it.
+/// Checks the local filesystem pack cache first.  On miss, builds via a
+/// temporary gitoxide repo (Phase 5 approach) and caches the result.
 pub(super) async fn build_pack(
     pool: &SqlitePool,
     repo_db_id: i64,
     want: &[ObjectId],
     have: &[ObjectId],
+    pack_cache_dir: &std::path::Path,
 ) -> Result<crate::backend::PackOutput> {
-    use std::sync::mpsc;
+    // Phase 6: check cache.
+    if let Some(output) = try_cache_hit(pack_cache_dir, repo_db_id, want, have) {
+        return Ok(output);
+    }
 
     // 1. Enumerate commit OIDs: want-reachable minus have-reachable.
     let want_commits = super::graph::reachable_excluding(pool, repo_db_id, want, have, usize::MAX)
@@ -370,8 +446,8 @@ pub(super) async fn build_pack(
     }
 
     if needed_oids.is_empty() {
-        // Return an empty pack.
         let empty_pack = build_empty_pack();
+        write_to_cache(pack_cache_dir, repo_db_id, want, have, &empty_pack);
         return Ok(crate::backend::PackOutput {
             reader: Box::new(std::io::Cursor::new(empty_pack)),
             shallow: Vec::new(),
@@ -402,10 +478,11 @@ pub(super) async fn build_pack(
     }
 
     // 5-6. Write objects to temp repo and generate pack (CPU-bound).
-    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(4);
-    let (progress_tx, progress_rx) = mpsc::channel::<String>();
+    let cache_dir = pack_cache_dir.to_path_buf();
+    let want_owned = want.to_vec();
+    let have_owned = have.to_vec();
 
-    std::thread::spawn(move || -> Result<()> {
+    let pack_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         // Create a temp bare repo.
         let temp_dir = tempfile::tempdir().context("creating temp dir for pack build")?;
         let temp_repo_path = temp_dir.path().join("pack.git");
@@ -423,7 +500,6 @@ pub(super) async fn build_pack(
                 continue;
             }
 
-            // Git loose object format: "<kind> <size>\0<data>", zlib-compressed.
             let kind_str = match kind {
                 gix_object::Kind::Blob => "blob",
                 gix_object::Kind::Tree => "tree",
@@ -440,7 +516,7 @@ pub(super) async fn build_pack(
             encoder.finish()?;
         }
 
-        // Open the temp repo with gitoxide.
+        // Open the temp repo with gitoxide and generate the pack.
         let repo = gix::open(&temp_repo_path).context("opening temp repo")?;
         let mut handle = repo.objects;
         handle.prevent_pack_unload();
@@ -449,12 +525,11 @@ pub(super) async fn build_pack(
         let oids: Vec<ObjectId> = fetched.iter().map(|(oid, _, _)| *oid).collect();
 
         let should_interrupt = std::sync::atomic::AtomicBool::new(false);
-        let counting = gix_features::progress::Discard;
 
         let (counts, _) = gix_pack::data::output::count::objects(
             handle.clone().into_inner(),
             Box::new(oids.into_iter().map(Ok)),
-            &counting,
+            &gix_features::progress::Discard,
             &should_interrupt,
             gix_pack::data::output::count::objects::Options {
                 thread_limit: None,
@@ -465,12 +540,6 @@ pub(super) async fn build_pack(
         )?;
         let counts: Vec<_> = counts.into_iter().collect();
         let num_objects = counts.len();
-
-        // Send progress about pack generation.
-        let _ = progress_tx.send(format!(
-            "Total {} (delta 0), reused 0 (delta 0)\n",
-            num_objects
-        ));
 
         let mut in_order_entries =
             gix::parallel::InOrderIter::from(gix_pack::data::output::entry::iter_from_counts(
@@ -496,29 +565,25 @@ pub(super) async fn build_pack(
             gix_hash::Kind::default(),
         );
 
+        let mut pack_data = Vec::new();
         for chunk_result in &mut pack_iter {
             chunk_result?;
             let chunk = buf.drain();
-            if !chunk.is_empty() {
-                if tx.send(chunk).is_err() {
-                    return Ok(());
-                }
-            }
+            pack_data.extend_from_slice(&chunk);
         }
 
-        Ok(())
-    });
+        // Write to cache (best-effort).
+        write_to_cache(&cache_dir, repo_db_id, &want_owned, &have_owned, &pack_data);
 
-    let reader = PackReader {
-        rx,
-        current: std::io::Cursor::new(Vec::new()),
-        thread: None, // We don't join the thread — errors surface via the channel.
-    };
+        Ok(pack_data)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("pack build task panicked: {e}"))??;
 
     Ok(crate::backend::PackOutput {
-        reader: Box::new(reader),
+        reader: Box::new(std::io::Cursor::new(pack_bytes)),
         shallow: Vec::new(),
-        progress: Some(progress_rx),
+        progress: None,
     })
 }
 
@@ -572,47 +637,6 @@ fn build_empty_pack() -> Vec<u8> {
     let hash = hasher.try_finalize().expect("SHA-1 finalize");
     buf.extend_from_slice(hash.as_bytes());
     buf
-}
-
-/// Reader that pulls pack chunks from a background thread via a bounded channel.
-struct PackReader {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    current: std::io::Cursor<Vec<u8>>,
-    thread: Option<std::thread::JoinHandle<Result<()>>>,
-}
-
-impl std::io::Read for PackReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let n = self.current.read(buf)?;
-            if n > 0 {
-                return Ok(n);
-            }
-            match self.rx.recv() {
-                Ok(chunk) => {
-                    self.current = std::io::Cursor::new(chunk);
-                }
-                Err(_) => {
-                    // Channel closed — check for thread errors if we have a handle.
-                    if let Some(handle) = self.thread.take() {
-                        match handle.join() {
-                            Ok(Ok(())) => return Ok(0),
-                            Ok(Err(e)) => {
-                                return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                            }
-                            Err(_) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "pack generation thread panicked",
-                                ));
-                            }
-                        }
-                    }
-                    return Ok(0);
-                }
-            }
-        }
-    }
 }
 
 /// A write target that accumulates bytes between pack iterator steps.
