@@ -207,15 +207,19 @@ impl StorageBackend for SqlBackend {
         async move { objects::read_object_raw(&pool, db_id, oid, cap).await }
     }
 
-    // --- Phase 3+ stubs ---
-
     fn compute_push_kind(
         &self,
-        _repo: &SqlRepo,
-        _update: &RefUpdate,
+        repo: &SqlRepo,
+        update: &RefUpdate,
     ) -> impl std::future::Future<Output = PushKind> + Send {
-        async { todo!("Phase 4") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let old_oid = update.old_oid;
+        let new_oid = update.new_oid;
+        async move { graph::compute_push_kind(&pool, db_id, old_oid, new_oid).await }
     }
+
+    // --- Phase 5+ stubs ---
 
     fn build_pack(
         &self,
@@ -271,21 +275,27 @@ impl StorageBackend for SqlBackend {
 
     fn reachable_excluding(
         &self,
-        _repo: &SqlRepo,
-        _from: &[ObjectId],
-        _excluding: &[ObjectId],
-        _cap: usize,
+        repo: &SqlRepo,
+        from: &[ObjectId],
+        excluding: &[ObjectId],
+        cap: usize,
     ) -> impl std::future::Future<Output = std::result::Result<Vec<ObjectId>, ReachableError>> + Send
     {
-        async { todo!("Phase 4") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let from = from.to_vec();
+        let excluding = excluding.to_vec();
+        async move { graph::reachable_excluding(&pool, db_id, &from, &excluding, cap).await }
     }
 
     fn tree_diff(
         &self,
-        _repo: &SqlRepo,
-        _parent_tree: Option<ObjectId>,
-        _child_tree: ObjectId,
+        repo: &SqlRepo,
+        parent_tree: Option<ObjectId>,
+        child_tree: ObjectId,
     ) -> impl std::future::Future<Output = Result<RefDiff>> + Send {
-        async { todo!("Phase 4") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        async move { objects::tree_diff(&pool, db_id, parent_tree, child_tree).await }
     }
 }

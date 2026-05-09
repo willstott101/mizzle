@@ -16,7 +16,7 @@ const KIND_COMMIT: i32 = 2;
 const KIND_TAG: i32 = 3;
 
 /// Return the OID's raw bytes as `&[u8]` for sqlx binding.
-fn oid_bytes(oid: &ObjectId) -> &[u8] {
+pub(super) fn oid_bytes(oid: &ObjectId) -> &[u8] {
     &oid.as_bytes()[..]
 }
 
@@ -282,6 +282,185 @@ pub(super) async fn ingest_pack(
     tx.commit().await.context("committing ingest transaction")?;
 
     Ok(Some((metadata, inserted_oids)))
+}
+
+// ---------------------------------------------------------------------------
+// Tree diff
+// ---------------------------------------------------------------------------
+
+/// Compute the path-level diff between two trees.
+///
+/// Reads tree objects from SQL into an in-memory map, then uses
+/// `gix_diff::tree` with a `Find` impl backed by that map.
+pub(super) async fn tree_diff(
+    pool: &SqlitePool,
+    repo_db_id: i64,
+    parent_tree: Option<ObjectId>,
+    child_tree: ObjectId,
+) -> Result<crate::auth_types::RefDiff> {
+    use crate::auth_types::{RefDiffChange, RefDiffEntry};
+
+    let empty_tree = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+    let lhs = parent_tree.unwrap_or(empty_tree);
+    let rhs = child_tree;
+
+    // Pre-fetch all tree objects reachable from both sides into memory.
+    let mut store = MemObjectStore::new();
+    fetch_trees_recursive(pool, repo_db_id, &lhs, &mut store).await?;
+    fetch_trees_recursive(pool, repo_db_id, &rhs, &mut store).await?;
+
+    // Run the diff synchronously (CPU-bound, but tree diffs are small).
+    tokio::task::spawn_blocking(move || {
+        use gix_diff::tree::{
+            recorder::{Change as RecChange, Location},
+            Recorder,
+        };
+        use gix_object::FindExt;
+
+        let mut buf_l = Vec::new();
+        let mut buf_r = Vec::new();
+        let lhs_iter = store
+            .find_tree_iter(&lhs, &mut buf_l)
+            .with_context(|| format!("reading parent tree {lhs}"))?;
+        let rhs_iter = store
+            .find_tree_iter(&rhs, &mut buf_r)
+            .with_context(|| format!("reading child tree {rhs}"))?;
+
+        let mut state = gix_diff::tree::State::default();
+        let mut recorder = Recorder::default().track_location(Some(Location::Path));
+
+        gix_diff::tree(lhs_iter, rhs_iter, &mut state, &store, &mut recorder)
+            .context("running tree diff")?;
+
+        let mut entries = Vec::with_capacity(recorder.records.len());
+        for rec in recorder.records {
+            entries.push(match rec {
+                RecChange::Addition {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Added,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+                RecChange::Deletion {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Removed,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+                RecChange::Modification {
+                    entry_mode,
+                    oid,
+                    path,
+                    ..
+                } => RefDiffEntry {
+                    path,
+                    change: RefDiffChange::Modified,
+                    mode: u32::from(entry_mode.value()),
+                    oid,
+                },
+            });
+        }
+
+        Ok(crate::auth_types::RefDiff { entries })
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("tree diff task panicked: {e}"))?
+}
+
+/// In-memory object store for tree diff operations.
+struct MemObjectStore {
+    objects: std::collections::HashMap<ObjectId, (gix_object::Kind, Vec<u8>)>,
+}
+
+impl MemObjectStore {
+    fn new() -> Self {
+        Self {
+            objects: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl gix_object::Find for MemObjectStore {
+    fn try_find<'a>(
+        &self,
+        id: &gix_hash::oid,
+        buf: &'a mut Vec<u8>,
+    ) -> Result<Option<gix_object::Data<'a>>, gix_object::find::Error> {
+        let oid = id.to_owned();
+        match self.objects.get(&oid) {
+            Some((kind, data)) => {
+                buf.clear();
+                buf.extend_from_slice(data);
+                Ok(Some(gix_object::Data {
+                    kind: *kind,
+                    data: buf,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+/// Recursively fetch a tree and all its subtrees from SQL into the store.
+async fn fetch_trees_recursive(
+    pool: &SqlitePool,
+    repo_db_id: i64,
+    oid: &ObjectId,
+    store: &mut MemObjectStore,
+) -> Result<()> {
+    // Skip the well-known empty tree (no data in DB).
+    let empty_tree = ObjectId::empty_tree(gix_hash::Kind::Sha1);
+    if *oid == empty_tree {
+        // Insert the empty tree so gix_diff::tree can find it.
+        store
+            .objects
+            .insert(empty_tree, (gix_object::Kind::Tree, Vec::new()));
+        return Ok(());
+    }
+
+    if store.objects.contains_key(oid) {
+        return Ok(());
+    }
+
+    let row: Option<(i32, Vec<u8>)> =
+        sqlx::query_as("SELECT kind, data FROM objects WHERE repo_id = ? AND oid = ?")
+            .bind(repo_db_id)
+            .bind(oid_bytes(oid))
+            .fetch_optional(pool)
+            .await
+            .with_context(|| format!("fetching tree {oid}"))?;
+
+    let (kind_int, data) = row.with_context(|| format!("tree {oid} not found"))?;
+    if kind_int != KIND_TREE {
+        anyhow::bail!("object {oid} is not a tree (kind={kind_int})");
+    }
+
+    store
+        .objects
+        .insert(*oid, (gix_object::Kind::Tree, data.clone()));
+
+    // Parse tree entries and recurse into subtrees.
+    let tree =
+        gix_object::TreeRef::from_bytes(&data).with_context(|| format!("parsing tree {oid}"))?;
+    for entry in tree.entries {
+        if entry.mode.is_tree() {
+            let child_oid = entry.oid.to_owned();
+            // Box the recursive future to avoid infinite-size type.
+            Box::pin(fetch_trees_recursive(pool, repo_db_id, &child_oid, store)).await?;
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
