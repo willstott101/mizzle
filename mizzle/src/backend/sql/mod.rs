@@ -12,6 +12,7 @@ mod refs;
 pub(crate) mod schema;
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use gix::ObjectId;
@@ -46,11 +47,15 @@ pub struct SqlRepo {
 }
 
 /// Opaque handle for an ingested pack, used for rollback on auth failure.
-#[allow(dead_code)] // fields used starting in Phase 3
 pub struct SqlIngestedPack {
-    metadata: PackMetadata,
+    /// Wrapped in `Mutex<Option<…>>` so `inspect_ingested` (which takes `&self`)
+    /// can move the metadata out exactly once.  The protocol never calls
+    /// `inspect_ingested` more than once per ingest.
+    metadata: Mutex<Option<PackMetadata>>,
     /// OIDs inserted during this ingest (for potential rollback).
+    #[allow(dead_code)] // reserved for future GC
     inserted_oids: Vec<ObjectId>,
+    #[allow(dead_code)] // reserved for future GC
     repo_db_id: i64,
 }
 
@@ -224,17 +229,37 @@ impl StorageBackend for SqlBackend {
 
     fn ingest_pack(
         &self,
-        _repo: &SqlRepo,
-        _staged_pack: &Path,
+        repo: &SqlRepo,
+        staged_pack: &Path,
     ) -> impl std::future::Future<Output = Result<Option<SqlIngestedPack>>> + Send {
-        async { todo!("Phase 3") }
+        let pool = repo.pool.clone();
+        let db_id = repo.repo_db_id;
+        let staged = staged_pack.to_path_buf();
+        async move {
+            match objects::ingest_pack(&pool, db_id, &staged).await? {
+                Some((metadata, inserted_oids)) => Ok(Some(SqlIngestedPack {
+                    metadata: Mutex::new(Some(metadata)),
+                    inserted_oids,
+                    repo_db_id: db_id,
+                })),
+                None => Ok(None),
+            }
+        }
     }
 
     fn inspect_ingested(
         &self,
-        _pack: &SqlIngestedPack,
+        pack: &SqlIngestedPack,
     ) -> impl std::future::Future<Output = Result<PackMetadata>> + Send {
-        async { todo!("Phase 3") }
+        // Take the pre-computed metadata out of the Mutex.  The protocol
+        // only calls inspect_ingested once per ingest.
+        let metadata = pack
+            .metadata
+            .lock()
+            .expect("metadata mutex poisoned")
+            .take()
+            .expect("inspect_ingested called more than once");
+        async move { Ok(metadata) }
     }
 
     fn rollback_ingest(
