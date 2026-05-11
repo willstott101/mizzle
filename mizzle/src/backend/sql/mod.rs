@@ -35,8 +35,7 @@ use crate::traits::PushKind;
 #[derive(Clone)]
 pub struct SqlBackend {
     pool: SqlitePool,
-    /// Directory for cached pack files (see Phase 6).
-    #[allow(dead_code)] // used in Phase 6
+    /// Directory for cached pack files.
     pack_cache_dir: PathBuf,
 }
 
@@ -230,14 +229,19 @@ impl StorageBackend for SqlBackend {
         repo: &SqlRepo,
         want: &[ObjectId],
         have: &[ObjectId],
-        _opts: &PackOptions,
+        opts: &PackOptions,
     ) -> impl std::future::Future<Output = Result<PackOutput>> + Send {
         let pool = repo.pool.clone();
         let db_id = repo.repo_db_id;
         let want = want.to_vec();
         let have = have.to_vec();
+        let opts = PackOptions {
+            deepen: opts.deepen,
+            filter: opts.filter.clone(),
+            thin_pack: opts.thin_pack,
+        };
         let cache_dir = self.pack_cache_dir.clone();
-        async move { objects::build_pack(&pool, db_id, &want, &have, &cache_dir).await }
+        async move { objects::build_pack(&pool, db_id, &want, &have, &opts, &cache_dir).await }
     }
 
     fn ingest_pack(

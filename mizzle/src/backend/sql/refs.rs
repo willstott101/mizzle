@@ -40,6 +40,7 @@ pub(super) async fn list_refs(pool: &SqlitePool, repo_db_id: i64) -> Result<Refs
     let mut head = None;
 
     for (name, oid_bytes) in &ref_rows {
+        // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
         let oid = ObjectId::from_bytes_or_panic(oid_bytes);
         refs.push(RefInfo {
             name: name.clone(),
@@ -74,6 +75,7 @@ pub(super) async fn resolve_ref(
             .await
             .context("resolving ref")?;
 
+    // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
     Ok(row.map(|(oid_bytes,)| ObjectId::from_bytes_or_panic(&oid_bytes)))
 }
 

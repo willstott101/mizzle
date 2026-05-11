@@ -58,26 +58,34 @@ pub(super) async fn read_blob(
     oid: ObjectId,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let row: Option<(i32, Vec<u8>)> =
-        sqlx::query_as("SELECT kind, data FROM objects WHERE repo_id = ? AND oid = ?")
+    // Check kind and length without deserialising the data column.
+    let row: Option<(i32, i64)> =
+        sqlx::query_as("SELECT kind, LENGTH(data) FROM objects WHERE repo_id = ? AND oid = ?")
             .bind(repo_db_id)
             .bind(oid_bytes(&oid))
             .fetch_optional(pool)
             .await
-            .context("reading blob")?;
+            .context("reading blob metadata")?;
 
     match row {
-        Some((kind, data)) => {
-            if kind != KIND_BLOB {
+        Some((kind, len)) => {
+            if kind != KIND_BLOB || (len as u64) > cap {
                 return Ok(None);
             }
-            if (data.len() as u64) > cap {
-                return Ok(None);
-            }
-            Ok(Some(data))
         }
-        None => Ok(None),
+        None => return Ok(None),
     }
+
+    // Object exists, is a blob, and fits within cap — fetch the data.
+    let (data,): (Vec<u8>,) =
+        sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ?")
+            .bind(repo_db_id)
+            .bind(oid_bytes(&oid))
+            .fetch_one(pool)
+            .await
+            .context("reading blob data")?;
+
+    Ok(Some(data))
 }
 
 /// Read raw object bytes regardless of kind, capped at `cap`. Returns
@@ -88,23 +96,31 @@ pub(super) async fn read_object_raw(
     oid: ObjectId,
     cap: u64,
 ) -> Result<Option<Vec<u8>>> {
-    let row: Option<(Vec<u8>,)> =
-        sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ?")
+    // Check length without deserialising the data column.
+    let row: Option<(i64,)> =
+        sqlx::query_as("SELECT LENGTH(data) FROM objects WHERE repo_id = ? AND oid = ?")
             .bind(repo_db_id)
             .bind(oid_bytes(&oid))
             .fetch_optional(pool)
             .await
-            .context("reading object")?;
+            .context("reading object length")?;
 
     match row {
-        Some((data,)) => {
-            if (data.len() as u64) > cap {
-                return Ok(None);
-            }
-            Ok(Some(data))
-        }
-        None => Ok(None),
+        Some((len,)) if (len as u64) > cap => return Ok(None),
+        Some(_) => {}
+        None => return Ok(None),
     }
+
+    // Object exists and fits within cap — fetch the data.
+    let (data,): (Vec<u8>,) =
+        sqlx::query_as("SELECT data FROM objects WHERE repo_id = ? AND oid = ?")
+            .bind(repo_db_id)
+            .bind(oid_bytes(&oid))
+            .fetch_one(pool)
+            .await
+            .context("reading object data")?;
+
+    Ok(Some(data))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,7 +247,7 @@ pub(super) async fn ingest_pack(
     let header = {
         let mut file = std::fs::File::open(staged_pack).context("opening staged pack")?;
         let mut buf = [0u8; 12];
-        std::io::Read::read(&mut file, &mut buf).context("reading pack header")?;
+        std::io::Read::read_exact(&mut file, &mut buf).context("reading pack header")?;
         buf
     };
     if mizzle_proto::receive::pack_object_count(&header).unwrap_or(0) == 0 {
@@ -292,10 +308,23 @@ pub(super) async fn ingest_pack(
 // Pack cache
 // ---------------------------------------------------------------------------
 
-/// Compute a deterministic cache key from wants and haves.
+/// Compute a deterministic cache key from wants, haves, and pack options.
 ///
-/// `SHA-256(sorted_wants || 0x00 || sorted_haves)` as a hex string.
-fn pack_cache_key(repo_db_id: i64, want: &[ObjectId], have: &[ObjectId]) -> String {
+/// The key is `SHA-256(repo_id || sorted_wants || 0x00 || sorted_haves || 0x01 || opts)`
+/// as a hex string.
+///
+/// ## Correctness
+///
+/// Git objects are content-addressed: the set of objects reachable from a
+/// fixed set of OIDs is immutable (objects are never mutated, only created or
+/// GC'd).  Including the options in the key ensures that different
+/// filter/deepen/thin_pack settings never share a cached pack.
+fn pack_cache_key(
+    repo_db_id: i64,
+    want: &[ObjectId],
+    have: &[ObjectId],
+    opts: &crate::backend::PackOptions,
+) -> String {
     use sha2::{Digest, Sha256};
 
     let mut hasher = Sha256::new();
@@ -315,6 +344,17 @@ fn pack_cache_key(repo_db_id: i64, want: &[ObjectId], have: &[ObjectId]) -> Stri
         hasher.update(oid.as_bytes());
     }
 
+    // Pack options: deepen depth, filter variant, thin_pack flag.
+    hasher.update([0x01]);
+    hasher.update(opts.deepen.unwrap_or(0).to_le_bytes());
+    let filter_tag: u8 = match &opts.filter {
+        None => 0,
+        Some(crate::backend::Filter::BlobNone) => 1,
+        Some(crate::backend::Filter::TreeNone) => 2,
+    };
+    hasher.update([filter_tag]);
+    hasher.update([opts.thin_pack as u8]);
+
     format!("{:x}", hasher.finalize())
 }
 
@@ -324,8 +364,9 @@ fn try_cache_hit(
     repo_db_id: i64,
     want: &[ObjectId],
     have: &[ObjectId],
+    opts: &crate::backend::PackOptions,
 ) -> Option<crate::backend::PackOutput> {
-    let key = pack_cache_key(repo_db_id, want, have);
+    let key = pack_cache_key(repo_db_id, want, have, opts);
     let cache_path = pack_cache_dir
         .join(repo_db_id.to_string())
         .join(format!("{key}.pack"));
@@ -348,9 +389,10 @@ fn write_to_cache(
     repo_db_id: i64,
     want: &[ObjectId],
     have: &[ObjectId],
+    opts: &crate::backend::PackOptions,
     data: &[u8],
 ) {
-    let key = pack_cache_key(repo_db_id, want, have);
+    let key = pack_cache_key(repo_db_id, want, have, opts);
     let dir = pack_cache_dir.join(repo_db_id.to_string());
     let _ = std::fs::create_dir_all(&dir);
     let cache_path = dir.join(format!("{key}.pack"));
@@ -370,10 +412,11 @@ pub(super) async fn build_pack(
     repo_db_id: i64,
     want: &[ObjectId],
     have: &[ObjectId],
+    opts: &crate::backend::PackOptions,
     pack_cache_dir: &std::path::Path,
 ) -> Result<crate::backend::PackOutput> {
     // Phase 6: check cache.
-    if let Some(output) = try_cache_hit(pack_cache_dir, repo_db_id, want, have) {
+    if let Some(output) = try_cache_hit(pack_cache_dir, repo_db_id, want, have, opts) {
         return Ok(output);
     }
 
@@ -447,7 +490,7 @@ pub(super) async fn build_pack(
 
     if needed_oids.is_empty() {
         let empty_pack = build_empty_pack();
-        write_to_cache(pack_cache_dir, repo_db_id, want, have, &empty_pack);
+        write_to_cache(pack_cache_dir, repo_db_id, want, have, opts, &empty_pack);
         return Ok(crate::backend::PackOutput {
             reader: Box::new(std::io::Cursor::new(empty_pack)),
             shallow: Vec::new(),
@@ -479,8 +522,7 @@ pub(super) async fn build_pack(
 
     // 5-6. Write objects to temp repo and generate pack (CPU-bound).
     let cache_dir = pack_cache_dir.to_path_buf();
-    let want_owned = want.to_vec();
-    let have_owned = have.to_vec();
+    let cache_key = pack_cache_key(repo_db_id, want, have, opts);
 
     let pack_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         // Create a temp bare repo.
@@ -573,7 +615,9 @@ pub(super) async fn build_pack(
         }
 
         // Write to cache (best-effort).
-        write_to_cache(&cache_dir, repo_db_id, &want_owned, &have_owned, &pack_data);
+        let dir = cache_dir.join(repo_db_id.to_string());
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(format!("{cache_key}.pack")), &pack_data);
 
         Ok(pack_data)
     })
