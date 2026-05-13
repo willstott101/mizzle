@@ -6,6 +6,8 @@
 
 pub mod fs_git_cli;
 pub mod fs_gitoxide;
+#[cfg(feature = "sql")]
+pub mod sql;
 
 use std::future::Future;
 use std::path::Path;

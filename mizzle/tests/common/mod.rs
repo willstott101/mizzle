@@ -63,6 +63,27 @@ macro_rules! dual_backend_access_test {
     };
 }
 
+/// Like [`dual_backend_access_test!`] but for the SQL backend only.
+///
+/// The body receives a `SqlBackend`.  A tokio runtime is active for the
+/// duration of the test (required by sqlx).  Gated behind `feature = "sql"`.
+#[cfg(feature = "sql")]
+#[macro_export]
+macro_rules! sql_backend_access_test {
+    ($name:ident, $body:expr) => {
+        paste::paste! {
+            #[test]
+            fn [< $name _sql >]() -> anyhow::Result<()> {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let _guard = rt.enter();
+                let repo_tmp = common::temprepo()?;
+                let backend = common::sql_backend_from_fs(&repo_tmp.path());
+                $body(backend)
+            }
+        }
+    };
+}
+
 pub struct TempRepo {
     dir: TempDir,
 }
@@ -479,6 +500,67 @@ where
 
     ServerHandle::new(port, move || {
         let _ = tx.send(());
+    })
+}
+
+// ---------------------------------------------------------------------------
+// SQL backend test helpers
+// ---------------------------------------------------------------------------
+
+/// Create a [`SqlBackend`] backed by an in-memory SQLite database, pre-populated
+/// with the refs and objects from a filesystem bare repo at `bare_path`.
+///
+/// Finds the existing `.pack` files in the bare repo's `objects/pack/` directory
+/// (already indexed by `git push --mirror`) and ingests them into SQL.
+#[cfg(feature = "sql")]
+pub fn sql_backend_from_fs(bare_path: &FsPath) -> mizzle::backend::sql::SqlBackend {
+    use mizzle::backend::fs_gitoxide::FsGitoxide;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
+        let pack_cache_dir = tempdir().unwrap().keep();
+        let sql = mizzle::backend::sql::SqlBackend::new(pool, pack_cache_dir)
+            .await
+            .unwrap();
+
+        // Register the repo in SQL (using the same path key as the FS repo).
+        sql.init_repo(&bare_path.to_path_buf()).await.unwrap();
+        let sql_repo = sql.open(&bare_path.to_path_buf()).await.unwrap();
+
+        // Ingest all existing pack files from the bare repo.
+        // The temprepo was created by `git push --mirror`, so there's at
+        // least one .pack + .idx pair in objects/pack/.
+        let pack_dir = bare_path.join("objects").join("pack");
+        if pack_dir.exists() {
+            for entry in std::fs::read_dir(&pack_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pack") {
+                    sql.ingest_pack(&sql_repo, &path).await.unwrap();
+                }
+            }
+        }
+
+        // Mirror refs from FS into SQL.
+        let fs = FsGitoxide;
+        let fs_repo = fs.open(&bare_path.to_path_buf()).await.unwrap();
+        let refs_snap = fs.list_refs(&fs_repo).await.unwrap();
+
+        let ref_updates: Vec<mizzle_proto::receive::RefUpdate> = refs_snap
+            .refs
+            .iter()
+            .filter(|r| r.name.starts_with("refs/"))
+            .map(|r| mizzle_proto::receive::RefUpdate {
+                old_oid: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                new_oid: r.oid,
+                refname: r.name.clone(),
+            })
+            .collect();
+        if !ref_updates.is_empty() {
+            sql.update_refs(&sql_repo, &ref_updates).await.unwrap();
+        }
+
+        sql
     })
 }
 

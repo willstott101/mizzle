@@ -203,3 +203,250 @@ fn concurrent_pushes_only_one_wins_gitoxide() {
 fn concurrent_pushes_only_one_wins_git_cli() {
     concurrent_pushes_only_one_wins(|| mizzle::backend::fs_git_cli::FsGitCli);
 }
+
+// ─── SQL backend tests ───────────────────────────────────────────────────────
+
+#[cfg(feature = "sql")]
+mod sql_tests {
+    use super::*;
+
+    /// SQL-specific helper: scenario functions create their own temprepo, but
+    /// for SQL the backend must already have that repo registered.  We solve
+    /// this by passing the repo path alongside the backend.
+    fn sql_setup() -> (mizzle::backend::sql::SqlBackend, common::TempRepo) {
+        let repo_tmp = common::temprepo().unwrap();
+        let backend = common::sql_backend_from_fs(&repo_tmp.path());
+        (backend, repo_tmp)
+    }
+
+    #[test]
+    fn stale_oid_rejected_sql() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (backend, _repo_tmp) = sql_setup();
+        // scenario_stale_oid_rejected creates its own temprepo, so we
+        // duplicate the scenario inline using the pre-registered path.
+        use futures_lite::future::block_on;
+        let bare = _repo_tmp.path();
+        let repo = block_on(backend.open(&bare)).unwrap();
+
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
+            .unwrap()
+            .unwrap();
+
+        let result = block_on(backend.update_refs(
+            &repo,
+            &[RefUpdate {
+                old_oid: dev_oid,
+                new_oid: dev_oid,
+                refname: "refs/heads/main".to_string(),
+            }],
+        ));
+        assert!(
+            result.is_err(),
+            "update_refs with wrong old_oid must fail; main is at {main_oid}, claimed {dev_oid}"
+        );
+
+        let after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after, main_oid,
+            "main must be unchanged after stale-CAS failure"
+        );
+    }
+
+    #[test]
+    fn multi_ref_atomicity_sql() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (backend, _repo_tmp) = sql_setup();
+        use futures_lite::future::block_on;
+        let bare = _repo_tmp.path();
+        let repo = block_on(backend.open(&bare)).unwrap();
+
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
+            .unwrap()
+            .unwrap();
+
+        let result = block_on(backend.update_refs(
+            &repo,
+            &[
+                RefUpdate {
+                    old_oid: null_oid(),
+                    new_oid: dev_oid,
+                    refname: "refs/heads/feature".to_string(),
+                },
+                RefUpdate {
+                    old_oid: dev_oid,
+                    new_oid: dev_oid,
+                    refname: "refs/heads/main".to_string(),
+                },
+            ],
+        ));
+        assert!(result.is_err(), "batch with a stale edit must fail");
+
+        let main_after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(main_after, main_oid, "main must be unchanged");
+
+        let feature_after = block_on(backend.resolve_ref(&repo, "refs/heads/feature")).unwrap();
+        assert!(
+            feature_after.is_none(),
+            "feature must not have been created; got {feature_after:?}"
+        );
+    }
+
+    /// build_pack must write a cache file on miss, and serve it on a
+    /// subsequent call with the same wants/haves.
+    #[test]
+    fn pack_cache_miss_then_hit_sql() {
+        use futures_lite::future::block_on;
+        use mizzle::backend::{PackOptions, StorageBackend};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (backend, repo_tmp) = sql_setup();
+        let bare = repo_tmp.path();
+        let repo = block_on(backend.open(&bare)).unwrap();
+
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+
+        let opts = PackOptions {
+            deepen: None,
+            filter: None,
+            thin_pack: false,
+        };
+
+        // Cache dir should be empty before the first call.
+        let cache_dir = backend.pack_cache_dir();
+        let cache_files_before: Vec<_> = walkdir(cache_dir);
+        assert!(
+            cache_files_before.is_empty(),
+            "cache dir should be empty before build_pack, found: {cache_files_before:?}"
+        );
+
+        // First call: cache miss → builds pack and writes cache.
+        let mut output1 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut bytes1 = Vec::new();
+        std::io::Read::read_to_end(&mut output1.reader, &mut bytes1).unwrap();
+        assert!(!bytes1.is_empty(), "pack must not be empty");
+
+        // A .pack file should now exist in the cache dir.
+        let cache_files_after: Vec<_> = walkdir(cache_dir);
+        assert_eq!(
+            cache_files_after.len(),
+            1,
+            "expected exactly 1 cache file, found: {cache_files_after:?}"
+        );
+        assert!(
+            cache_files_after[0]
+                .extension()
+                .map(|e| e == "pack")
+                .unwrap_or(false),
+            "cache file should have .pack extension: {:?}",
+            cache_files_after[0]
+        );
+
+        // Second call: same wants/haves → cache hit.
+        let mut output2 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut bytes2 = Vec::new();
+        std::io::Read::read_to_end(&mut output2.reader, &mut bytes2).unwrap();
+
+        assert_eq!(bytes1, bytes2, "cache hit must return identical pack bytes");
+
+        // No new cache files should have been created.
+        let cache_files_final: Vec<_> = walkdir(cache_dir);
+        assert_eq!(
+            cache_files_final.len(),
+            1,
+            "cache should still have exactly 1 file"
+        );
+    }
+
+    /// Recursively list all files under `dir`.
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walkdir(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn concurrent_pushes_only_one_wins_sql() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let (backend, repo_tmp) = sql_setup();
+        let bare = repo_tmp.path();
+
+        use futures_lite::future::block_on;
+        const RACERS: usize = 8;
+
+        let repo = block_on(backend.open(&bare)).unwrap();
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
+            .unwrap()
+            .unwrap();
+        drop(repo);
+
+        let shared = std::sync::Arc::new(backend);
+        let barrier = std::sync::Arc::new(Barrier::new(RACERS));
+        let successes = std::sync::Arc::new(Mutex::new(0usize));
+        let bare = std::sync::Arc::new(bare);
+        let rt_handle = rt.handle().clone();
+
+        let mut join_handles = Vec::with_capacity(RACERS);
+        for _ in 0..RACERS {
+            let shared = shared.clone();
+            let barrier = barrier.clone();
+            let successes = successes.clone();
+            let bare = bare.clone();
+            let rt_handle = rt_handle.clone();
+            join_handles.push(std::thread::spawn(move || {
+                let _guard = rt_handle.enter();
+                barrier.wait();
+                let b = (*shared).clone();
+                let repo = block_on(b.open(&bare)).unwrap();
+                let result = block_on(b.update_refs(
+                    &repo,
+                    &[RefUpdate {
+                        old_oid: main_oid,
+                        new_oid: dev_oid,
+                        refname: "refs/heads/main".to_string(),
+                    }],
+                ));
+                if result.is_ok() {
+                    *successes.lock().unwrap() += 1;
+                }
+            }));
+        }
+        for h in join_handles {
+            h.join().expect("racer thread panicked");
+        }
+
+        let wins = *successes.lock().unwrap();
+        assert_eq!(
+            wins, 1,
+            "exactly 1 push must win; got {wins}/{RACERS} successes"
+        );
+    }
+}
