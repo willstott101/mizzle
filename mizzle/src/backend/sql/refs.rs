@@ -6,10 +6,7 @@ use sqlx::SqlitePool;
 
 use crate::backend::{HeadInfo, RefInfo, RefsSnapshot};
 
-/// Return the OID's raw bytes as `&[u8]` for sqlx binding.
-fn oid_bytes(oid: &ObjectId) -> &[u8] {
-    &oid.as_bytes()[..]
-}
+use super::objects::{oid_bytes, parse_oid};
 
 /// List all refs for a repository.
 ///
@@ -39,9 +36,8 @@ pub(super) async fn list_refs(pool: &SqlitePool, repo_db_id: i64) -> Result<Refs
     let mut refs = Vec::with_capacity(ref_rows.len());
     let mut head = None;
 
-    for (name, oid_bytes) in &ref_rows {
-        // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
-        let oid = ObjectId::from_bytes_or_panic(oid_bytes);
+    for (name, raw_oid) in &ref_rows {
+        let oid = parse_oid(raw_oid)?;
         refs.push(RefInfo {
             name: name.clone(),
             oid,
@@ -75,8 +71,7 @@ pub(super) async fn resolve_ref(
             .await
             .context("resolving ref")?;
 
-    // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
-    Ok(row.map(|(oid_bytes,)| ObjectId::from_bytes_or_panic(&oid_bytes)))
+    row.map(|(raw,)| parse_oid(&raw)).transpose()
 }
 
 /// Apply ref updates as a single all-or-nothing transaction with CAS semantics.

@@ -270,13 +270,16 @@ impl StorageBackend for SqlBackend {
     ) -> impl std::future::Future<Output = Result<PackMetadata>> + Send {
         // Take the pre-computed metadata out of the Mutex.  The protocol
         // only calls inspect_ingested once per ingest.
-        let metadata = pack
+        let result = pack
             .metadata
             .lock()
-            .expect("metadata mutex poisoned")
-            .take()
-            .expect("inspect_ingested called more than once");
-        async move { Ok(metadata) }
+            .map_err(|_| anyhow::anyhow!("metadata mutex poisoned"))
+            .and_then(|mut guard| {
+                guard
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("inspect_ingested called more than once"))
+            });
+        async move { result }
     }
 
     fn rollback_ingest(

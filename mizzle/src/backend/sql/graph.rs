@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use crate::backend::ReachableError;
 use crate::traits::PushKind;
 
-use super::objects::oid_bytes;
+use super::objects::{oid_bytes, parse_oid};
 
 /// Classify a ref update as Create / Delete / FastForward / ForcePush.
 ///
@@ -127,8 +127,7 @@ pub(super) async fn reachable_excluding(
         .map_err(|e| ReachableError::Other(anyhow::anyhow!("fetching parents: {e}")))?;
 
         for (parent_bytes,) in parents {
-            // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
-            let parent = ObjectId::from_bytes_or_panic(&parent_bytes);
+            let parent = parse_oid(&parent_bytes)?;
             if !exclude_set.contains(&parent) && visited.insert(parent) {
                 queue.push_back(parent);
             }
@@ -166,8 +165,7 @@ async fn collect_ancestors(
     .map_err(|e| ReachableError::Other(anyhow::anyhow!("collecting ancestors: {e}")))?;
 
     for (bytes,) in rows {
-        // PANIC: panics if the DB contains a corrupt (wrong-length) OID.
-        set.insert(ObjectId::from_bytes_or_panic(&bytes));
+        set.insert(parse_oid(&bytes)?);
     }
     Ok(())
 }

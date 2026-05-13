@@ -20,6 +20,11 @@ pub(super) fn oid_bytes(oid: &ObjectId) -> &[u8] {
     &oid.as_bytes()[..]
 }
 
+/// Fallible conversion from a database BLOB to an [`ObjectId`].
+pub(super) fn parse_oid(bytes: &[u8]) -> Result<ObjectId> {
+    ObjectId::try_from(bytes).map_err(|e| anyhow::anyhow!("corrupt OID in database: {e}"))
+}
+
 /// Check whether an object exists in the repository.
 pub(super) async fn has_object(pool: &SqlitePool, repo_db_id: i64, oid: &ObjectId) -> Result<bool> {
     let row: (bool,) =
