@@ -11,9 +11,7 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Build
@@ -22,3 +20,29 @@ jobs:
       run: cargo test --verbose
     - name: Check fmt
       run: cargo fmt --check
+
+  tikv-integration:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install TiUP
+      run: curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+
+    - name: Start TiKV playground
+      run: |
+        ~/.tiup/bin/tiup playground --without-monitor &
+        echo "Waiting for PD to become healthy..."
+        for i in $(seq 1 60); do
+          if curl -sf http://127.0.0.1:2379/health > /dev/null 2>&1; then
+            echo "PD ready after ${i}s"
+            break
+          fi
+          sleep 2
+        done
+        curl -sf http://127.0.0.1:2379/health || (echo "PD never became healthy" && exit 1)
+
+    - name: Run KV integration tests
+      env:
+        MIZZLE_TIKV_PD_ADDR: "127.0.0.1:2379"
+      run: cargo test --features tikv --verbose 2>&1
