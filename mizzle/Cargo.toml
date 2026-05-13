@@ -32,13 +32,13 @@ tempfile = "3.25.0"
 gix-lock = "21"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
 flate2 = { version = "1", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = "0.10"
 
 [features]
 default = ["axum"]
 axum = ["dep:axum"]
 ssh = ["dep:russh"]
-sql = ["dep:sqlx", "dep:flate2", "dep:sha2"]
+sql = ["dep:sqlx", "dep:flate2"]
 
 [[example]]
 name = "axum"

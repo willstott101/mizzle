@@ -6,6 +6,7 @@
 
 pub mod fs_git_cli;
 pub mod fs_gitoxide;
+pub mod pack_cache;
 #[cfg(feature = "sql")]
 pub mod sql;
 

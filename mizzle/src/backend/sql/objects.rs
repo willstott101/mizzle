@@ -309,105 +309,6 @@ pub(super) async fn ingest_pack(
 // Build pack
 // ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Pack cache
-// ---------------------------------------------------------------------------
-
-/// Compute a deterministic cache key from wants, haves, and pack options.
-///
-/// The key is `SHA-256(repo_id || sorted_wants || 0x00 || sorted_haves || 0x01 || opts)`
-/// as a hex string.
-///
-/// ## Correctness
-///
-/// Git objects are content-addressed: the set of objects reachable from a
-/// fixed set of OIDs is immutable (objects are never mutated, only created or
-/// GC'd).  Including the options in the key ensures that different
-/// filter/deepen/thin_pack settings never share a cached pack.
-fn pack_cache_key(
-    repo_db_id: i64,
-    want: &[ObjectId],
-    have: &[ObjectId],
-    opts: &crate::backend::PackOptions,
-) -> String {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(repo_db_id.to_le_bytes());
-
-    let mut sorted_wants: Vec<_> = want.to_vec();
-    sorted_wants.sort();
-    for oid in &sorted_wants {
-        hasher.update(oid.as_bytes());
-    }
-
-    hasher.update([0x00]);
-
-    let mut sorted_haves: Vec<_> = have.to_vec();
-    sorted_haves.sort();
-    for oid in &sorted_haves {
-        hasher.update(oid.as_bytes());
-    }
-
-    // Pack options: deepen depth, filter variant, thin_pack flag.
-    hasher.update([0x01]);
-    hasher.update(opts.deepen.unwrap_or(0).to_le_bytes());
-    let filter_tag: u8 = match &opts.filter {
-        None => 0,
-        Some(crate::backend::Filter::BlobNone) => 1,
-        Some(crate::backend::Filter::TreeNone) => 2,
-    };
-    hasher.update([filter_tag]);
-    hasher.update([opts.thin_pack as u8]);
-
-    format!("{:x}", hasher.finalize())
-}
-
-/// Try to serve a pack from cache.  Returns `Some(PackOutput)` on cache hit.
-fn try_cache_hit(
-    pack_cache_dir: &std::path::Path,
-    repo_db_id: i64,
-    want: &[ObjectId],
-    have: &[ObjectId],
-    opts: &crate::backend::PackOptions,
-) -> Option<crate::backend::PackOutput> {
-    let key = pack_cache_key(repo_db_id, want, have, opts);
-    let cache_path = pack_cache_dir
-        .join(repo_db_id.to_string())
-        .join(format!("{key}.pack"));
-
-    if cache_path.exists() {
-        let file = std::fs::File::open(&cache_path).ok()?;
-        Some(crate::backend::PackOutput {
-            reader: Box::new(std::io::BufReader::new(file)),
-            shallow: Vec::new(),
-            progress: None,
-        })
-    } else {
-        None
-    }
-}
-
-/// Write pack bytes to the cache.  Best-effort — errors are silently ignored.
-fn write_to_cache(
-    pack_cache_dir: &std::path::Path,
-    repo_db_id: i64,
-    want: &[ObjectId],
-    have: &[ObjectId],
-    opts: &crate::backend::PackOptions,
-    data: &[u8],
-) {
-    let key = pack_cache_key(repo_db_id, want, have, opts);
-    let dir = pack_cache_dir.join(repo_db_id.to_string());
-    let _ = std::fs::create_dir_all(&dir);
-    let cache_path = dir.join(format!("{key}.pack"));
-    let _ = std::fs::write(&cache_path, data);
-}
-
-// ---------------------------------------------------------------------------
-// Build pack
-// ---------------------------------------------------------------------------
-
 /// Build a pack containing objects reachable from `want` but not from `have`.
 ///
 /// Checks the local filesystem pack cache first.  On miss, builds via a
@@ -420,8 +321,11 @@ pub(super) async fn build_pack(
     opts: &crate::backend::PackOptions,
     pack_cache_dir: &std::path::Path,
 ) -> Result<crate::backend::PackOutput> {
-    // Phase 6: check cache.
-    if let Some(output) = try_cache_hit(pack_cache_dir, repo_db_id, want, have, opts) {
+    use crate::backend::pack_cache;
+
+    let cache_repo_id = repo_db_id as u64;
+    let cache_key = pack_cache::key(cache_repo_id, want, have, opts);
+    if let Some(output) = pack_cache::try_hit(pack_cache_dir, cache_repo_id, &cache_key) {
         return Ok(output);
     }
 
@@ -495,7 +399,7 @@ pub(super) async fn build_pack(
 
     if needed_oids.is_empty() {
         let empty_pack = build_empty_pack();
-        write_to_cache(pack_cache_dir, repo_db_id, want, have, opts, &empty_pack);
+        pack_cache::write(pack_cache_dir, cache_repo_id, &cache_key, &empty_pack);
         return Ok(crate::backend::PackOutput {
             reader: Box::new(std::io::Cursor::new(empty_pack)),
             shallow: Vec::new(),
@@ -527,7 +431,7 @@ pub(super) async fn build_pack(
 
     // 5-6. Write objects to temp repo and generate pack (CPU-bound).
     let cache_dir = pack_cache_dir.to_path_buf();
-    let cache_key = pack_cache_key(repo_db_id, want, have, opts);
+    let cache_key_owned = cache_key.clone();
 
     let pack_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
         // Create a temp bare repo.
@@ -619,10 +523,7 @@ pub(super) async fn build_pack(
             pack_data.extend_from_slice(&chunk);
         }
 
-        // Write to cache (best-effort).
-        let dir = cache_dir.join(repo_db_id.to_string());
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(dir.join(format!("{cache_key}.pack")), &pack_data);
+        pack_cache::write(&cache_dir, cache_repo_id, &cache_key_owned, &pack_data);
 
         Ok(pack_data)
     })
