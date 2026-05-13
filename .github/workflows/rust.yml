@@ -45,4 +45,4 @@ jobs:
     - name: Run KV integration tests
       env:
         MIZZLE_TIKV_PD_ADDR: "127.0.0.1:2379"
-      run: cargo test --features tikv --verbose 2>&1
+      run: cargo test --features tikv --test backend_parity --verbose kv_tests
