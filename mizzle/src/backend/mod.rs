@@ -6,6 +6,8 @@
 
 pub mod fs_git_cli;
 pub mod fs_gitoxide;
+#[cfg(feature = "tikv")]
+pub mod kv;
 pub mod pack_cache;
 #[cfg(feature = "sql")]
 pub mod sql;
