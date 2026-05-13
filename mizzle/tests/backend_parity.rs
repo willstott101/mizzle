@@ -450,3 +450,135 @@ mod sql_tests {
         );
     }
 }
+
+// ─── KV backend tests ────────────────────────────────────────────────────────
+//
+// Gated on the `tikv` feature AND `$MIZZLE_TIKV_PD_ADDR`.  Without the env
+// var the tests skip silently so contributors can `cargo test --features tikv`
+// without a running cluster — CI provisions TiKV via `tiup playground` and
+// sets the env var.
+
+#[cfg(feature = "tikv")]
+mod kv_tests {
+    use super::*;
+
+    fn kv_setup() -> Option<(mizzle::backend::kv::KvBackend, common::TempRepo)> {
+        let repo_tmp = common::temprepo().unwrap();
+        let backend = common::kv_backend_from_fs(&repo_tmp.path())?;
+        Some((backend, repo_tmp))
+    }
+
+    #[test]
+    fn stale_oid_rejected_kv() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let Some((backend, _repo_tmp)) = kv_setup() else {
+            eprintln!("skipping: MIZZLE_TIKV_PD_ADDR not set");
+            return;
+        };
+        use futures_lite::future::block_on;
+        let bare = _repo_tmp.path();
+        let repo = block_on(backend.open(&bare)).unwrap();
+
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
+            .unwrap()
+            .unwrap();
+
+        let result = block_on(backend.update_refs(
+            &repo,
+            &[RefUpdate {
+                old_oid: dev_oid,
+                new_oid: dev_oid,
+                refname: "refs/heads/main".to_string(),
+            }],
+        ));
+        assert!(
+            result.is_err(),
+            "update_refs with wrong old_oid must fail; main is at {main_oid}, claimed {dev_oid}"
+        );
+
+        let after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after, main_oid,
+            "main must be unchanged after stale-CAS failure"
+        );
+    }
+
+    /// End-to-end fetch path: build_pack must hit the cache on the second
+    /// call, and (more importantly here) actually produce a valid pack on the
+    /// first call — exercising reachable_excluding, tree_oids collection, the
+    /// temp-gitoxide-repo assembly, and pack_cache write.
+    #[test]
+    fn pack_cache_miss_then_hit_kv() {
+        use futures_lite::future::block_on;
+        use mizzle::backend::{PackOptions, StorageBackend};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let Some((backend, repo_tmp)) = kv_setup() else {
+            eprintln!("skipping: MIZZLE_TIKV_PD_ADDR not set");
+            return;
+        };
+        let bare = repo_tmp.path();
+        let repo = block_on(backend.open(&bare)).unwrap();
+
+        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+            .unwrap()
+            .unwrap();
+
+        let opts = PackOptions {
+            deepen: None,
+            filter: None,
+            thin_pack: false,
+        };
+
+        let cache_dir = backend.pack_cache_dir();
+        assert!(
+            walkdir(cache_dir).is_empty(),
+            "cache should be empty before first build_pack"
+        );
+
+        let mut output1 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut bytes1 = Vec::new();
+        std::io::Read::read_to_end(&mut output1.reader, &mut bytes1).unwrap();
+        assert!(!bytes1.is_empty(), "pack must not be empty");
+
+        let after_first = walkdir(cache_dir);
+        assert_eq!(
+            after_first.len(),
+            1,
+            "expected exactly 1 cache file, found: {after_first:?}"
+        );
+
+        let mut output2 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut bytes2 = Vec::new();
+        std::io::Read::read_to_end(&mut output2.reader, &mut bytes2).unwrap();
+        assert_eq!(bytes1, bytes2, "cache hit must return identical pack bytes");
+
+        assert_eq!(
+            walkdir(cache_dir).len(),
+            1,
+            "cache hit must not write a new file"
+        );
+    }
+
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    files.extend(walkdir(&path));
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        files
+    }
+}

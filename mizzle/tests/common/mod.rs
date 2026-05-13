@@ -564,6 +564,59 @@ pub fn sql_backend_from_fs(bare_path: &FsPath) -> mizzle::backend::sql::SqlBacke
     })
 }
 
+/// Create a [`KvBackend`](mizzle::backend::kv::KvBackend) connected to the
+/// TiKV cluster at `$MIZZLE_TIKV_PD_ADDR` and pre-populated with the refs
+/// and objects from a filesystem bare repo at `bare_path`.
+///
+/// Returns `None` if the env var is unset so tests can skip cleanly when
+/// no TiKV cluster is available locally.
+#[cfg(feature = "tikv")]
+pub fn kv_backend_from_fs(bare_path: &FsPath) -> Option<mizzle::backend::kv::KvBackend> {
+    use mizzle::backend::fs_gitoxide::FsGitoxide;
+
+    let pd_addr = std::env::var("MIZZLE_TIKV_PD_ADDR").ok()?;
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    Some(rt.block_on(async move {
+        let pack_cache_dir = tempdir().unwrap().keep();
+        let kv = mizzle::backend::kv::KvBackend::connect(vec![pd_addr], pack_cache_dir)
+            .await
+            .expect("connect to TiKV");
+
+        kv.init_repo(&bare_path.to_path_buf()).await.unwrap();
+        let kv_repo = kv.open(&bare_path.to_path_buf()).await.unwrap();
+
+        let pack_dir = bare_path.join("objects").join("pack");
+        if pack_dir.exists() {
+            for entry in std::fs::read_dir(&pack_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pack") {
+                    kv.ingest_pack(&kv_repo, &path).await.unwrap();
+                }
+            }
+        }
+
+        let fs = FsGitoxide;
+        let fs_repo = fs.open(&bare_path.to_path_buf()).await.unwrap();
+        let refs_snap = fs.list_refs(&fs_repo).await.unwrap();
+
+        let ref_updates: Vec<mizzle_proto::receive::RefUpdate> = refs_snap
+            .refs
+            .iter()
+            .filter(|r| r.name.starts_with("refs/"))
+            .map(|r| mizzle_proto::receive::RefUpdate {
+                old_oid: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                new_oid: r.oid,
+                refname: r.name.clone(),
+            })
+            .collect();
+        if !ref_updates.is_empty() {
+            kv.update_refs(&kv_repo, &ref_updates).await.unwrap();
+        }
+
+        kv
+    }))
+}
+
 /// Spin up an axum server with a custom [`RepoAccess`] using the default FsGitoxide backend.
 pub fn axum_access_server<A, F>(bare_repo_path: PathBuf, make_access: F) -> ServerHandle
 where
