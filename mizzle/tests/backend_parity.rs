@@ -462,32 +462,48 @@ mod sql_tests {
 mod kv_tests {
     use super::*;
 
-    fn kv_setup() -> Option<(mizzle::backend::kv::KvBackend, common::TempRepo)> {
+    /// One-stop fixture: a tokio `Runtime` that outlives the backend (tikv-client
+    /// spawns background tasks on whatever runtime is current at construction
+    /// time, so the runtime must stay alive for every subsequent operation),
+    /// the backend itself, and the on-disk temp repo we ingested into it.
+    struct KvFixture {
+        rt: tokio::runtime::Runtime,
+        backend: mizzle::backend::kv::KvBackend,
+        repo_tmp: common::TempRepo,
+    }
+
+    fn kv_setup() -> Option<KvFixture> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
         let repo_tmp = common::temprepo().unwrap();
-        let backend = common::kv_backend_from_fs(&repo_tmp.path())?;
-        Some((backend, repo_tmp))
+        let backend = common::kv_backend_from_fs(&rt, &repo_tmp.path())?;
+        Some(KvFixture {
+            rt,
+            backend,
+            repo_tmp,
+        })
     }
 
     #[test]
     fn stale_oid_rejected_kv() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let Some((backend, _repo_tmp)) = kv_setup() else {
+        let Some(fx) = kv_setup() else {
             eprintln!("skipping: MIZZLE_TIKV_PD_ADDR not set");
             return;
         };
-        use futures_lite::future::block_on;
-        let bare = _repo_tmp.path();
-        let repo = block_on(backend.open(&bare)).unwrap();
+        let bare = fx.repo_tmp.path();
+        let repo = fx.rt.block_on(fx.backend.open(&bare)).unwrap();
 
-        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+        let main_oid = fx
+            .rt
+            .block_on(fx.backend.resolve_ref(&repo, "refs/heads/main"))
             .unwrap()
             .unwrap();
-        let dev_oid = block_on(backend.resolve_ref(&repo, "refs/heads/dev"))
+        let dev_oid = fx
+            .rt
+            .block_on(fx.backend.resolve_ref(&repo, "refs/heads/dev"))
             .unwrap()
             .unwrap();
 
-        let result = block_on(backend.update_refs(
+        let result = fx.rt.block_on(fx.backend.update_refs(
             &repo,
             &[RefUpdate {
                 old_oid: dev_oid,
@@ -500,7 +516,9 @@ mod kv_tests {
             "update_refs with wrong old_oid must fail; main is at {main_oid}, claimed {dev_oid}"
         );
 
-        let after = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+        let after = fx
+            .rt
+            .block_on(fx.backend.resolve_ref(&repo, "refs/heads/main"))
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -515,19 +533,18 @@ mod kv_tests {
     /// temp-gitoxide-repo assembly, and pack_cache write.
     #[test]
     fn pack_cache_miss_then_hit_kv() {
-        use futures_lite::future::block_on;
         use mizzle::backend::{PackOptions, StorageBackend};
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let Some((backend, repo_tmp)) = kv_setup() else {
+        let Some(fx) = kv_setup() else {
             eprintln!("skipping: MIZZLE_TIKV_PD_ADDR not set");
             return;
         };
-        let bare = repo_tmp.path();
-        let repo = block_on(backend.open(&bare)).unwrap();
+        let bare = fx.repo_tmp.path();
+        let repo = fx.rt.block_on(fx.backend.open(&bare)).unwrap();
 
-        let main_oid = block_on(backend.resolve_ref(&repo, "refs/heads/main"))
+        let main_oid = fx
+            .rt
+            .block_on(fx.backend.resolve_ref(&repo, "refs/heads/main"))
             .unwrap()
             .unwrap();
 
@@ -537,13 +554,16 @@ mod kv_tests {
             thin_pack: false,
         };
 
-        let cache_dir = backend.pack_cache_dir();
+        let cache_dir = fx.backend.pack_cache_dir();
         assert!(
             walkdir(cache_dir).is_empty(),
             "cache should be empty before first build_pack"
         );
 
-        let mut output1 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut output1 = fx
+            .rt
+            .block_on(fx.backend.build_pack(&repo, &[main_oid], &[], &opts))
+            .unwrap();
         let mut bytes1 = Vec::new();
         std::io::Read::read_to_end(&mut output1.reader, &mut bytes1).unwrap();
         assert!(!bytes1.is_empty(), "pack must not be empty");
@@ -555,7 +575,10 @@ mod kv_tests {
             "expected exactly 1 cache file, found: {after_first:?}"
         );
 
-        let mut output2 = block_on(backend.build_pack(&repo, &[main_oid], &[], &opts)).unwrap();
+        let mut output2 = fx
+            .rt
+            .block_on(fx.backend.build_pack(&repo, &[main_oid], &[], &opts))
+            .unwrap();
         let mut bytes2 = Vec::new();
         std::io::Read::read_to_end(&mut output2.reader, &mut bytes2).unwrap();
         assert_eq!(bytes1, bytes2, "cache hit must return identical pack bytes");

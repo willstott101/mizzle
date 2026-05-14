@@ -568,14 +568,22 @@ pub fn sql_backend_from_fs(bare_path: &FsPath) -> mizzle::backend::sql::SqlBacke
 /// TiKV cluster at `$MIZZLE_TIKV_PD_ADDR` and pre-populated with the refs
 /// and objects from a filesystem bare repo at `bare_path`.
 ///
+/// The caller owns the tokio runtime so it can outlive the backend.
+/// `TransactionClient` spawns background tasks (PD client, timestamp oracle)
+/// on the runtime that's current at construction time — if the helper owned
+/// its own runtime locally those tasks would die on return and the next
+/// operation would hit `TimestampRequest channel is closed`.
+///
 /// Returns `None` if the env var is unset so tests can skip cleanly when
 /// no TiKV cluster is available locally.
 #[cfg(feature = "tikv")]
-pub fn kv_backend_from_fs(bare_path: &FsPath) -> Option<mizzle::backend::kv::KvBackend> {
+pub fn kv_backend_from_fs(
+    rt: &tokio::runtime::Runtime,
+    bare_path: &FsPath,
+) -> Option<mizzle::backend::kv::KvBackend> {
     use mizzle::backend::fs_gitoxide::FsGitoxide;
 
     let pd_addr = std::env::var("MIZZLE_TIKV_PD_ADDR").ok()?;
-    let rt = tokio::runtime::Runtime::new().unwrap();
     Some(rt.block_on(async move {
         let pack_cache_dir = tempdir().unwrap().keep();
         let kv = mizzle::backend::kv::KvBackend::connect(vec![pd_addr], pack_cache_dir)
