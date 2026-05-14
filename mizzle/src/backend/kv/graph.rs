@@ -10,7 +10,7 @@ use anyhow::Context;
 use gix::ObjectId;
 use tikv_client::TransactionClient;
 
-use super::keys;
+use super::{keys, txn};
 use crate::backend::ReachableError;
 use crate::traits::PushKind;
 
@@ -152,28 +152,28 @@ async fn fetch_parents(
     repo_id: u64,
     commit_oid: &ObjectId,
 ) -> anyhow::Result<Vec<ObjectId>> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for fetch_parents")?;
-
-    let start = keys::parents_prefix_start(repo_id, commit_oid);
-    let end = keys::parents_prefix_end(repo_id, commit_oid);
-
-    let pairs = txn
-        .scan(start..end, u32::MAX)
-        .await
-        .context("scan commit parents")?;
-    txn.commit().await.ok();
-
-    // Keys are sorted by pos (big-endian u16) so the iterator is already in
-    // parent order.  We only need the values.
-    let mut parents = Vec::new();
-    for pair in pairs {
-        let value: Vec<u8> = pair.value().clone();
-        let parent = ObjectId::try_from(value.as_slice())
-            .map_err(|e| anyhow::anyhow!("corrupt parent oid: {e}"))?;
-        parents.push(parent);
+    let result: anyhow::Result<Vec<ObjectId>> = async {
+        let start = keys::parents_prefix_start(repo_id, commit_oid);
+        let end = keys::parents_prefix_end(repo_id, commit_oid);
+        let pairs = t
+            .scan(start..end, u32::MAX)
+            .await
+            .context("scan commit parents")?;
+        // Keys are sorted by pos (big-endian u16) so the iterator is already in
+        // parent order.  We only need the values.
+        let mut parents = Vec::new();
+        for pair in pairs {
+            let value: Vec<u8> = pair.value().clone();
+            let parent = ObjectId::try_from(value.as_slice())
+                .map_err(|e| anyhow::anyhow!("corrupt parent oid: {e}"))?;
+            parents.push(parent);
+        }
+        Ok(parents)
     }
-    Ok(parents)
+    .await;
+    txn::finalize_read(&mut t, result).await
 }

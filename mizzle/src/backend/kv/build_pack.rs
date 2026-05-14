@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use gix::ObjectId;
 use tikv_client::TransactionClient;
 
-use super::{graph, keys, objects};
+use super::{graph, keys, objects, txn};
 use crate::auth_types::{RefDiff, RefDiffChange, RefDiffEntry};
 use crate::backend::{pack_cache, PackOptions, PackOutput};
 
@@ -164,20 +164,22 @@ async fn read_object_of_kind(
     oid: &ObjectId,
     expected_kind: u8,
 ) -> Result<Option<Vec<u8>>> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for read_object_of_kind")?;
-    let value = txn.get(keys::obj(repo_id, oid)).await.context("get obj")?;
-    txn.commit().await.ok();
-
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_empty() || value[0] != expected_kind {
-        return Ok(None);
+    let result: Result<Option<Vec<u8>>> = async {
+        let value = t.get(keys::obj(repo_id, oid)).await.context("get obj")?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value.is_empty() || value[0] != expected_kind {
+            return Ok(None);
+        }
+        Ok(Some(value[1..].to_vec()))
     }
-    Ok(Some(value[1..].to_vec()))
+    .await;
+    txn::finalize_read(&mut t, result).await
 }
 
 async fn read_object_with_gix_kind(
@@ -185,27 +187,29 @@ async fn read_object_with_gix_kind(
     repo_id: u64,
     oid: &ObjectId,
 ) -> Result<Option<(gix_object::Kind, Vec<u8>)>> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for read_object_with_gix_kind")?;
-    let value = txn.get(keys::obj(repo_id, oid)).await.context("get obj")?;
-    txn.commit().await.ok();
-
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    if value.is_empty() {
-        return Ok(None);
+    let result: Result<Option<(gix_object::Kind, Vec<u8>)>> = async {
+        let value = t.get(keys::obj(repo_id, oid)).await.context("get obj")?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let kind = match value[0] {
+            objects::KIND_BLOB => gix_object::Kind::Blob,
+            objects::KIND_TREE => gix_object::Kind::Tree,
+            objects::KIND_COMMIT => gix_object::Kind::Commit,
+            objects::KIND_TAG => gix_object::Kind::Tag,
+            _ => return Ok(None),
+        };
+        Ok(Some((kind, value[1..].to_vec())))
     }
-    let kind = match value[0] {
-        objects::KIND_BLOB => gix_object::Kind::Blob,
-        objects::KIND_TREE => gix_object::Kind::Tree,
-        objects::KIND_COMMIT => gix_object::Kind::Commit,
-        objects::KIND_TAG => gix_object::Kind::Tag,
-        _ => return Ok(None),
-    };
-    Ok(Some((kind, value[1..].to_vec())))
+    .await;
+    txn::finalize_read(&mut t, result).await
 }
 
 /// Stage the fetched objects as loose files in a temp bare repo, then drive

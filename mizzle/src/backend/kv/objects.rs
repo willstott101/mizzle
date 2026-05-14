@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use gix::ObjectId;
 use tikv_client::TransactionClient;
 
-use super::keys;
+use super::{keys, txn};
 use crate::backend::{ObjectKind, PackMetadata, PackObject};
 
 /// Kind constants matching the SQL backend so we can copy / paste integration
@@ -37,16 +37,17 @@ pub(super) async fn has_object(
     repo_id: u64,
     oid: &ObjectId,
 ) -> Result<bool> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for has_object")?;
-    let exists = txn
-        .key_exists(keys::obj(repo_id, oid))
-        .await
-        .context("key_exists")?;
-    txn.commit().await.ok();
-    Ok(exists)
+    let result: Result<bool> = async {
+        t.key_exists(keys::obj(repo_id, oid))
+            .await
+            .context("key_exists")
+    }
+    .await;
+    txn::finalize_read(&mut t, result).await
 }
 
 pub(super) async fn has_objects(
@@ -54,19 +55,22 @@ pub(super) async fn has_objects(
     repo_id: u64,
     oids: &[ObjectId],
 ) -> Result<Vec<bool>> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for has_objects")?;
-    let keys: Vec<Vec<u8>> = oids.iter().map(|o| keys::obj(repo_id, o)).collect();
-    let found = txn
-        .batch_get(keys.clone())
-        .await
-        .context("batch_get")?
-        .map(|pair| pair.key().clone().into())
-        .collect::<std::collections::HashSet<Vec<u8>>>();
-    txn.commit().await.ok();
-    Ok(keys.iter().map(|k| found.contains(k)).collect())
+    let key_bytes: Vec<Vec<u8>> = oids.iter().map(|o| keys::obj(repo_id, o)).collect();
+    let result: Result<Vec<bool>> = async {
+        let found = t
+            .batch_get(key_bytes.clone())
+            .await
+            .context("batch_get")?
+            .map(|pair| pair.key().clone().into())
+            .collect::<std::collections::HashSet<Vec<u8>>>();
+        Ok(key_bytes.iter().map(|k| found.contains(k)).collect())
+    }
+    .await;
+    txn::finalize_read(&mut t, result).await
 }
 
 pub(super) async fn read_blob(
@@ -99,21 +103,23 @@ async fn read_object_with_kind(
     oid: ObjectId,
     cap: u64,
 ) -> Result<Option<(u8, Vec<u8>)>> {
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for read_object")?;
-    let value = txn.get(keys::obj(repo_id, &oid)).await.context("get obj")?;
-    txn.commit().await.ok();
-
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let (kind, data) = decode_object(&value)?;
-    if (data.len() as u64) > cap {
-        return Ok(None);
+    let result: Result<Option<(u8, Vec<u8>)>> = async {
+        let value = t.get(keys::obj(repo_id, &oid)).await.context("get obj")?;
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let (kind, data) = decode_object(&value)?;
+        if (data.len() as u64) > cap {
+            return Ok(None);
+        }
+        Ok(Some((kind, data.to_vec())))
     }
-    Ok(Some((kind, data.to_vec())))
+    .await;
+    txn::finalize_read(&mut t, result).await
 }
 
 // ---------------------------------------------------------------------------
@@ -257,32 +263,34 @@ pub(super) async fn ingest_pack(
 
     // Single txn for the whole pack.  TiKV's per-txn limits are generous;
     // FDB needs to slice into smaller batches (out of scope for the PoC).
-    let mut txn = db
+    let mut t = db
         .begin_optimistic()
         .await
         .context("begin txn for ingest")?;
-
-    let mut inserted_oids = Vec::with_capacity(extracted.len());
-    for obj in &extracted {
-        txn.put(
-            keys::obj(repo_id, &obj.oid),
-            encode_object(obj.kind, &obj.data),
-        )
-        .await
-        .context("write object")?;
-        inserted_oids.push(obj.oid);
-
-        for (parent_oid, pos) in &obj.parents {
-            txn.put(
-                keys::par(repo_id, &obj.oid, *pos),
-                parent_oid.as_bytes().to_vec(),
+    let result: Result<Vec<ObjectId>> = async {
+        let mut inserted_oids = Vec::with_capacity(extracted.len());
+        for obj in &extracted {
+            t.put(
+                keys::obj(repo_id, &obj.oid),
+                encode_object(obj.kind, &obj.data),
             )
             .await
-            .context("write commit parent")?;
-        }
-    }
+            .context("write object")?;
+            inserted_oids.push(obj.oid);
 
-    txn.commit().await.context("commit ingest txn")?;
+            for (parent_oid, pos) in &obj.parents {
+                t.put(
+                    keys::par(repo_id, &obj.oid, *pos),
+                    parent_oid.as_bytes().to_vec(),
+                )
+                .await
+                .context("write commit parent")?;
+            }
+        }
+        Ok(inserted_oids)
+    }
+    .await;
+    let inserted_oids = txn::finalize_write(&mut t, result).await?;
 
     Ok(Some((metadata, inserted_oids)))
 }

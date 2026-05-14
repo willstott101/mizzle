@@ -14,6 +14,7 @@ mod graph;
 mod keys;
 mod objects;
 mod refs;
+mod txn;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -98,59 +99,82 @@ impl KvBackend {
 /// Atomically allocate (or look up) a `repo_id` for `path` and mark the
 /// repository as existing.  Idempotent.
 async fn init_repo_inner(db: &TransactionClient, path: &str) -> Result<u64> {
-    let mut txn = db
-        .begin_pessimistic()
-        .await
-        .context("begin txn for init_repo")?;
-
-    // Fast path: already initialised.
-    if let Some(bytes) = txn
-        .get(keys::repo_index(path))
-        .await
-        .context("read repo_index")?
-    {
-        let id = decode_u64(&bytes).context("decoding repo_id")?;
-        txn.rollback().await.ok();
+    // Fast path: read-only check whether the repo already has an id.
+    let mut probe = db.begin_optimistic().await.context("begin probe txn")?;
+    let probe_result: Result<Option<u64>> = async {
+        match probe
+            .get(keys::repo_index(path))
+            .await
+            .context("read repo_index")?
+        {
+            Some(bytes) => Ok(Some(decode_u64(&bytes).context("decoding repo_id")?)),
+            None => Ok(None),
+        }
+    }
+    .await;
+    if let Some(id) = txn::finalize_read(&mut probe, probe_result).await? {
         return Ok(id);
     }
 
-    // Slow path: allocate next id under the counter, then write both keys.
-    let counter_key = keys::next_repo_id();
-    let next = match txn
-        .get_for_update(counter_key.clone())
+    // Slow path: allocate the next id, write the index entry + existence
+    // marker, all under one pessimistic txn.
+    let mut alloc = db
+        .begin_pessimistic()
         .await
-        .context("read repo_id counter")?
-    {
-        Some(b) => decode_u64(&b).context("decoding repo_id counter")?,
-        None => 1, // 0 is reserved.
-    };
+        .context("begin alloc txn for init_repo")?;
+    let alloc_result: Result<u64> = async {
+        // Re-check inside the pessimistic txn in case another writer raced us
+        // between the probe and here.
+        if let Some(bytes) = alloc
+            .get(keys::repo_index(path))
+            .await
+            .context("re-check repo_index")?
+        {
+            return decode_u64(&bytes).context("decoding repo_id");
+        }
 
-    txn.put(counter_key, encode_u64(next + 1))
-        .await
-        .context("write repo_id counter")?;
-    txn.put(keys::repo_index(path), encode_u64(next))
-        .await
-        .context("write repo_index")?;
-    txn.put(keys::repo_meta(next, keys::REPO_META_EXISTS), Vec::new())
-        .await
-        .context("mark repo as existing")?;
+        let counter_key = keys::next_repo_id();
+        let next = match alloc
+            .get_for_update(counter_key.clone())
+            .await
+            .context("read repo_id counter")?
+        {
+            Some(b) => decode_u64(&b).context("decoding repo_id counter")?,
+            None => 1, // 0 is reserved.
+        };
 
-    txn.commit().await.context("commit init_repo txn")?;
-    Ok(next)
+        alloc
+            .put(counter_key, encode_u64(next + 1))
+            .await
+            .context("write repo_id counter")?;
+        alloc
+            .put(keys::repo_index(path), encode_u64(next))
+            .await
+            .context("write repo_index")?;
+        alloc
+            .put(keys::repo_meta(next, keys::REPO_META_EXISTS), Vec::new())
+            .await
+            .context("mark repo as existing")?;
+        Ok(next)
+    }
+    .await;
+    txn::finalize_write(&mut alloc, alloc_result).await
 }
 
 async fn open_inner(db: &TransactionClient, path: &str) -> Result<u64> {
     let mut txn = db.begin_optimistic().await.context("begin txn for open")?;
-    let result = txn
-        .get(keys::repo_index(path))
-        .await
-        .context("read repo_index")?;
-    txn.commit().await.ok();
-
-    match result {
-        Some(bytes) => decode_u64(&bytes).context("decoding repo_id"),
-        None => anyhow::bail!("{path:?} does not appear to be a git repository"),
+    let result: Result<u64> = async {
+        let value = txn
+            .get(keys::repo_index(path))
+            .await
+            .context("read repo_index")?;
+        match value {
+            Some(bytes) => decode_u64(&bytes).context("decoding repo_id"),
+            None => anyhow::bail!("{path:?} does not appear to be a git repository"),
+        }
     }
+    .await;
+    txn::finalize_read(&mut txn, result).await
 }
 
 fn encode_u64(v: u64) -> Vec<u8> {
