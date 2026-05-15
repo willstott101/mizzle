@@ -99,7 +99,6 @@ pub fn par(repo_id: u64, commit_oid: &ObjectId, pos: u16) -> Vec<u8> {
 }
 
 /// Lower bound (inclusive) for a scan over the parents of a single commit.
-#[allow(dead_code)] // used by the graph traversal commit
 pub fn parents_prefix_start(repo_id: u64, commit_oid: &ObjectId) -> Vec<u8> {
     let mut k = Vec::with_capacity(29);
     k.push(PREFIX_PAR);
@@ -109,7 +108,6 @@ pub fn parents_prefix_start(repo_id: u64, commit_oid: &ObjectId) -> Vec<u8> {
 }
 
 /// Upper bound (exclusive) for a scan over the parents of a single commit.
-#[allow(dead_code)] // used by the graph traversal commit
 pub fn parents_prefix_end(repo_id: u64, commit_oid: &ObjectId) -> Vec<u8> {
     let mut k = parents_prefix_start(repo_id, commit_oid);
     increment_in_place(&mut k);

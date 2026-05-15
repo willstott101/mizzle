@@ -574,19 +574,23 @@ pub fn sql_backend_from_fs(bare_path: &FsPath) -> mizzle::backend::sql::SqlBacke
 /// its own runtime locally those tasks would die on return and the next
 /// operation would hit `TimestampRequest channel is closed`.
 ///
-/// Returns `None` if the env var is unset so tests can skip cleanly when
-/// no TiKV cluster is available locally.
+/// Returns the backend and the `TempDir` that owns the pack cache; the
+/// caller must keep the `TempDir` alive for the duration of the backend so
+/// the cache directory isn't cleaned up prematurely, and isn't leaked on
+/// test exit.  Returns `None` if the env var is unset so tests can skip
+/// cleanly when no TiKV cluster is available locally.
 #[cfg(feature = "tikv")]
 pub fn kv_backend_from_fs(
     rt: &tokio::runtime::Runtime,
     bare_path: &FsPath,
-) -> Option<mizzle::backend::kv::KvBackend> {
+) -> Option<(mizzle::backend::kv::KvBackend, TempDir)> {
     use mizzle::backend::fs_gitoxide::FsGitoxide;
 
     let pd_addr = std::env::var("MIZZLE_TIKV_PD_ADDR").ok()?;
-    Some(rt.block_on(async move {
-        let pack_cache_dir = tempdir().unwrap().keep();
-        let kv = mizzle::backend::kv::KvBackend::connect(vec![pd_addr], pack_cache_dir)
+    let cache_dir = tempdir().unwrap();
+    let cache_path = cache_dir.path().to_path_buf();
+    let backend = rt.block_on(async move {
+        let kv = mizzle::backend::kv::KvBackend::connect(vec![pd_addr], cache_path)
             .await
             .expect("connect to TiKV");
 
@@ -622,7 +626,8 @@ pub fn kv_backend_from_fs(
         }
 
         kv
-    }))
+    });
+    Some((backend, cache_dir))
 }
 
 /// Spin up an axum server with a custom [`RepoAccess`] using the default FsGitoxide backend.

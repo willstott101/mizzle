@@ -8,6 +8,10 @@ use super::{keys, txn};
 use crate::auth_types::CommitInfo;
 use crate::backend::{HeadInfo, RefInfo, RefsSnapshot};
 
+/// Per-call cap on the ref scan.  Set absurdly high because real repos have
+/// tens-to-thousands of refs, not billions — the SQL backend likewise reads
+/// every ref in one query.  A future pagination layer can lower this if
+/// we ever see a repo that needs it.
 const SCAN_LIMIT: u32 = u32::MAX;
 
 /// Read all refs of a repository plus its HEAD symref target.

@@ -465,21 +465,26 @@ mod kv_tests {
     /// One-stop fixture: a tokio `Runtime` that outlives the backend (tikv-client
     /// spawns background tasks on whatever runtime is current at construction
     /// time, so the runtime must stay alive for every subsequent operation),
-    /// the backend itself, and the on-disk temp repo we ingested into it.
+    /// the backend itself, the on-disk temp repo we ingested into it, and the
+    /// `TempDir` that owns the pack cache directory (so it's cleaned up when
+    /// the fixture drops instead of leaking on every test run).
     struct KvFixture {
         rt: tokio::runtime::Runtime,
         backend: mizzle::backend::kv::KvBackend,
         repo_tmp: common::TempRepo,
+        #[allow(dead_code)] // held for its Drop side effect (rmdir on exit)
+        cache_dir: tempfile::TempDir,
     }
 
     fn kv_setup() -> Option<KvFixture> {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let repo_tmp = common::temprepo().unwrap();
-        let backend = common::kv_backend_from_fs(&rt, &repo_tmp.path())?;
+        let (backend, cache_dir) = common::kv_backend_from_fs(&rt, &repo_tmp.path())?;
         Some(KvFixture {
             rt,
             backend,
             repo_tmp,
+            cache_dir,
         })
     }
 

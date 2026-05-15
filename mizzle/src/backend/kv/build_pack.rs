@@ -110,6 +110,10 @@ pub(super) async fn build_pack(
 }
 
 /// Read a commit and return its tree OID, if the OID is actually a commit.
+///
+/// A commit-shaped OID that fails to parse or whose tree field is malformed
+/// is a data-corruption signal — we still surface the missing tree as `None`
+/// so build_pack can skip it, but log loudly so the corruption gets noticed.
 async fn read_commit_tree(
     db: &TransactionClient,
     repo_id: u64,
@@ -118,10 +122,20 @@ async fn read_commit_tree(
     let Some(data) = objects::read_object_raw(db, repo_id, *commit_oid, u64::MAX).await? else {
         return Ok(None);
     };
-    let Ok(commit) = gix_object::CommitRef::from_bytes(&data) else {
-        return Ok(None);
+    let commit = match gix_object::CommitRef::from_bytes(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(%commit_oid, error = %e, "failed to parse commit object during build_pack");
+            return Ok(None);
+        }
     };
-    Ok(ObjectId::from_hex(commit.tree.as_ref()).ok())
+    match ObjectId::from_hex(commit.tree.as_ref()) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(e) => {
+            tracing::warn!(%commit_oid, error = %e, "commit has malformed tree oid during build_pack");
+            Ok(None)
+        }
+    }
 }
 
 /// Recursively collect every OID reachable from `tree_oid` (inclusive).

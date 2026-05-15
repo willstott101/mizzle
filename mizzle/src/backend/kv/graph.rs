@@ -68,9 +68,12 @@ async fn is_ancestor(
 /// Walk commits reachable from `from`, stopping at any commit reachable from
 /// `excluding`.  Returns OIDs in BFS order, capped at `cap`.
 ///
-/// Two-pass: expand the exclude-set first (sharing the cap budget so a giant
-/// excluding side cannot starve the from-side walk), then walk from-side
-/// pruning at the exclude-set.
+/// Two-pass: expand the exclude-set first, then walk from-side pruning at
+/// the exclude-set.  The `cap` argument bounds the returned `result` length
+/// per the trait contract.  As a defensive measure `collect_ancestors` also
+/// honours `cap` on the shared `exclude_set` size — since the set is shared
+/// across calls, this acts as a global ceiling on the exclude-side rather
+/// than a per-exclusion budget.
 pub(super) async fn reachable_excluding(
     db: &TransactionClient,
     repo_id: u64,
