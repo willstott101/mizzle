@@ -124,7 +124,7 @@ pub(crate) fn objects_for_fetch_with_have_set(
                 .try_find(&commit_id, &mut commit_buf)
                 .map_err(|e| anyhow!("find commit {commit_id}: {e}"))?
                 .ok_or_else(|| anyhow!("commit {commit_id} not found"))?;
-            gix::objs::CommitRefIter::from_bytes(obj.data)
+            gix::objs::CommitRefIter::from_bytes(obj.data, gix_hash::Kind::Sha1)
                 .tree_id()
                 .map_err(|e| anyhow!("read tree id from commit: {e}"))?
         };
@@ -139,7 +139,7 @@ pub(crate) fn objects_for_fetch_with_have_set(
                 .try_find(&tree_id, &mut tree_buf)
                 .map_err(|e| anyhow!("find tree {tree_id}: {e}"))?
                 .ok_or_else(|| anyhow!("tree {tree_id} not found"))?;
-            let root = gix::objs::TreeRefIter::from_bytes(obj.data);
+            let root = gix::objs::TreeRefIter::from_bytes(obj.data, gix_hash::Kind::Sha1);
             let mut visitor = WantVisitor {
                 have_set: &have_set,
                 result: &mut objects,
@@ -196,9 +196,10 @@ fn depth_limited_commits(
             .try_find(&commit_id, &mut buf)
             .map_err(|e| anyhow!("find commit {commit_id}: {e}"))?
             .ok_or_else(|| anyhow!("commit {commit_id} not found"))?;
-        let parents: Vec<ObjectId> = gix::objs::CommitRefIter::from_bytes(obj.data)
-            .parent_ids()
-            .collect();
+        let parents: Vec<ObjectId> =
+            gix::objs::CommitRefIter::from_bytes(obj.data, gix_hash::Kind::Sha1)
+                .parent_ids()
+                .collect();
 
         // At the depth boundary: include this commit but not its parents.
         // Only mark as shallow if the commit actually has parents that are
@@ -244,7 +245,7 @@ fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<H
                 .try_find(&commit_id, &mut commit_buf)
                 .map_err(|e| anyhow!("find have commit {commit_id}: {e}"))?
                 .ok_or_else(|| anyhow!("have commit {commit_id} not found"))?;
-            gix::objs::CommitRefIter::from_bytes(obj.data)
+            gix::objs::CommitRefIter::from_bytes(obj.data, gix_hash::Kind::Sha1)
                 .tree_id()
                 .map_err(|e| anyhow!("read tree id from have commit: {e}"))?
         };
@@ -259,7 +260,7 @@ fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<H
                 .try_find(&tree_id, &mut tree_buf)
                 .map_err(|e| anyhow!("find have tree {tree_id}: {e}"))?
                 .ok_or_else(|| anyhow!("have tree {tree_id} not found"))?;
-            let root = gix::objs::TreeRefIter::from_bytes(obj.data);
+            let root = gix::objs::TreeRefIter::from_bytes(obj.data, gix_hash::Kind::Sha1);
             let mut visitor = HaveVisitor {
                 have_set: &mut have_set,
             };

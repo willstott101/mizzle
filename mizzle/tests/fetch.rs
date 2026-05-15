@@ -3,7 +3,7 @@ mod common;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use tempfile::tempdir;
@@ -63,43 +63,58 @@ dual_backend_test!(test_fetch, |make_server: fn(
 
 struct SniffingProxy {
     pub port: u16,
-    responses: Arc<Mutex<Vec<Vec<u8>>>>,
+    inner: Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>,
 }
 
 impl SniffingProxy {
     fn new(upstream_port: u16) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let responses: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
-        let responses_clone = Arc::clone(&responses);
+        let inner = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let inner_clone = Arc::clone(&inner);
 
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(client) = stream else { break };
-                let responses = Arc::clone(&responses_clone);
+                let inner = Arc::clone(&inner_clone);
                 thread::spawn(move || {
                     if let Ok(bytes) = proxy_connection(client, upstream_port) {
-                        responses.lock().unwrap().push(bytes);
+                        let (lock, cvar) = &*inner;
+                        lock.lock().unwrap().push(bytes);
+                        cvar.notify_all();
                     }
                 });
             }
         });
 
-        SniffingProxy { port, responses }
+        SniffingProxy { port, inner }
     }
 
     fn has_thin_pack_in_response(&self) -> anyhow::Result<bool> {
-        thread::sleep(std::time::Duration::from_millis(100));
-
-        let responses = self.responses.lock().unwrap();
-        for bytes in responses.iter() {
-            if let Ok(pack) = extract_pack_from_response(bytes) {
-                if is_thin_pack(&pack)? {
-                    return Ok(true);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (lock, cvar) = &*self.inner;
+        let mut seen = 0usize;
+        loop {
+            let guard = lock.lock().unwrap();
+            // Check any newly-captured responses since our last scan.
+            for bytes in guard[seen..].iter() {
+                if let Ok(pack) = extract_pack_from_response(bytes) {
+                    if is_thin_pack(&pack)? {
+                        return Ok(true);
+                    }
                 }
             }
+            seen = guard.len();
+
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let (_guard, timeout) = cvar.wait_timeout(guard, remaining).unwrap();
+            if timeout.timed_out() {
+                return Ok(false);
+            }
         }
-        Ok(false)
     }
 }
 

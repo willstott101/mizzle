@@ -354,7 +354,7 @@ pub(super) async fn build_pack(
                 .fetch_optional(pool)
                 .await?;
         if let Some((data,)) = row {
-            if let Ok(commit) = gix_object::CommitRef::from_bytes(&data) {
+            if let Ok(commit) = gix_object::CommitRef::from_bytes(&data, gix_hash::Kind::Sha1) {
                 if let Ok(tree_oid) = ObjectId::from_hex(commit.tree.as_ref()) {
                     collect_tree_oids(pool, repo_db_id, &tree_oid, &mut needed_oids).await?;
                 }
@@ -384,7 +384,7 @@ pub(super) async fn build_pack(
                     .fetch_optional(pool)
                     .await?;
             if let Some((data,)) = row {
-                if let Ok(commit) = gix_object::CommitRef::from_bytes(&data) {
+                if let Ok(commit) = gix_object::CommitRef::from_bytes(&data, gix_hash::Kind::Sha1) {
                     if let Ok(tree_oid) = ObjectId::from_hex(commit.tree.as_ref()) {
                         collect_tree_oids(pool, repo_db_id, &tree_oid, &mut have_oids).await?;
                     }
@@ -561,7 +561,7 @@ async fn collect_tree_oids(
         None => return Ok(()), // tree not found (shouldn't happen, but defensive)
     };
 
-    let tree = gix_object::TreeRef::from_bytes(&data)
+    let tree = gix_object::TreeRef::from_bytes(&data, gix_hash::Kind::Sha1)
         .with_context(|| format!("parsing tree {tree_oid}"))?;
     for entry in tree.entries {
         let child_oid = entry.oid.to_owned();
@@ -735,6 +735,7 @@ impl gix_object::Find for MemObjectStore {
                 Ok(Some(gix_object::Data {
                     kind: *kind,
                     data: buf,
+                    hash_kind: gix_hash::Kind::Sha1,
                 }))
             }
             None => Ok(None),
@@ -781,8 +782,8 @@ async fn fetch_trees_recursive(
         .insert(*oid, (gix_object::Kind::Tree, data.clone()));
 
     // Parse tree entries and recurse into subtrees.
-    let tree =
-        gix_object::TreeRef::from_bytes(&data).with_context(|| format!("parsing tree {oid}"))?;
+    let tree = gix_object::TreeRef::from_bytes(&data, gix_hash::Kind::Sha1)
+        .with_context(|| format!("parsing tree {oid}"))?;
     for entry in tree.entries {
         if entry.mode.is_tree() {
             let child_oid = entry.oid.to_owned();

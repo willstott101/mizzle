@@ -15,6 +15,44 @@ use std::{fs, thread};
 
 use tempfile::{tempdir, TempDir};
 
+// ─── ReadySignal ─────────────────────────────────────────────────────────────
+//
+// One-shot signalling primitive for test infrastructure.  A background task
+// (server, proxy, …) sends [`ReadySender::signal`] once it is ready; the test
+// thread blocks on [`ReadyReceiver::wait`].
+//
+// Servers that bind their `TcpListener` *before* spawning a thread do not need
+// this — the bound port is the readiness guarantee (see `axum_server`).  Use
+// `ReadySignal` when the readiness event happens *inside* the spawned task.
+
+/// Sending half of a [`ready_signal`] pair.
+pub struct ReadySender(std::sync::mpsc::SyncSender<()>);
+
+/// Receiving half of a [`ready_signal`] pair.
+pub struct ReadyReceiver(std::sync::mpsc::Receiver<()>);
+
+/// Create a one-shot readiness signal.
+pub fn ready_signal() -> (ReadySender, ReadyReceiver) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    (ReadySender(tx), ReadyReceiver(rx))
+}
+
+impl ReadySender {
+    /// Signal that the background task is ready.  Consumes `self` so it can
+    /// only be called once.
+    pub fn signal(self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl ReadyReceiver {
+    /// Block until the sender calls [`ReadySender::signal`] or is dropped
+    /// (e.g. the background task panicked before becoming ready).
+    pub fn wait(self) {
+        let _ = self.0.recv();
+    }
+}
+
 /// Generate a test for each backend (FsGitoxide and FsGitCli).
 ///
 /// The body receives a `make_server` closure: `fn(Config) -> ServerHandle`.

@@ -1,13 +1,8 @@
 // Backend parity and concurrency tests.
 //
-// These tests express the *correct* post-fix behaviour for the concurrency
-// gaps documented in design/concurrency.md.  Tests that currently fail on
-// FsGitoxide are the regression baseline for Phase 1 implementation work.
-//
-// Failing tests:
-//   stale_oid_rejected_gitoxide          — PreviousValue::Any ignores old_oid
-//   multi_ref_atomicity_gitoxide         — per-ref transactions are not atomic
-//   concurrent_pushes_only_one_wins_gitoxide — lost-update under concurrent push
+// These tests express the correct behaviour for the concurrency gaps
+// documented in design/concurrency.md.  All three filesystem backends
+// (FsGitoxide, FsGitCli) now pass.
 mod common;
 
 use std::path::PathBuf;
@@ -26,9 +21,6 @@ fn null_oid() -> ObjectId {
 // ─── CAS correctness scenarios ───────────────────────────────────────────────
 
 /// Updating a ref with a wrong `old_oid` must be rejected.
-///
-/// Currently **fails** on FsGitoxide: `PreviousValue::Any` accepts any value.
-/// Passes on FsGitCli: `git update-ref` enforces CAS under the per-ref lock.
 fn scenario_stale_oid_rejected<B: StorageBackend<RepoId = PathBuf>>(backend: B) {
     use futures_lite::future::block_on;
 
@@ -68,10 +60,6 @@ fn scenario_stale_oid_rejected<B: StorageBackend<RepoId = PathBuf>>(backend: B) 
 
 /// A multi-ref batch where one edit has a stale `old_oid` must leave *all*
 /// refs unchanged (all-or-nothing).
-///
-/// Currently **fails** on FsGitoxide: the first ref in the batch commits
-/// before the second fails, leaving the repo in a partial state.
-/// Passes on FsGitCli: `git update-ref --stdin` is a single transaction.
 fn scenario_multi_ref_atomicity<B: StorageBackend<RepoId = PathBuf>>(backend: B) {
     use futures_lite::future::block_on;
 
@@ -133,10 +121,6 @@ dual_backend_access_test!(multi_ref_atomicity, |backend| {
 /// Eight threads simultaneously attempt to push `main: A → B` with the same
 /// `old_oid = A`.  Exactly one must succeed; the remaining seven must receive
 /// a CAS error.
-///
-/// Currently **fails** on FsGitoxide: all eight calls return `Ok(())` because
-/// `PreviousValue::Any` never checks `old_oid`.
-/// Passes on FsGitCli: `git update-ref` enforces the CAS under the per-ref lock.
 fn concurrent_pushes_only_one_wins<B, F>(make_backend: F)
 where
     B: StorageBackend<RepoId = PathBuf>,

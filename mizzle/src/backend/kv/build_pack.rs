@@ -122,7 +122,7 @@ async fn read_commit_tree(
     let Some(data) = objects::read_object_raw(db, repo_id, *commit_oid, u64::MAX).await? else {
         return Ok(None);
     };
-    let commit = match gix_object::CommitRef::from_bytes(&data) {
+    let commit = match gix_object::CommitRef::from_bytes(&data, gix_hash::Kind::Sha1) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(%commit_oid, error = %e, "failed to parse commit object during build_pack");
@@ -155,7 +155,7 @@ async fn collect_tree_oids(
             Some(d) => d,
             None => continue,
         };
-        let tree = gix_object::TreeRef::from_bytes(&data)
+        let tree = gix_object::TreeRef::from_bytes(&data, gix_hash::Kind::Sha1)
             .with_context(|| format!("parsing tree {current}"))?;
         for entry in tree.entries {
             let child = entry.oid.to_owned();
@@ -464,6 +464,7 @@ impl gix_object::Find for MemObjectStore {
                 Ok(Some(gix_object::Data {
                     kind: *kind,
                     data: buf,
+                    hash_kind: gix_hash::Kind::Sha1,
                 }))
             }
             None => Ok(None),
@@ -496,8 +497,8 @@ async fn fetch_trees_recursive(
         .objects
         .insert(*oid, (gix_object::Kind::Tree, data.clone()));
 
-    let tree =
-        gix_object::TreeRef::from_bytes(&data).with_context(|| format!("parsing tree {oid}"))?;
+    let tree = gix_object::TreeRef::from_bytes(&data, gix_hash::Kind::Sha1)
+        .with_context(|| format!("parsing tree {oid}"))?;
     for entry in tree.entries {
         if entry.mode.is_tree() {
             let child = entry.oid.to_owned();
