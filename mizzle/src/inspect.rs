@@ -103,7 +103,8 @@ pub fn inspect_pack(pack_path: &Path) -> Result<PackMetadata> {
 }
 
 pub(crate) fn parse_commit_info(data: &[u8], oid: ObjectId) -> Result<CommitInfo> {
-    let commit = gix_object::CommitRef::from_bytes(data).context("parsing commit object")?;
+    let commit = gix_object::CommitRef::from_bytes(data, gix_hash::Kind::Sha1)
+        .context("parsing commit object")?;
 
     let tree = ObjectId::from_hex(commit.tree.as_ref()).context("parsing commit tree oid")?;
     let parents = commit
@@ -138,7 +139,8 @@ pub(crate) fn parse_commit_info(data: &[u8], oid: ObjectId) -> Result<CommitInfo
 }
 
 pub(crate) fn parse_tag_info(data: &[u8], oid: ObjectId) -> Result<TagInfo> {
-    let tag = gix_object::TagRef::from_bytes(data).context("parsing tag object")?;
+    let tag =
+        gix_object::TagRef::from_bytes(data, gix_hash::Kind::Sha1).context("parsing tag object")?;
 
     let signature = tag.pgp_signature.map(|s| s.to_vec());
     let signature = signature.map(|bytes| {
@@ -148,7 +150,7 @@ pub(crate) fn parse_tag_info(data: &[u8], oid: ObjectId) -> Result<TagInfo> {
 
     let tagger = match tag.tagger {
         Some(raw) => {
-            let s = gix::actor::SignatureRef::from_bytes::<()>(raw)
+            let s = gix::actor::SignatureRef::from_bytes(raw)
                 .map_err(|e| anyhow::anyhow!("parsing tag tagger: {e:?}"))?;
             Some(identity_from(&s))
         }

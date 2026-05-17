@@ -11,9 +11,7 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     - name: Build
@@ -22,3 +20,50 @@ jobs:
       run: cargo test --verbose
     - name: Check fmt
       run: cargo fmt --check
+
+  tikv-integration:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install TiUP
+      run: curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+
+    - name: Start TiKV playground
+      run: |
+        ~/.tiup/bin/tiup playground --without-monitor > /tmp/tiup.log 2>&1 &
+        echo "Waiting for PD to become healthy..."
+        for i in $(seq 1 60); do
+          if curl -sf http://127.0.0.1:2379/health > /dev/null 2>&1; then
+            echo "PD ready after ${i}s"
+            break
+          fi
+          sleep 2
+        done
+        curl -sf http://127.0.0.1:2379/health || (echo "PD never became healthy" && cat /tmp/tiup.log && exit 1)
+
+        echo "Waiting for at least one TiKV store to be Up..."
+        for i in $(seq 1 90); do
+          UP=$(curl -s http://127.0.0.1:2379/pd/api/v1/stores | python3 -c "import sys, json; d = json.load(sys.stdin); print(sum(1 for s in d.get('stores', []) if s.get('store', {}).get('state_name') == 'Up'))" 2>/dev/null || echo 0)
+          if [ "$UP" -ge 1 ]; then
+            echo "TiKV ready after ${i}s ($UP stores Up)"
+            break
+          fi
+          sleep 2
+        done
+        FINAL_UP=$(curl -s http://127.0.0.1:2379/pd/api/v1/stores | python3 -c "import sys, json; d = json.load(sys.stdin); print(sum(1 for s in d.get('stores', []) if s.get('store', {}).get('state_name') == 'Up'))" 2>/dev/null || echo 0)
+        if [ "$FINAL_UP" -lt 1 ]; then
+          echo "No TiKV stores ever reached Up state"
+          cat /tmp/tiup.log
+          exit 1
+        fi
+
+    - name: Run KV integration tests
+      env:
+        MIZZLE_TIKV_PD_ADDR: "127.0.0.1:2379"
+        RUST_BACKTRACE: "1"
+      run: cargo test --features tikv --test backend_parity --verbose kv_tests -- --nocapture --test-threads=1
+
+    - name: Dump TiUP playground log on failure
+      if: failure()
+      run: cat /tmp/tiup.log || true

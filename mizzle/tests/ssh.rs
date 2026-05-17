@@ -105,8 +105,9 @@ impl SshTestServer {
             });
         });
 
-        // Give the server a moment to start accepting
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // No sleep needed: the TcpListener is bound above (line 88-91) before
+        // the thread spawns, so the kernel is already queuing incoming TCP
+        // connections.  Same guarantee axum_server relies on in common/mod.rs.
 
         SshTestServer {
             port,

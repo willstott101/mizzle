@@ -15,6 +15,44 @@ use std::{fs, thread};
 
 use tempfile::{tempdir, TempDir};
 
+// ─── ReadySignal ─────────────────────────────────────────────────────────────
+//
+// One-shot signalling primitive for test infrastructure.  A background task
+// (server, proxy, …) sends [`ReadySender::signal`] once it is ready; the test
+// thread blocks on [`ReadyReceiver::wait`].
+//
+// Servers that bind their `TcpListener` *before* spawning a thread do not need
+// this — the bound port is the readiness guarantee (see `axum_server`).  Use
+// `ReadySignal` when the readiness event happens *inside* the spawned task.
+
+/// Sending half of a [`ready_signal`] pair.
+pub struct ReadySender(std::sync::mpsc::SyncSender<()>);
+
+/// Receiving half of a [`ready_signal`] pair.
+pub struct ReadyReceiver(std::sync::mpsc::Receiver<()>);
+
+/// Create a one-shot readiness signal.
+pub fn ready_signal() -> (ReadySender, ReadyReceiver) {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    (ReadySender(tx), ReadyReceiver(rx))
+}
+
+impl ReadySender {
+    /// Signal that the background task is ready.  Consumes `self` so it can
+    /// only be called once.
+    pub fn signal(self) {
+        let _ = self.0.send(());
+    }
+}
+
+impl ReadyReceiver {
+    /// Block until the sender calls [`ReadySender::signal`] or is dropped
+    /// (e.g. the background task panicked before becoming ready).
+    pub fn wait(self) {
+        let _ = self.0.recv();
+    }
+}
+
 /// Generate a test for each backend (FsGitoxide and FsGitCli).
 ///
 /// The body receives a `make_server` closure: `fn(Config) -> ServerHandle`.
@@ -562,6 +600,72 @@ pub fn sql_backend_from_fs(bare_path: &FsPath) -> mizzle::backend::sql::SqlBacke
 
         sql
     })
+}
+
+/// Create a [`KvBackend`](mizzle::backend::kv::KvBackend) connected to the
+/// TiKV cluster at `$MIZZLE_TIKV_PD_ADDR` and pre-populated with the refs
+/// and objects from a filesystem bare repo at `bare_path`.
+///
+/// The caller owns the tokio runtime so it can outlive the backend.
+/// `TransactionClient` spawns background tasks (PD client, timestamp oracle)
+/// on the runtime that's current at construction time — if the helper owned
+/// its own runtime locally those tasks would die on return and the next
+/// operation would hit `TimestampRequest channel is closed`.
+///
+/// Returns the backend and the `TempDir` that owns the pack cache; the
+/// caller must keep the `TempDir` alive for the duration of the backend so
+/// the cache directory isn't cleaned up prematurely, and isn't leaked on
+/// test exit.  Returns `None` if the env var is unset so tests can skip
+/// cleanly when no TiKV cluster is available locally.
+#[cfg(feature = "tikv")]
+pub fn kv_backend_from_fs(
+    rt: &tokio::runtime::Runtime,
+    bare_path: &FsPath,
+) -> Option<(mizzle::backend::kv::KvBackend, TempDir)> {
+    use mizzle::backend::fs_gitoxide::FsGitoxide;
+
+    let pd_addr = std::env::var("MIZZLE_TIKV_PD_ADDR").ok()?;
+    let cache_dir = tempdir().unwrap();
+    let cache_path = cache_dir.path().to_path_buf();
+    let backend = rt.block_on(async move {
+        let kv = mizzle::backend::kv::KvBackend::connect(vec![pd_addr], cache_path)
+            .await
+            .expect("connect to TiKV");
+
+        kv.init_repo(&bare_path.to_path_buf()).await.unwrap();
+        let kv_repo = kv.open(&bare_path.to_path_buf()).await.unwrap();
+
+        let pack_dir = bare_path.join("objects").join("pack");
+        if pack_dir.exists() {
+            for entry in std::fs::read_dir(&pack_dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pack") {
+                    kv.ingest_pack(&kv_repo, &path).await.unwrap();
+                }
+            }
+        }
+
+        let fs = FsGitoxide;
+        let fs_repo = fs.open(&bare_path.to_path_buf()).await.unwrap();
+        let refs_snap = fs.list_refs(&fs_repo).await.unwrap();
+
+        let ref_updates: Vec<mizzle_proto::receive::RefUpdate> = refs_snap
+            .refs
+            .iter()
+            .filter(|r| r.name.starts_with("refs/"))
+            .map(|r| mizzle_proto::receive::RefUpdate {
+                old_oid: gix_hash::ObjectId::null(gix_hash::Kind::Sha1),
+                new_oid: r.oid,
+                refname: r.name.clone(),
+            })
+            .collect();
+        if !ref_updates.is_empty() {
+            kv.update_refs(&kv_repo, &ref_updates).await.unwrap();
+        }
+
+        kv
+    });
+    Some((backend, cache_dir))
 }
 
 /// Spin up an axum server with a custom [`RepoAccess`] using the default FsGitoxide backend.
