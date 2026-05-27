@@ -146,6 +146,16 @@ round-trip.
 The cross-backend harness from Phase 6 immediately validates correctness
 and surfaces performance characteristics.
 
+### Phase 9 — Git LFS
+
+LFS as a storage concern orthogonal to the git `StorageBackend`: a thin
+`LfsStore` trait joined to the auth layer only by `RepoId`, so the LFS
+object store and the git object store can be the same backend (coupled)
+or different ones (e.g. S3 for LFS, SQLite for git).  The batch API
+returns URLs rather than bytes, so a store chooses per object between
+proxying through mizzle and redirecting to a presigned URL.  Full plan in
+[lfs-backend-plan.md](lfs-backend-plan.md).
+
 ---
 
 ## Testing strategy
