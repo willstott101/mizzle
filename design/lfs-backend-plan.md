@@ -130,6 +130,8 @@ backend can reuse its existing repo handle.
 ```rust
 pub trait LfsStore: Send + Sync + 'static {
     type RepoId: Send + Sync + Clone + 'static;
+    /// Expected to be a cheap handle (e.g. a cloned pool reference), not
+    /// an expensive resource — constructed once per request.
     type Repo: Send + Sync;
 
     fn open(&self, id: &Self::RepoId)
@@ -147,11 +149,21 @@ pub trait LfsStore: Send + Sync + 'static {
     fn upload_action(&self, repo: &Self::Repo, oid: &LfsOid, size: u64)
         -> impl Future<Output = Result<TransferAction>> + Send;
 
-    // Proxy-mode byte transfer — only called when the matching
-    // *_action returned `Proxy`.  Redirect-only stores leave these
-    // `unimplemented!()`.
+    /// Stream a stored object to the client (proxy transfer only).
+    ///
+    /// Only called when `download_action` returned `TransferAction::Proxy`.
+    /// Stores that always return `Redirect` never have this called; they
+    /// should return `Err(LfsError::ProxyNotSupported)`.
     fn read(&self, repo: &Self::Repo, oid: &LfsOid)
         -> impl Future<Output = Result<impl AsyncRead + Send>> + Send;
+
+    /// Receive and store an object from the client (proxy transfer only).
+    ///
+    /// Only called when `upload_action` returned `TransferAction::Proxy`.
+    /// Stores that always return `Redirect` never have this called; they
+    /// should return `Err(LfsError::ProxyNotSupported)`.
+    /// Implementations must verify the sha256 of the received bytes
+    /// matches `oid` and reject on mismatch.
     fn write(&self, repo: &Self::Repo, oid: &LfsOid, size: u64,
              src: impl AsyncRead + Send + Unpin)
         -> impl Future<Output = Result<()>> + Send;
@@ -173,6 +185,12 @@ pub enum TransferAction {
 `LfsOid` is a `[u8; 32]` newtype (sha256), distinct from gix `ObjectId`
 (a git object name).  It lives in `mizzle-proto` with the pointer parser.
 
+For redirect stores (S3), presigning is a local HMAC operation; only
+`stat` (HeadObject) is a network round-trip per batch object.  If
+profiling shows the separate `stat` + `*_action` calls are a bottleneck,
+a `batch_object(op, oid, size)` default method can fuse them — deferred
+until there is evidence it matters.
+
 Reference stores at a glance:
 
 | Store | `download/upload_action` | `read`/`write` |
@@ -180,7 +198,7 @@ Reference stores at a glance:
 | `FsLfs` | `Proxy` | read/write `objects/<oid[0:2]>/<oid[2:4]>/<oid>` |
 | `SqlLfs` (coupled) | `Proxy` | `SELECT`/`INSERT` on `lfs_objects` |
 | `KvLfs` (coupled) | `Proxy` | get/put `("lfs", repo, oid)` |
-| `S3LfsStore` | `Redirect { presigned }` | `unimplemented!()` |
+| `S3LfsStore` | `Redirect { presigned }` | `Err(LfsError::ProxyNotSupported)` |
 
 ## Wiring into `serve`
 
@@ -229,7 +247,13 @@ One hook on `RepoAccess`, defaulted so it is non-breaking:
 /// Authorise an LFS transfer batch.  Called once per batch request,
 /// before any object bytes move.  Default: allow (matches the v1
 /// "reachable ⇒ readable" stance; forges gate uploads here).
-fn authorize_lfs(&self, _op: LfsOperation) -> Result<(), String> { Ok(()) }
+///
+/// `git_ref` is the optional git ref from the BatchRequest (e.g.
+/// `refs/heads/main`) — forges that scope LFS access by branch can use
+/// it.  It is advisory: git-lfs clients may omit it.
+fn authorize_lfs(&self, _op: LfsOperation, _git_ref: Option<&str>) -> Result<(), String> {
+    Ok(())
+}
 ```
 
 `LfsOperation` is `Download | Upload`.  The `Box<T>` forwarding impl in
@@ -238,15 +262,19 @@ default.
 
 Flow:
 
-1. **Batch** — `authorize_lfs(op)` runs first.  On `Err`, return HTTP 403
-   with the reason; no actions are issued, so no transfer URL is ever
-   minted.  This is the gate.
-2. **Proxy transfer endpoints** re-check the same capability on the
-   per-request `RepoAccess` the forge constructs (defence in depth — the
-   `PUT` handler must not trust a stale href).
-3. **Redirect transfer** needs no second check: the presigned URL
-   carries its own time-limited credential, issued only after step 1
-   passed.  Auth lives entirely at the batch boundary.
+1. **Batch** — `authorize_lfs(op, git_ref)` runs first.  On `Err`, return
+   HTTP 403 with the reason; no actions are issued, so no transfer URL is
+   ever minted.  This is the gate.
+2. **Proxy transfer endpoints** (`GET`/`PUT objects/<oid>`) receive their
+   own HTTP request.  The forge constructs a `RepoAccess` from that
+   request's credentials (bearer token, session cookie — whatever it uses
+   for all other endpoints) and `authorize_lfs` is called again.  There
+   is no mizzle-issued token: the forge's existing per-request auth
+   covers proxy transfer identically to the way it covers
+   `/git-upload-pack`.
+3. **Redirect transfer** needs no second check: the presigned URL carries
+   its own time-limited credential, issued only after step 1 passed.  Auth
+   lives entirely at the batch boundary.
 
 ### Upload integrity
 
@@ -282,7 +310,7 @@ mizzle/src/lfs/
 └── fs.rs         FsLfs reference store (standard on-disk layout)
 mizzle/src/backend/sql/lfs.rs    SqlLfs (coupled) — lfs_objects table
 mizzle/src/backend/kv/lfs.rs     KvLfs (coupled) — ("lfs", repo, oid) keys
-mizzle/src/lfs/s3.rs             S3LfsStore (separated) — presigned redirect
+mizzle/src/backend/s3_lfs.rs     S3LfsStore (separated) — presigned redirect
 ```
 
 ---
@@ -319,15 +347,16 @@ No concrete store yet.  `cargo build` green; existing tests unaffected.
 
 `batch.rs`:
 
-1. Parse `BatchRequest`; call `authorize_lfs(op)`.
+1. Parse `BatchRequest`; call `authorize_lfs(op, git_ref)`.
 2. For each object: `stat`.
    - **download**: present → `download_action`; absent → per-object
      `error { code: 404 }`.
    - **upload**: absent → `upload_action`; present → no action (already
      have it), optionally a `verify` action.
 3. For `TransferAction::Proxy`, synthesise the href
-   `<lfs-base>/objects/<oid>` (+ a short-lived mizzle token header); for
-   `Redirect`, pass `href`/`header`/`expires_at` straight through.
+   `<lfs-base>/objects/<oid>` (no separate token — the forge's normal
+   auth credentials cover the transfer endpoint); for `Redirect`, pass
+   `href`/`header`/`expires_at` straight through.
 4. Emit `BatchResponse` as `application/vnd.git-lfs+json`.
 
 `transfer.rs` (proxy stores only):
@@ -343,6 +372,10 @@ Standard git-lfs on-disk layout
 `<root>/<oid[0:2]>/<oid[2:4]>/<oid>`, `Proxy` for both actions.  Pairs
 with `FsGitoxide` / `FsGitCli`.  This is the correctness oracle: a real
 `git lfs push` / `git lfs pull` round-trips against it (Phase 7).
+
+`write` streams to a temp file in the same directory and renames it into
+place on success, so a failed upload never leaves a partial file at the
+canonical OID path.  `read` is a plain file open.
 
 ## Phase 4 — Coupled stores (`SqlLfs`, `KvLfs`)
 
@@ -364,8 +397,16 @@ cross-repo dedup — see below).
 
 - `stat` → `HeadObject`.
 - `download_action` → presigned `GetObject` URL (`Redirect`).
-- `upload_action` → presigned `PutObject` URL (`Redirect`).
-- `read`/`write` → `unimplemented!()` (never invoked in redirect mode).
+- `upload_action` → presigned `PutObject` URL with conditions:
+  `Content-Length` set to the declared size, and a content-checksum
+  condition (`x-amz-checksum-sha256` if the bucket has checksum
+  enforcement) so S3 rejects undersized or corrupt uploads before they
+  are committed.  Document the trust boundary: mizzle never reads the
+  uploaded bytes, so `verify` (existence + size via `stat`) is the only
+  post-upload integrity check mizzle can perform; strong sha256 verification
+  requires either Proxy mode or a separate async read-back.
+- `read`/`write` → `Err(LfsError::ProxyNotSupported)` (never invoked in
+  redirect mode).
 
 Behind an `s3` cargo feature (`aws-sdk-s3` or `rusty-s3` for
 presign-only).  Multi-gigabyte transfers bypass the mizzle process
