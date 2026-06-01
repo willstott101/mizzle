@@ -15,6 +15,7 @@ pub mod transfer;
 pub use fs::FsLfs;
 
 use std::future::Future;
+use std::marker::PhantomData;
 
 use anyhow::Result;
 use futures_lite::AsyncRead;
@@ -100,4 +101,78 @@ pub trait LfsStore: Send + Sync + 'static {
         size: u64,
         src: impl AsyncRead + Send + Unpin,
     ) -> impl Future<Output = Result<()>> + Send;
+}
+
+// ---------------------------------------------------------------------------
+// NoLfs — placeholder for repos that don't support LFS
+// ---------------------------------------------------------------------------
+
+/// A no-op [`LfsStore`] for repositories that do not support Git LFS.
+///
+/// Pass this to [`serve_with_backends`](crate::servers::axum::serve_with_backends)
+/// when you want git-only behaviour without wiring up a real LFS store.
+/// All batch objects are reported as missing; proxy transfer endpoints return
+/// an error if somehow reached.
+#[derive(Clone, Copy)]
+pub struct NoLfs<R>(PhantomData<fn() -> R>);
+
+impl<R> NoLfs<R> {
+    pub fn new() -> Self {
+        NoLfs(PhantomData)
+    }
+}
+
+impl<R> Default for NoLfs<R> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<R: Send + Sync + Clone + 'static> LfsStore for NoLfs<R> {
+    type RepoId = R;
+    type Repo = ();
+
+    fn open(&self, _id: &R) -> impl Future<Output = Result<()>> + Send {
+        async { Ok(()) }
+    }
+
+    fn stat(&self, _repo: &(), _oid: &LfsOid) -> impl Future<Output = Result<Option<u64>>> + Send {
+        async { Ok(None) }
+    }
+
+    fn download_action(
+        &self,
+        _repo: &(),
+        _oid: &LfsOid,
+        _size: u64,
+    ) -> impl Future<Output = Result<TransferAction>> + Send {
+        async { anyhow::bail!("LFS not supported") }
+    }
+
+    fn upload_action(
+        &self,
+        _repo: &(),
+        _oid: &LfsOid,
+        _size: u64,
+    ) -> impl Future<Output = Result<TransferAction>> + Send {
+        async { anyhow::bail!("LFS not supported") }
+    }
+
+    fn read(
+        &self,
+        _repo: &(),
+        _oid: &LfsOid,
+    ) -> impl Future<Output = Result<Box<dyn AsyncRead + Send + Unpin>>> + Send {
+        async { anyhow::bail!("LFS not supported") }
+    }
+
+    fn write(
+        &self,
+        _repo: &(),
+        _oid: &LfsOid,
+        _size: u64,
+        _src: impl AsyncRead + Send + Unpin,
+    ) -> impl Future<Output = Result<()>> + Send {
+        async { anyhow::bail!("LFS not supported") }
+    }
 }

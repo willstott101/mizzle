@@ -7,12 +7,11 @@ use axum::{
 use futures_lite::AsyncRead;
 use futures_util::TryStreamExt;
 use std::io;
-use std::path::PathBuf;
 use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 use tokio_util::io::StreamReader;
 
 use crate::{
-    backend::{fs_gitoxide::FsGitoxide, StorageBackend},
+    backend::StorageBackend,
     lfs::{batch, transfer, LfsStore},
     serve::{serve_git_protocol_1, serve_git_protocol_2, GitResponse, ProtocolLimits},
     traits::RepoAccess,
@@ -34,19 +33,6 @@ impl IntoResponse for GitResponse {
             StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         (status_code, headers, body).into_response()
     }
-}
-
-/// Serve a git request using the default filesystem (gitoxide) backend.
-///
-/// Call this from your own handler after performing whatever authentication you
-/// need.  `path` is the full URL path (e.g. `"myrepo.git/info/refs"`).
-pub async fn serve<A: RepoAccess<RepoId = PathBuf> + Send + 'static>(
-    access: A,
-    path: &str,
-    limits: &ProtocolLimits,
-    req: Request,
-) -> Response {
-    serve_with_backend(access, FsGitoxide, path, limits, req).await
 }
 
 /// Serve a Git LFS request.
@@ -200,11 +186,7 @@ where
     serve_with_backend(access, git, path, limits, req).await
 }
 
-/// Serve a git request using an arbitrary [`StorageBackend`].
-///
-/// This is the generic version of [`serve`] — use it when you want to plug in
-/// a backend other than the default [`FsGitoxide`].
-pub async fn serve_with_backend<A, B>(
+async fn serve_with_backend<A, B>(
     access: A,
     backend: B,
     path: &str,
