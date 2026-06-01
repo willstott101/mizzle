@@ -395,6 +395,11 @@ impl FsGitoxide {
     }
 
     fn init_repo_sync(&self, repo_path: &PathBuf) -> Result<()> {
+        if let Some(parent) = repo_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating parent directories for {}", repo_path.display())
+            })?;
+        }
         match gix::init_bare(repo_path) {
             Ok(_) => Ok(()),
             // gix::init_bare rejects non-empty directories.  A concurrent
@@ -1178,6 +1183,16 @@ mod tests {
         assert!(refs.is_empty(), "freshly init'd repo should have no refs");
         // Calling again is a no-op (already exists)
         futures_lite::future::block_on(FsGitoxide.init_repo(&repo_path)).unwrap();
+    }
+
+    #[test]
+    fn test_init_repo_creates_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().join("org/team/test.git");
+        assert!(!repo_path.exists());
+        futures_lite::future::block_on(FsGitoxide.init_repo(&repo_path)).unwrap();
+        assert!(repo_path.exists());
+        gix::open(&repo_path).unwrap();
     }
 
     #[test]
