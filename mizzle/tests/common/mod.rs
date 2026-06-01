@@ -383,7 +383,15 @@ async fn axum_git_handler(
     req: Request,
 ) -> Response {
     let limits = mizzle::serve::ProtocolLimits::default();
-    mizzle::servers::axum::serve((*config).clone(), &path, &limits, req).await
+    mizzle::servers::axum::serve_with_backends(
+        (*config).clone(),
+        mizzle::backend::fs_gitoxide::FsGitoxide,
+        mizzle::lfs::fs::FsLfs,
+        &path,
+        &limits,
+        req,
+    )
+    .await
 }
 
 pub fn axum_server(config: Config) -> ServerHandle {
