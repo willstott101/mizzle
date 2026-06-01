@@ -107,7 +107,7 @@ async fn main() {
         .init();
 
     let config = Arc::new(Config {
-        repos_base: PathBuf::from("."),
+        repos_base: PathBuf::from("./data"),
         limits: ProtocolLimits::default(),
     });
 
