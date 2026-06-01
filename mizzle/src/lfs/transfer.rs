@@ -3,6 +3,7 @@
 //! Handles the actual byte transfer for stores that use `TransferAction::Proxy`.
 
 use futures_lite::AsyncRead;
+use tracing::{debug, error, info, warn};
 
 use mizzle_proto::lfs::Operation;
 
@@ -29,27 +30,47 @@ where
     A: RepoAccess,
     L: LfsStore<RepoId = A::RepoId>,
 {
+    debug!(oid = oid_hex, "LFS download request");
+
     let oid = match format!("sha256:{oid_hex}").parse::<LfsOid>() {
         Ok(o) => o,
-        Err(_) => return (400, None),
+        Err(e) => {
+            warn!(oid = oid_hex, error = %e, "LFS download: invalid OID");
+            return (400, None);
+        }
     };
 
     let repo = match lfs.open(repo_id).await {
         Ok(r) => r,
-        Err(_) => return (500, None),
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS download: failed to open store");
+            return (500, None);
+        }
     };
 
     // Check existence.
     match lfs.stat(&repo, &oid).await {
-        Ok(None) => return (404, None),
+        Ok(None) => {
+            debug!(oid = oid_hex, "LFS download: object not found");
+            return (404, None);
+        }
         Ok(Some(_)) => {}
-        Err(_) => return (500, None),
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS download: stat failed");
+            return (500, None);
+        }
     }
 
     // Stream.
     match lfs.read(&repo, &oid).await {
-        Ok(reader) => (200, Some(reader)),
-        Err(_) => (500, None),
+        Ok(reader) => {
+            info!(oid = oid_hex, "LFS download: streaming object");
+            (200, Some(reader))
+        }
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS download: read failed");
+            (500, None)
+        }
     }
 }
 
@@ -73,23 +94,36 @@ where
     A: RepoAccess,
     L: LfsStore<RepoId = A::RepoId>,
 {
+    debug!(oid = oid_hex, size, "LFS upload request");
+
     // Auth gate for uploads.
-    if let Err(_reason) = access.authorize_lfs(Operation::Upload, None) {
+    if let Err(reason) = access.authorize_lfs(Operation::Upload, None) {
+        warn!(oid = oid_hex, reason, "LFS upload: authorization denied");
         return 403;
     }
 
     let oid = match format!("sha256:{oid_hex}").parse::<LfsOid>() {
         Ok(o) => o,
-        Err(_) => return 400,
+        Err(e) => {
+            warn!(oid = oid_hex, error = %e, "LFS upload: invalid OID");
+            return 400;
+        }
     };
 
     let repo = match lfs.open(repo_id).await {
         Ok(r) => r,
-        Err(_) => return 500,
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS upload: failed to open store");
+            return 500;
+        }
     };
 
+    info!(oid = oid_hex, size, "LFS upload: receiving object");
     match lfs.write(&repo, &oid, size, body).await {
-        Ok(()) => 200,
+        Ok(()) => {
+            info!(oid = oid_hex, size, "LFS upload: object stored");
+            200
+        }
         Err(e) => {
             let msg = e.to_string();
             if msg.contains("sha256")
@@ -97,8 +131,10 @@ where
                 || msg.contains("size")
                 || msg.contains("mismatch")
             {
+                warn!(oid = oid_hex, error = %e, "LFS upload: integrity check failed");
                 422
             } else {
+                error!(oid = oid_hex, error = %e, "LFS upload: write failed");
                 500
             }
         }
@@ -123,20 +159,37 @@ where
     A: RepoAccess,
     L: LfsStore<RepoId = A::RepoId>,
 {
+    let oid_hex = oid.to_hex();
+    debug!(oid = oid_hex, expected_size, "LFS verify request");
+
     let repo = match lfs.open(repo_id).await {
         Ok(r) => r,
-        Err(_) => return 500,
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS verify: failed to open store");
+            return 500;
+        }
     };
 
     match lfs.stat(&repo, oid).await {
-        Ok(None) => 404,
+        Ok(None) => {
+            warn!(oid = oid_hex, "LFS verify: object not found");
+            404
+        }
         Ok(Some(actual_size)) => {
             if actual_size == expected_size {
+                info!(oid = oid_hex, actual_size, "LFS verify: object OK");
                 200
             } else {
+                warn!(
+                    oid = oid_hex,
+                    expected_size, actual_size, "LFS verify: size mismatch"
+                );
                 422
             }
         }
-        Err(_) => 500,
+        Err(e) => {
+            error!(oid = oid_hex, error = %e, "LFS verify: stat failed");
+            500
+        }
     }
 }
