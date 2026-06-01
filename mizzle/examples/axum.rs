@@ -40,6 +40,10 @@ impl RepoAccess for Access {
         }
         Ok(())
     }
+
+    fn auto_init(&self) -> bool {
+        true
+    }
 }
 
 async fn git_handler(
@@ -55,15 +59,20 @@ async fn git_handler(
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
-    let access = Access {
-        repo_path: config.repo_path.clone(),
-    };
+    // Derive the per-repo path from the URL: everything before `.git/`.
+    let repo_name = path
+        .split_once(".git/")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(path.trim_end_matches('/'));
+    let repo_path = config.repos_base.join(repo_name);
+
+    let access = Access { repo_path };
     serve_with_backends(access, FsGitoxide, FsLfs, &path, &config.limits, req).await
 }
 
 #[derive(Clone)]
 struct Config {
-    repo_path: PathBuf,
+    repos_base: PathBuf,
     limits: ProtocolLimits,
 }
 
@@ -77,7 +86,7 @@ async fn main() {
         .init();
 
     let config = Arc::new(Config {
-        repo_path: PathBuf::from("."),
+        repos_base: PathBuf::from("."),
         limits: ProtocolLimits::default(),
     });
 
