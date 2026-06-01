@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{DefaultBodyLimit, Path, Request, State},
+    handler::Handler,
     response::Response,
     routing::get,
     Router,
@@ -111,22 +112,25 @@ async fn main() {
         limits: ProtocolLimits::default(),
     });
 
+    // TimeoutLayer measures request-processing time (first byte received →
+    // response complete).  It does NOT protect against idle TCP connections
+    // that never send headers — for that, configure hyper's
+    // `http1_header_read_timeout` on the server builder.
+    //
+    // Git smart-HTTP (GET/POST) completes quickly; a 300 s ceiling is fine.
+    // LFS uploads (PUT) can transfer gigabytes — applying any fixed deadline
+    // here would kill large uploads mid-stream, so PUT carries no timeout.
+    let git_timeout =
+        TimeoutLayer::with_status_code(StatusCode::GATEWAY_TIMEOUT, Duration::from_secs(300));
+
     let app = Router::new()
         .route(
             "/{*key}",
-            get(git_handler).post(git_handler).put(git_handler),
+            get(git_handler.layer(git_timeout.clone()))
+                .post(git_handler.layer(git_timeout))
+                .put(git_handler),
         )
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024)) // 5 GB
-        // NOTE: Do not set a short timeout here if you serve LFS uploads.
-        // TimeoutLayer applies to the entire request/response cycle, so a
-        // large upload that takes longer than the deadline will be killed
-        // mid-transfer and the client will see a broken pipe or 504.
-        // Either omit this layer or set a value larger than your worst-case
-        // upload time.  For non-LFS workloads a 300 s timeout is fine.
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::GATEWAY_TIMEOUT,
-            Duration::from_secs(3600), // 1 h — accommodates large LFS uploads
-        ))
         .layer(ConcurrencyLimitLayer::new(64))
         .with_state(config);
 

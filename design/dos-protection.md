@@ -45,6 +45,32 @@ command.  This is enforced by a spawned task, not a passive check.
 | IP blocking / allowlisting     | Network policy                      | **Forge / infrastructure** |
 | Abuse detection                | Domain logic in `RepoAccess`        | **Forge**                 |
 
+## HTTP request timeouts
+
+Two distinct problems share the word "timeout" but need separate mitigations:
+
+**Idle TCP connections** — a client that opens a connection but never sends
+HTTP request headers.  `tower_http::TimeoutLayer` does *not* cover this; it
+only starts once the framework begins processing a request.  True idle-connection
+protection requires configuring hyper's `http1_header_read_timeout` on the
+server builder, or relying on OS-level TCP keepalives.
+
+**Request-processing time** — how long the full request/response cycle is
+allowed to take.  `TimeoutLayer` handles this, but one ceiling does not fit
+all operations:
+
+- **Git smart-HTTP (GET, POST)**: bounded by negotiation and pack-build time.
+  A few minutes (e.g. 300 s) is a safe ceiling.
+- **LFS batch (POST)**: pure JSON metadata exchange; should complete in seconds.
+- **LFS upload (PUT)**: bounded by the client's upload bandwidth and object
+  size.  Any fixed deadline kills large uploads mid-stream.  Apply no
+  `TimeoutLayer` to PUT routes; rely on pack-size limits and connection-level
+  flow control instead.
+
+The example applies `TimeoutLayer` per HTTP method using axum's
+`Handler::layer()`, so git operations get the short ceiling while LFS uploads
+are unrestricted.
+
 ## Example code, not library code
 
 Mizzle's example binaries / reference servers should demonstrate sensible
