@@ -1,5 +1,6 @@
 pub mod command;
 pub mod fetch;
+pub mod lfs;
 pub mod limits;
 pub mod ls_refs;
 pub mod pack;
