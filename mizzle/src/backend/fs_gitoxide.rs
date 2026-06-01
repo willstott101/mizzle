@@ -542,7 +542,7 @@ impl FsGitoxide {
             Some(temp_dir.path()),
             &mut progress,
             &interrupt,
-            None::<gix::objs::find::Never>,
+            Some(Box::new(local.objects.clone())),
             Default::default(),
         )
         .context("indexing received pack")?;
