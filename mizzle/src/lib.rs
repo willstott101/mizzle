@@ -5,6 +5,7 @@ pub mod bitmap;
 mod command;
 mod fetch;
 pub(crate) mod inspect;
+pub mod lfs;
 mod ls_refs;
 pub(crate) mod pack;
 pub mod pack_reuse;

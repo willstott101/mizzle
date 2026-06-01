@@ -3671,6 +3671,8 @@ dependencies = [
  "gix-hash",
  "gix-packetline",
  "log",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

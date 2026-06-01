@@ -99,6 +99,22 @@ pub trait RepoAccess {
     fn auto_init(&self) -> bool {
         false
     }
+
+    /// Authorise a Git LFS transfer batch.
+    ///
+    /// Called once per batch request, before any object bytes move.
+    /// Default: allow (matches the v1 "reachable ⇒ readable" stance; forges
+    /// that want to gate uploads must override this).
+    ///
+    /// `git_ref` is the optional git ref from the `BatchRequest` (e.g.
+    /// `refs/heads/main`).  It is advisory: git-lfs clients may omit it.
+    fn authorize_lfs(
+        &self,
+        _op: mizzle_proto::lfs::Operation,
+        _git_ref: Option<&str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Convenience impl for deny-all access objects that are never constructed.
@@ -140,5 +156,12 @@ impl<T: RepoAccess + ?Sized> RepoAccess for Box<T> {
     }
     fn auto_init(&self) -> bool {
         (**self).auto_init()
+    }
+    fn authorize_lfs(
+        &self,
+        op: mizzle_proto::lfs::Operation,
+        git_ref: Option<&str>,
+    ) -> Result<(), String> {
+        (**self).authorize_lfs(op, git_ref)
     }
 }
