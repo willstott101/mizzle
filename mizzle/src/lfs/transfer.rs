@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use mizzle_proto::lfs::Operation;
 
-use super::{LfsOid, LfsStore};
+use super::{LfsOid, LfsStore, LfsWriteError};
 use crate::traits::RepoAccess;
 
 /// Handle a proxy download request (`GET objects/<oid>`).
@@ -124,19 +124,13 @@ where
             info!(oid = oid_hex, size, "LFS upload: object stored");
             200
         }
+        Err(e @ (LfsWriteError::HashMismatch { .. } | LfsWriteError::SizeMismatch { .. })) => {
+            warn!(oid = oid_hex, error = %e, "LFS upload: integrity check failed");
+            422
+        }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("sha256")
-                || msg.contains("hash")
-                || msg.contains("size")
-                || msg.contains("mismatch")
-            {
-                warn!(oid = oid_hex, error = %e, "LFS upload: integrity check failed");
-                422
-            } else {
-                error!(oid = oid_hex, error = %e, "LFS upload: write failed");
-                500
-            }
+            error!(oid = oid_hex, error = %e, "LFS upload: write failed");
+            500
         }
     }
 }

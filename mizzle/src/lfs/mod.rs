@@ -23,6 +23,24 @@ use futures_lite::AsyncRead;
 pub use mizzle_proto::lfs::{LfsOid, Operation as LfsOperation};
 
 // ---------------------------------------------------------------------------
+// LfsWriteError
+// ---------------------------------------------------------------------------
+
+/// Typed error returned by [`LfsStore::write`].
+///
+/// Separating integrity failures from I/O failures lets callers map to the
+/// correct HTTP status code (422 vs 500) without inspecting error strings.
+#[derive(Debug, thiserror::Error)]
+pub enum LfsWriteError {
+    #[error("sha256 mismatch: expected {expected}, got {actual}")]
+    HashMismatch { expected: String, actual: String },
+    #[error("size mismatch: expected {expected} bytes, got {actual}")]
+    SizeMismatch { expected: u64, actual: u64 },
+    #[error(transparent)]
+    Io(#[from] anyhow::Error),
+}
+
+// ---------------------------------------------------------------------------
 // TransferAction
 // ---------------------------------------------------------------------------
 
@@ -93,14 +111,15 @@ pub trait LfsStore: Send + Sync + 'static {
     ///
     /// Only called when `upload_action` returned `TransferAction::Proxy`.
     /// Implementations **must** verify the SHA-256 of the received bytes and
-    /// reject a mismatch against `oid`.
+    /// reject a mismatch against `oid` as [`LfsWriteError::HashMismatch`], and
+    /// a size mismatch as [`LfsWriteError::SizeMismatch`].
     fn write(
         &self,
         repo: &Self::Repo,
         oid: &LfsOid,
         size: u64,
         src: impl AsyncRead + Send + Unpin,
-    ) -> impl Future<Output = Result<()>> + Send;
+    ) -> impl Future<Output = Result<(), LfsWriteError>> + Send;
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +191,7 @@ impl<R: Send + Sync + Clone + 'static> LfsStore for NoLfs<R> {
         _oid: &LfsOid,
         _size: u64,
         _src: impl AsyncRead + Send + Unpin,
-    ) -> impl Future<Output = Result<()>> + Send {
-        async { anyhow::bail!("LFS not supported") }
+    ) -> impl Future<Output = Result<(), LfsWriteError>> + Send {
+        async { Err(LfsWriteError::Io(anyhow::anyhow!("LFS not supported"))) }
     }
 }

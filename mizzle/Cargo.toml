@@ -19,6 +19,7 @@ gix-features = { version = "0.48", features = ["parallel"] }
 futures-lite = "2.6"
 piper = "0.2"
 anyhow = "1.0"
+thiserror = "2"
 tokio = { version = "1.49.0", features = ["full", "macros", "rt-multi-thread"] }
 tokio-util = { version = "0.7.18", features = ["compat", "io"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
