@@ -79,7 +79,7 @@ pub async fn info_refs_receive_pack_task(
     refs: Vec<(gix::ObjectId, String)>,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> Result<()> {
-    let caps = b"report-status delete-refs agent=mizzle/dev";
+    let caps = b"report-status delete-refs ofs-delta agent=mizzle/dev";
     if refs.is_empty() {
         // Empty repo: advertise capabilities only.
         let null_oid = "0000000000000000000000000000000000000000";
