@@ -11,8 +11,10 @@ use axum::{
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use mizzle::backend::fs_gitoxide::FsGitoxide;
+use mizzle::lfs::fs::FsLfs;
 use mizzle::serve::ProtocolLimits;
-use mizzle::servers::axum::serve;
+use mizzle::servers::axum::serve_with_backends;
 use mizzle::traits::{PushRef, RepoAccess};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -56,7 +58,7 @@ async fn git_handler(
     let access = Access {
         repo_path: config.repo_path.clone(),
     };
-    serve(access, &path, &config.limits, req).await
+    serve_with_backends(access, FsGitoxide, FsLfs, &path, &config.limits, req).await
 }
 
 #[derive(Clone)]
