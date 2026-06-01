@@ -386,7 +386,7 @@ async fn axum_git_handler(
     mizzle::servers::axum::serve_with_backends(
         (*config).clone(),
         mizzle::backend::fs_gitoxide::FsGitoxide,
-        mizzle::lfs::fs::FsLfs,
+        mizzle::lfs::NoLfs::new(),
         &path,
         &limits,
         req,
@@ -443,9 +443,10 @@ where
         B: StorageBackend<RepoId = PathBuf> + Clone + Send + Sync + 'static,
     {
         let limits = mizzle::serve::ProtocolLimits::default();
-        mizzle::servers::axum::serve_with_backend(
+        mizzle::servers::axum::serve_with_backends(
             state.0.clone(),
             state.1.clone(),
+            mizzle::lfs::NoLfs::new(),
             &path,
             &limits,
             req,
@@ -513,9 +514,10 @@ where
             async move {
                 let access = state.2(state.0.as_str().into());
                 let limits = mizzle::serve::ProtocolLimits::default();
-                mizzle::servers::axum::serve_with_backend(
+                mizzle::servers::axum::serve_with_backends(
                     access,
                     state.1.clone(),
+                    mizzle::lfs::NoLfs::new(),
                     &path,
                     &limits,
                     req,

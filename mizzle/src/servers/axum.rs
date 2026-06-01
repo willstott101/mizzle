@@ -186,11 +186,7 @@ where
     serve_with_backend(access, git, path, limits, req).await
 }
 
-/// Serve a git request using an arbitrary [`StorageBackend`].
-///
-/// This is the generic version of [`serve`] — use it when you want to plug in
-/// a backend other than the default [`FsGitoxide`].
-pub async fn serve_with_backend<A, B>(
+async fn serve_with_backend<A, B>(
     access: A,
     backend: B,
     path: &str,
