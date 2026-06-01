@@ -9,6 +9,7 @@ use axum::{
     Router,
 };
 
+use axum::http::header::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use base64::Engine;
@@ -77,7 +78,12 @@ async fn git_handler(
     };
 
     if !authorized {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::WWW_AUTHENTICATE,
+            axum::http::HeaderValue::from_static("Basic realm=\"mizzle\""),
+        );
+        return (StatusCode::UNAUTHORIZED, headers, "unauthorized").into_response();
     }
 
     // Derive the per-repo path from the URL: everything before `.git/`.
