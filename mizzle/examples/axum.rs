@@ -11,6 +11,7 @@ use axum::{
 
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
+use base64::Engine;
 use mizzle::backend::fs_gitoxide::FsGitoxide;
 use mizzle::lfs::fs::FsLfs;
 use mizzle::serve::ProtocolLimits;
@@ -47,11 +48,31 @@ async fn git_handler(
     Path(path): Path<String>,
     req: Request,
 ) -> Response {
-    let token = req
+    let auth_header = req
         .headers()
         .get("Authorization")
         .and_then(|v| v.to_str().ok());
-    if token != Some("Bearer secret") {
+
+    let authorized = if let Some(header) = auth_header {
+        if let Some(credentials) = header.strip_prefix("Basic ") {
+            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(credentials) {
+                if let Ok(creds_str) = String::from_utf8(decoded) {
+                    // Check for username:password (default is "user:pass")
+                    creds_str == "user:pass"
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if !authorized {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
     }
 
