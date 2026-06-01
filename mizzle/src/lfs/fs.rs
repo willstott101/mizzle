@@ -8,12 +8,12 @@
 
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use futures_lite::AsyncRead;
 use sha2::{Digest, Sha256};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
-use super::{LfsOid, LfsStore, TransferAction};
+use super::{LfsOid, LfsStore, LfsWriteError, TransferAction};
 
 /// Filesystem LFS store.
 ///
@@ -92,7 +92,7 @@ impl LfsStore for FsLfs {
         oid: &LfsOid,
         size: u64,
         mut src: impl AsyncRead + Send + Unpin,
-    ) -> Result<()> {
+    ) -> Result<(), LfsWriteError> {
         use futures_lite::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
@@ -105,11 +105,14 @@ impl LfsStore for FsLfs {
         }
 
         // Ensure directory exists.
-        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(|e| LfsWriteError::Io(e.into()))?;
 
         // Write to a temp file in the same directory (for atomic rename).
-        let tmp_file = tempfile::NamedTempFile::new_in(&dir)?;
-        let (std_file, tmp_path) = tmp_file.keep()?;
+        let tmp_file =
+            tempfile::NamedTempFile::new_in(&dir).map_err(|e| LfsWriteError::Io(e.into()))?;
+        let (std_file, tmp_path) = tmp_file.keep().map_err(|e| LfsWriteError::Io(e.into()))?;
         let mut tokio_file = tokio::fs::File::from_std(std_file);
 
         let mut hasher = Sha256::new();
@@ -117,39 +120,50 @@ impl LfsStore for FsLfs {
         let mut buf = vec![0u8; 64 * 1024]; // 64 KiB read buffer
 
         loop {
-            let n = src.read(&mut buf).await?;
+            let n = src
+                .read(&mut buf)
+                .await
+                .map_err(|e| LfsWriteError::Io(e.into()))?;
             if n == 0 {
                 break;
             }
             hasher.update(&buf[..n]);
-            tokio_file.write_all(&buf[..n]).await?;
+            tokio_file
+                .write_all(&buf[..n])
+                .await
+                .map_err(|e| LfsWriteError::Io(e.into()))?;
             total_written += n as u64;
         }
 
-        tokio_file.flush().await?;
+        tokio_file
+            .flush()
+            .await
+            .map_err(|e| LfsWriteError::Io(e.into()))?;
         drop(tokio_file);
 
         // Verify size.
         if total_written != size {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            return Err(anyhow!(
-                "size mismatch: expected {size} bytes, got {total_written}"
-            ));
+            return Err(LfsWriteError::SizeMismatch {
+                expected: size,
+                actual: total_written,
+            });
         }
 
         // Verify sha256.
         let actual_hash: [u8; 32] = hasher.finalize().into();
         if actual_hash != oid.0 {
             let _ = tokio::fs::remove_file(&tmp_path).await;
-            let actual_hex = LfsOid(actual_hash).to_hex();
-            return Err(anyhow!(
-                "sha256 mismatch: expected {}, got {actual_hex}",
-                oid.to_hex()
-            ));
+            return Err(LfsWriteError::HashMismatch {
+                expected: oid.to_hex(),
+                actual: LfsOid(actual_hash).to_hex(),
+            });
         }
 
         // Atomically rename into place.
-        tokio::fs::rename(&tmp_path, &dest).await?;
+        tokio::fs::rename(&tmp_path, &dest)
+            .await
+            .map_err(|e| LfsWriteError::Io(e.into()))?;
 
         Ok(())
     }
