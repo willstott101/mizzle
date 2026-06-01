@@ -112,11 +112,20 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/{*key}", get(git_handler).post(git_handler))
+        .route(
+            "/{*key}",
+            get(git_handler).post(git_handler).put(git_handler),
+        )
         .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024)) // 5 GB
+        // NOTE: Do not set a short timeout here if you serve LFS uploads.
+        // TimeoutLayer applies to the entire request/response cycle, so a
+        // large upload that takes longer than the deadline will be killed
+        // mid-transfer and the client will see a broken pipe or 504.
+        // Either omit this layer or set a value larger than your worst-case
+        // upload time.  For non-LFS workloads a 300 s timeout is fine.
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
-            Duration::from_secs(300),
+            Duration::from_secs(3600), // 1 h — accommodates large LFS uploads
         ))
         .layer(ConcurrencyLimitLayer::new(64))
         .with_state(config);

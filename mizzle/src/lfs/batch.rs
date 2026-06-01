@@ -11,6 +11,8 @@ use mizzle_proto::lfs::{
     BatchResponseObject, Operation,
 };
 
+use tracing::{debug, error, info, warn};
+
 use super::{LfsOid, LfsStore, TransferAction};
 use crate::traits::RepoAccess;
 
@@ -33,16 +35,28 @@ where
     let req: BatchRequest = match serde_json::from_slice(body) {
         Ok(r) => r,
         Err(e) => {
+            warn!(error = %e, "LFS batch: invalid request body");
             return (
                 400,
                 serde_json::json!({"message": format!("invalid request: {e}")}).to_string(),
-            )
+            );
         }
     };
+
+    let op = req.operation;
+    let object_count = req.objects.len();
+    let git_ref_name = req.git_ref.as_ref().map(|r| r.name.as_str()).unwrap_or("");
+    debug!(
+        operation = ?op,
+        object_count,
+        git_ref = git_ref_name,
+        "LFS batch request"
+    );
 
     // 2. Authorise.
     let git_ref: Option<String> = req.git_ref.as_ref().map(|r| r.name.clone());
     if let Err(reason) = access.authorize_lfs(req.operation, git_ref.as_deref()) {
+        warn!(operation = ?op, reason, "LFS batch: authorization denied");
         return (403, serde_json::json!({"message": reason}).to_string());
     }
 
@@ -50,11 +64,12 @@ where
     let repo = match lfs.open(repo_id).await {
         Ok(r) => r,
         Err(e) => {
+            error!(error = %e, "LFS batch: failed to open LFS store");
             return (
                 500,
                 serde_json::json!({"message": format!("failed to open LFS store: {e}")})
                     .to_string(),
-            )
+            );
         }
     };
 
@@ -185,11 +200,21 @@ where
     };
 
     match serde_json::to_string(&response) {
-        Ok(json) => (200, json),
-        Err(e) => (
-            500,
-            serde_json::json!({"message": format!("serialization error: {e}")}).to_string(),
-        ),
+        Ok(json) => {
+            info!(
+                operation = ?op,
+                object_count,
+                "LFS batch: response ready"
+            );
+            (200, json)
+        }
+        Err(e) => {
+            error!(error = %e, "LFS batch: serialization error");
+            (
+                500,
+                serde_json::json!({"message": format!("serialization error: {e}")}).to_string(),
+            )
+        }
     }
 }
 
