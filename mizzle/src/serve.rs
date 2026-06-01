@@ -27,7 +27,7 @@ macro_rules! res_try {
         match $expr {
             Ok(value) => value,
             Err(error) => {
-                error!("{}:{} res_try error: {}", file!(), line!(), error);
+                error!("{}:{} res_try error: {:#}", file!(), line!(), error);
                 return GitResponse {
                     reader: None,
                     body: Some(format!("internal error: {:#}", error)),
