@@ -141,6 +141,79 @@ pub fn temprepo() -> Result<TempRepo> {
     Ok(repo)
 }
 
+/// Returns a completely empty bare repo — no commits, no refs.
+/// Use this to test first-push scenarios (exercises `ofs-delta` capability advertisement).
+pub fn bare_empty_repo() -> Result<TempRepo> {
+    let dir = tempdir()?;
+    let repo = TempRepo { dir };
+    fs::create_dir_all(repo.path())?;
+    _run_git(repo.path().as_path(), ["init", "--bare"])?;
+    Ok(repo)
+}
+
+/// Returns a bare repo whose HEAD commit contains a single large text file (~12 KB).
+/// Use this to test thin-pack pushes: cloning and then pushing a modified version of
+/// the large file causes git to emit a REF_DELTA against the existing server-side blob,
+/// exercising the thin-pack resolver in `ingest_pack_sync`.
+pub fn temprepo_with_large_file() -> Result<TempRepo> {
+    let dir = tempdir()?;
+    let repo = TempRepo { dir };
+    create_bare_repo_with_large_file(&repo.path())?;
+    Ok(repo)
+}
+
+fn create_bare_repo_with_large_file(bare_dir: &FsPath) -> Result<()> {
+    if bare_dir.exists() {
+        bail!(
+            "Target bare repo path already exists: {}",
+            bare_dir.display()
+        );
+    }
+    let parent = bare_dir
+        .parent()
+        .ok_or(anyhow!("bare_dir must have a parent directory"))?;
+    fs::create_dir_all(parent)?;
+
+    let work_dir: PathBuf = parent.join(format!(
+        ".work_{}",
+        bare_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("repo")
+    ));
+    if work_dir.exists() {
+        fs::remove_dir_all(&work_dir)?;
+    }
+    fs::create_dir_all(&work_dir)?;
+
+    _run_git(&work_dir, ["init", "-b", "main"])?;
+    _run_git(&work_dir, ["config", "user.name", "Example Bot"])?;
+    _run_git(&work_dir, ["config", "user.email", "bot@example.invalid"])?;
+    _run_git(&work_dir, ["config", "commit.gpgsign", "false"])?;
+    _run_git(&work_dir, ["config", "core.autocrlf", "false"])?;
+    _run_git(&work_dir, ["config", "core.filemode", "false"])?;
+
+    // 500 lines × ~25 chars ≈ 12 KB — above git's threshold for delta compression.
+    let large_content: String = (0..500)
+        .map(|i| format!("line {i:04}: padding content for delta compression test\n"))
+        .collect();
+    fs::write(work_dir.join("large.txt"), &large_content)?;
+    _run_git(&work_dir, ["add", "large.txt"])?;
+    _run_git(&work_dir, ["commit", "-m", "add large file"])?;
+
+    fs::create_dir_all(bare_dir)?;
+    _run_git(bare_dir, ["init", "--bare"])?;
+    _run_git(
+        &work_dir,
+        ["remote", "add", "origin", bare_dir.to_str().unwrap()],
+    )?;
+    _run_git(&work_dir, ["push", "--mirror", "origin"])?;
+    _run_git(bare_dir, ["symbolic-ref", "HEAD", "refs/heads/main"])?;
+    fs::remove_dir_all(&work_dir)?;
+
+    Ok(())
+}
+
 const AUTHOR_NAME: &str = "Test Author";
 const AUTHOR_EMAIL: &str = "author@example.com";
 const COMMITTER_NAME: &str = "Test Committer";
