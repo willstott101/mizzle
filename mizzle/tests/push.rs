@@ -20,9 +20,18 @@ dual_backend_test!(
 
         let work_dir = tempdir()?;
         common::run_git(work_dir.path(), ["init", "-b", "main"])?;
-        fs::write(work_dir.path().join("README.md"), "# hello\n")?;
-        common::run_git(work_dir.path(), ["add", "README.md"])?;
-        common::run_git(work_dir.path(), ["commit", "-m", "initial"])?;
+        // Push several commits each rewriting a large file so git generates
+        // intra-pack deltas.  Without `ofs-delta` the receiver gets REF_DELTA
+        // objects whose bases are also in the incoming pack — not yet in the
+        // ODB — causing "object not found".
+        for i in 0..5u32 {
+            let content: String = (0..500)
+                .map(|j| format!("commit {i} line {j:04}: padding for delta compression\n"))
+                .collect();
+            fs::write(work_dir.path().join("data.txt"), content)?;
+            common::run_git(work_dir.path(), ["add", "data.txt"])?;
+            common::run_git(work_dir.path(), ["commit", "-m", &format!("commit {i}")])?;
+        }
         let local_head = common::run_git(work_dir.path(), ["rev-parse", "HEAD"])?;
 
         common::run_git(
