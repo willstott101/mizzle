@@ -27,9 +27,10 @@ pub struct PackObjects {
 /// every object reachable from any commit in `want` that is not also reachable
 /// from any commit in `have`.
 ///
-/// Collects all object IDs (commits, trees, blobs) needed to pack for a fetch:
-/// every object reachable from any commit in `want` that is not also reachable
-/// from any commit in `have`.
+/// Every `have` must exist in the odb — traversal errors otherwise. Clients
+/// ahead of the server advertise haves the server has never seen, so callers
+/// must intersect the client's haves with the server's objects first (the
+/// protocol layer does this via `has_objects`, which also yields the ACKs).
 ///
 /// When `deepen` is `Some(n)`, only commits within `n` levels of the want tips
 /// are included; commits at the depth boundary are recorded in
@@ -52,23 +53,6 @@ pub fn objects_for_fetch_filtered(
     objects_for_fetch_with_have_set(odb, want, have, deepen, filter, have_set)
 }
 
-/// Filters `have` down to the commits the server actually possesses.
-///
-/// A client may advertise `have` lines for commits the server does not have —
-/// this happens whenever the client is *ahead* of the server (it holds history
-/// the server has never received). Feeding such an OID into a commit traversal
-/// or `.hide()` is a hard error ("object … could not be found"), so we drop the
-/// unknown ones up front. They carry no information the server can act on
-/// anyway: the server cannot exclude objects reachable from a commit it cannot
-/// read.
-fn known_have_commits<F: Find>(odb: &F, have: &[ObjectId]) -> Vec<ObjectId> {
-    let mut buf = Vec::new();
-    have.iter()
-        .copied()
-        .filter(|id| matches!(odb.try_find(id, &mut buf), Ok(Some(_))))
-        .collect()
-}
-
 /// Like [`objects_for_fetch_filtered`] but uses a pre-computed `have_set`
 /// rather than walking the have commits.  Use this when the have-set is
 /// already available (e.g. from a reachability bitmap) to skip the walk.
@@ -84,12 +68,6 @@ pub(crate) fn objects_for_fetch_with_have_set(
     filter: Option<&Filter>,
     have_set: HashSet<ObjectId>,
 ) -> anyhow::Result<PackObjects> {
-    // Drop haves the server doesn't have (client is ahead of us) before they
-    // reach the commit traversal / `.hide()` below, both of which error on an
-    // unknown OID. See [`known_have_commits`].
-    let have = known_have_commits(&odb, have);
-    let have = have.as_slice();
-
     // Separate wanted OIDs by type: commits go through graph traversal,
     // non-commits (blobs/trees requested directly, e.g. lazy fetch after
     // partial clone) are included as-is.
@@ -253,10 +231,6 @@ fn build_have_set(odb: impl Find + Clone, have: &[ObjectId]) -> anyhow::Result<H
     let mut state = gix::traverse::tree::breadthfirst::State::default();
     let mut commit_buf = Vec::new();
     let mut tree_buf = Vec::new();
-
-    // Skip haves the server doesn't have (client is ahead) — traversing from a
-    // missing commit is a hard error. See [`known_have_commits`].
-    let have = known_have_commits(&odb, have);
 
     let have_commits: Vec<ObjectId> =
         gix::traverse::commit::Simple::new(have.iter().copied(), odb.clone())
@@ -544,55 +518,6 @@ mod tests {
 
         let result = objects_for_fetch_filtered(open_odb(p), &[c1], &[c1], None, None).unwrap();
         assert!(result.objects.is_empty());
-    }
-
-    // ── client ahead of server ───────────────────────────────────────────────
-
-    // The client holds history the server has never seen (it is *ahead* of the
-    // server) and advertises a `have` for a commit the server doesn't have.
-    // The server must not error on the unknown OID — it should ignore it and
-    // pack the same objects as if only its known haves were sent. This
-    // reproduces the "have commit traversal: An object … could not be found"
-    // server-side failure.
-    #[test]
-    fn fetch_with_have_unknown_to_server() {
-        // Server repo: C1 → C2.
-        let server = tempdir().unwrap();
-        let sp = server.path();
-        init_repo(sp);
-        fs::write(sp.join("README.md"), "# hi\n").unwrap();
-        git(sp, &["add", "."]);
-        git(sp, &["commit", "-m", "C1"]);
-        let c1 = rev_parse(sp, "HEAD");
-
-        fs::write(sp.join("hello.txt"), "hello\n").unwrap();
-        git(sp, &["add", "."]);
-        git(sp, &["commit", "-m", "C2"]);
-        let c2 = rev_parse(sp, "HEAD");
-
-        // A separate repo standing in for the client's extra history: a commit
-        // the server has never received.
-        let client = tempdir().unwrap();
-        let cp = client.path();
-        init_repo(cp);
-        fs::write(cp.join("only-on-client.txt"), "ahead\n").unwrap();
-        git(cp, &["add", "."]);
-        git(cp, &["commit", "-m", "client-only"]);
-        let unknown = rev_parse(cp, "HEAD");
-
-        // Client wants C2 and advertises [C1, <unknown>] as haves. The unknown
-        // commit is absent from the server's odb.
-        let result: HashSet<_> =
-            objects_for_fetch_filtered(open_odb(sp), &[c2], &[c1, unknown], None, None)
-                .unwrap()
-                .objects
-                .into_iter()
-                .collect();
-
-        // The unknown have is ignored; result matches the C1-only negotiation.
-        assert_eq!(result, rev_list_objects(sp, &[c2], &[c1]));
-        assert!(result.contains(&c2));
-        assert!(!result.contains(&c1), "known have must still be excluded");
     }
 
     // ── cross-branch shared blob ──────────────────────────────────────────────

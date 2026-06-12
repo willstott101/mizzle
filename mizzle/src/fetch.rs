@@ -28,26 +28,30 @@ pub async fn perform_fetch<B: StorageBackend>(
     //   [wanted-refs delim-pkt] [packfile-uris delim-pkt]
     //   packfile flush-pkt
 
-    if !args.done {
-        let known = backend.has_objects(repo, &args.have).await?;
-        let acks: Vec<ObjectId> = args
-            .have
-            .iter()
-            .zip(known)
-            .filter_map(|(id, exists)| if exists { Some(*id) } else { None })
-            .collect();
+    // Intersect the client's haves with what we actually have, once. Clients
+    // that are ahead of the server advertise haves we've never seen; the pack
+    // layer requires every have to resolve, so only known ones may pass below.
+    // This same intersection is exactly the set of haves to ACK.
+    let known = backend.has_objects(repo, &args.have).await?;
+    let have: Vec<ObjectId> = args
+        .have
+        .iter()
+        .zip(known)
+        .filter_map(|(id, exists)| if exists { Some(*id) } else { None })
+        .collect();
 
+    if !args.done {
         // The server is ready to build a pack when it has at least one
         // common object with the client — unless the client asked for
         // wait-for-done, in which case the server must not declare
         // readiness on its own.
-        let ready = !acks.is_empty() && !args.wait_for_done;
+        let ready = !have.is_empty() && !args.wait_for_done;
 
         text_to_write(b"acknowledgments", &mut *writer).await?;
-        if acks.is_empty() {
+        if have.is_empty() {
             text_to_write(b"NAK", &mut *writer).await?;
         } else {
-            for ack in &acks {
+            for ack in &have {
                 text_to_write(format!("ACK {}", ack).as_bytes(), &mut *writer).await?;
             }
         }
@@ -66,9 +70,7 @@ pub async fn perform_fetch<B: StorageBackend>(
         filter,
         thin_pack: args.thin_pack,
     };
-    let mut pack_output = backend
-        .build_pack(repo, &args.want, &args.have, &opts)
-        .await?;
+    let mut pack_output = backend.build_pack(repo, &args.want, &have, &opts).await?;
 
     // shallow-info section: tell the client which commits are shallow
     // boundaries so it knows not to expect their parents.
@@ -102,15 +104,23 @@ pub async fn perform_fetch_v1<B: StorageBackend>(
     args: &FetchArgs,
     writer: &mut (impl AsyncWrite + Unpin),
 ) -> anyhow::Result<()> {
+    // As in [`perform_fetch`]: drop haves the server doesn't have before they
+    // reach the pack layer.
+    let known = backend.has_objects(repo, &args.have).await?;
+    let have: Vec<ObjectId> = args
+        .have
+        .iter()
+        .zip(known)
+        .filter_map(|(id, exists)| if exists { Some(*id) } else { None })
+        .collect();
+
     let filter = args.filter.as_deref().map(Filter::parse).transpose()?;
     let opts = PackOptions {
         deepen: args.deepen,
         filter,
         thin_pack: args.thin_pack,
     };
-    let mut pack_output = backend
-        .build_pack(repo, &args.want, &args.have, &opts)
-        .await?;
+    let mut pack_output = backend.build_pack(repo, &args.want, &have, &opts).await?;
 
     // In v1, shallow boundaries are sent before the NAK.
     for id in &pack_output.shallow {
@@ -441,6 +451,71 @@ mod tests {
         assert!(
             lines.contains(&"packfile".to_string()),
             "expected packfile section, got: {:?}",
+            lines
+        );
+    }
+
+    /// The client is ahead of the server: it advertises a have for a commit
+    /// the server has never received. The fetch must not error ("have commit
+    /// traversal: An object ... could not be found") — the unknown have is
+    /// dropped by the has_objects intersection and a pack is still produced.
+    #[test]
+    fn fetch_with_have_unknown_to_server() {
+        // Server repo: C1 → C2.
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        init_repo(p);
+
+        fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C1"]);
+        let c1 = rev_parse(p, "HEAD");
+
+        fs::write(p.join("b.txt"), "b\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-m", "C2"]);
+        let c2 = rev_parse(p, "HEAD");
+
+        // A commit that exists only on the client side: build it in a second
+        // repo so the server's odb has never seen it.
+        let client_dir = tempdir().unwrap();
+        let cp = client_dir.path();
+        init_repo(cp);
+        fs::write(cp.join("only-on-client.txt"), "ahead\n").unwrap();
+        git(cp, &["add", "."]);
+        git(cp, &["commit", "-m", "client-only"]);
+        let unknown = rev_parse(cp, "HEAD");
+
+        let backend = FsGitoxide;
+        let repo = futures_lite::future::block_on(backend.open(&p.to_path_buf())).unwrap();
+        let args = FetchArgs {
+            want: vec![c2],
+            want_refs: Vec::new(),
+            have: vec![c1, unknown],
+            done: true,
+            thin_pack: false,
+            no_progress: true,
+            include_tag: false,
+            ofs_delta: false,
+            wait_for_done: false,
+            deepen: None,
+            filter: None,
+        };
+
+        let (reader, mut writer) = piper::pipe(65536);
+        futures_lite::future::block_on(async {
+            perform_fetch(&backend, &repo, &args, &mut writer)
+                .await
+                .unwrap();
+        });
+        drop(writer);
+
+        let raw = collect_pkt_output(reader);
+        let lines = parse_pkt_lines(&raw);
+
+        assert!(
+            lines.contains(&"packfile".to_string()),
+            "expected packfile despite unknown have, got: {:?}",
             lines
         );
     }
