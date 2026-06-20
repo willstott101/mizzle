@@ -1,81 +1,99 @@
-use log::LevelFilter;
-use simple_logger::SimpleLogger;
-use trillium::Method;
-use trillium_client::Client;
-use trillium_smol;
+use axum::{
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, Method, StatusCode, Uri},
+    response::{IntoResponse, Response},
+    routing::any,
+    Router,
+};
+use std::net::SocketAddr;
 
-fn main() {
-    SimpleLogger::new()
-        .with_level(LevelFilter::Info)
-        .init()
-        .unwrap();
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 
-    // port 8080
-    trillium_smol::run(|mut conn: trillium::Conn| async move {
-        let client =
-            Client::new(trillium_rustls::RustlsConfig::<trillium_smol::ClientConfig>::default())
-                .with_default_pool();
+    let client = reqwest::Client::builder().build()?;
 
-        if conn
-            .request_headers()
-            .get_str("Git-Protocol")
-            .unwrap_or("version=2")
-            != "version=2"
-        {
-            println!("Only Git Protocol 2 is supported");
-            return conn
-                .with_status(trillium::Status::NotImplemented)
-                .with_body("Only Git Protocol 2 is supported")
-                .halt();
+    let app = Router::new().fallback(any(proxy)).with_state(client);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("listening on {addr}");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+async fn proxy(
+    State(client): State<reqwest::Client>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let git_protocol = headers
+        .get("Git-Protocol")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("version=2");
+    if git_protocol != "version=2" {
+        tracing::warn!("rejecting non-v2 Git-Protocol: {git_protocol}");
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "Only Git Protocol 2 is supported",
+        )
+            .into_response();
+    }
+
+    let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+    let url = format!("https://github.com{path_and_query}");
+    tracing::info!("REQ {method} {url}");
+
+    if method == Method::POST && !body.is_empty() {
+        tracing::info!("POST BODY\n{}", String::from_utf8_lossy(&body));
+    }
+
+    let mut req = client.request(method, &url);
+
+    // Forward the headers git relies on for smart-http protocol negotiation.
+    for name in ["Content-Type", "Git-Protocol", "Accept"] {
+        if let Some(v) = headers.get(name) {
+            req = req.header(name, v);
         }
+    }
+    if !body.is_empty() {
+        req = req.body(body);
+    }
 
-        let url = format!("https://github.com{}", conn.path());
-        println!("REQ {}", url);
-
-        let mut upstream_conn = match conn.method() {
-            Method::Get => client.get(url.as_str()),
-            Method::Post => {
-                let body = conn.request_body_string().await.unwrap();
-                println!("POST BODY");
-                println!("{}", body);
-                client.post(url.as_str()).with_body(body)
-            }
-            _ => todo!(),
-        };
-
-        match conn
-            .request_headers()
-            .get_str(trillium::KnownHeaderName::ContentType)
-        {
-            Some(v) => {
-                upstream_conn
-                    .request_headers()
-                    .append(trillium::KnownHeaderName::ContentType, v.to_owned());
-            }
-            None => (),
+    let upstream = match req.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!("upstream request failed: {err}");
+            return (StatusCode::BAD_GATEWAY, format!("upstream error: {err}")).into_response();
         }
+    };
 
-        match conn.request_headers().get_str("Git-Protocol") {
-            Some(v) => {
-                upstream_conn
-                    .request_headers()
-                    .append("Git-Protocol", v.to_owned());
-            }
-            None => (),
+    let status = upstream.status();
+    let content_type = upstream.headers().get("Content-Type").cloned();
+    let resp_body = match upstream.bytes().await {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::error!("reading upstream body failed: {err}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream body error: {err}"),
+            )
+                .into_response();
         }
+    };
 
-        // for h in conn.headers().iter() {
-        //     upstream_conn.request_headers().append(h.0, h.1.clone());
-        // }
+    tracing::info!("RESPONSE BODY\n{:?}", resp_body);
 
-        upstream_conn = upstream_conn.await.unwrap();
-
-        let response_body = upstream_conn.response_body();
-        let body = response_body.read_bytes().await.unwrap();
-
-        println!("RESPONSE BODY");
-        println!("{:?}", body);
-
-        conn.with_body(body)
-    });
+    let mut response = (status, resp_body).into_response();
+    if let Some(ct) = content_type {
+        response.headers_mut().insert("Content-Type", ct);
+    }
+    response
 }

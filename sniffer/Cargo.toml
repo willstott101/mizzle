@@ -6,14 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-trillium = "0.2"
-trillium-smol = "0.3"
-trillium-client = "*"
-log = "*"
-simple_logger = "*"
-form_urlencoded = "*"
-futures-lite = "*"
-smol = "*"
-piper = "*"
-anyhow = "*"
-trillium-rustls = "*"
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+anyhow = "1"
