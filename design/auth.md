@@ -144,6 +144,7 @@ state:
 | `pack_metadata()`              | Object identities and sizes from pack inspection.                                                        | Already populated by step 5.                                      |
 | `tags()`                       | Annotated tags introduced by this push.                                                                  | Populated by step 5.                                              |
 | `push_cert()`                  | `Option<&PushCert>` — parsed `git push --signed` certificate, if the client sent one.                    | Already parsed by step 1; `verify()` on it runs lazily, same as commit signatures. |
+| `receipt()`                    | Owned `PushReceipt` — every ref, every new commit's verification status, the push-cert's verification status. See [§ `Comparison::receipt`](#comparisonreceipt--an-audit-log-convenience). | Default method built from the accessors above; pays only for what wasn't already cached. |
 
 A forge that touches only `refs()` pays nothing beyond what the pipeline
 already did. A forge that calls `dropped_commits` for every ref pays for
@@ -333,6 +334,81 @@ non-repudiable "X pushed this, right now."
 - **No cert sent at all** — `push_cert()` returns `None`. Mizzle never
   requires a push-cert; forges that want to enforce one check for
   `None` themselves in `authorize_push`.
+
+## `Comparison::receipt` — an audit-log convenience
+
+Neither commit-signature nor push-certificate verification runs unless
+something asks for it — that's the point of making them lazy
+accessors. But that laziness is also a footgun for the one use case
+those two features exist to serve: `post_receive` is the natural place
+to write "who pushed what, verified how" to an audit log, and it's
+easy to write a `post_receive` that records the pusher and refs but
+never actually calls `verify()` or `push_cert()` — quietly dropping
+the verification data that would have made the record trustworthy.
+
+`Comparison::receipt()` closes that gap without adding a new cost
+path — it's a default method defined entirely in terms of the other
+accessors:
+
+```rust
+pub struct PushRefOutcome {
+    pub refname: String,
+    pub kind: PushKind,
+    pub old_oid: ObjectId,
+    pub new_oid: ObjectId,
+}
+
+pub struct PushCertSummary {
+    pub pusher: String,
+    pub pushee: String,
+    pub nonce_status: NonceStatus,
+}
+
+pub struct PushReceipt {
+    pub refs: Vec<PushRefOutcome>,
+    pub commit_verifications: Vec<(ObjectId, VerificationStatus)>,
+    pub push_cert: Option<(PushCertSummary, VerificationStatus)>,
+}
+
+pub trait Comparison<'a> {
+    // ...existing required methods...
+
+    /// Walks every ref's new commits and the push-cert (if any),
+    /// collecting an owned summary suitable for an audit log. Defined
+    /// entirely in terms of the accessors above — override only if a
+    /// different aggregation is needed.
+    fn receipt(&self) -> Result<PushReceipt, ComparisonError> {
+        let mut commit_verifications = Vec::new();
+        for r in self.refs() {
+            for c in self.new_commits(r)? {
+                commit_verifications.push((c.oid, self.verify(c)));
+            }
+        }
+        Ok(PushReceipt {
+            refs: self.refs().iter().map(PushRefOutcome::from).collect(),
+            commit_verifications,
+            push_cert: self.push_cert()
+                .map(|cert| (cert.summary(), self.verify_push_cert())),
+        })
+    }
+}
+```
+
+`Comparison` has exactly one implementor — mizzle itself; forges only
+ever consume `&dyn Comparison`, they never implement the trait. That
+makes `receipt()` free to add as a *default* method: no forge-side
+implementation burden, and a forge that never calls it pays nothing
+beyond what `authorize_push` already triggered. A forge that does call
+it — typically from `post_receive` — pays exactly what it would have
+paid writing the same loop by hand, reusing whatever `verify()` /
+`verify_push_cert()` results are already cached rather than
+recomputing them. `PushReceipt` is owned (not borrowed from
+`Comparison`) so it can cross into the `'static` `post_receive` future
+per [`PostReceiveFut`](../mizzle/src/traits.rs)'s lifetime contract.
+
+Deliberately not part of `RepoAccess`: it needs no forge-specific
+behaviour, and putting it on `Comparison` instead keeps `RepoAccess`'s
+required surface — the one every forge has to implement — unchanged.
 
 ## Trait surface
 
