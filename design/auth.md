@@ -1,7 +1,8 @@
 # Auth
 
 How mizzle hands authorisation decisions back to the embedding forge,
-and how commit-signature verification fits into that.
+and how commit-signature and push-certificate verification fit into
+that.
 
 For the wider architecture see [architecture.md](architecture.md).
 
@@ -103,7 +104,10 @@ from the lazy `Comparison` accessors only on the refs it cares about.
 
 ```
 0. forge handler                  resolve identity, construct RepoAccess
-1. read_receive_request           parse ref-update headers
+1. read_receive_request           parse ref-update headers (or the
+                                  push-cert block, if the client used
+                                  `git push --signed`); validate the
+                                  cert nonce statelessly
 2. authorize_preliminary          refnames + PushKind only;
                                   returns PushContext
 3. stage_pack                     stream to a temp file
@@ -139,6 +143,7 @@ state:
 | `read_blob(oid, cap)`          | Blob bytes for content-inspection policies (e.g. `.gitmodules`, secret-scanning).                        | O(blob size); `None` if not in the staged pack or above the cap.  |
 | `pack_metadata()`              | Object identities and sizes from pack inspection.                                                        | Already populated by step 5.                                      |
 | `tags()`                       | Annotated tags introduced by this push.                                                                  | Populated by step 5.                                              |
+| `push_cert()`                  | `Option<&PushCert>` — parsed `git push --signed` certificate, if the client sent one.                    | Already parsed by step 1; `verify()` on it runs lazily, same as commit signatures. |
 
 A forge that touches only `refs()` pays nothing beyond what the pipeline
 already did. A forge that calls `dropped_commits` for every ref pays for
@@ -219,6 +224,116 @@ part of the core library.
   e.g. by accepting into a quarantine ref namespace and gating
   promotion via the forge UI.
 
+## Push certificates — `git push --signed`
+
+Committer verification (above) tells the forge whether a *commit* was
+signed by a trusted key. It says nothing about the *push itself* — the
+transport-level "these refs move from these old OIDs to these new
+OIDs, right now" action is never part of any commit's hashed content,
+so no commit signature can attest to it. `git push --signed` closes
+that gap: the client signs a certificate covering the exact ref-update
+set plus a server-supplied nonce, before the pack is even generated.
+
+### Wire shape
+
+When the ref advertisement includes `push-cert=<nonce>`, the client
+sends a `push-cert` block instead of the plain ref-update commands:
+
+```
+PKT-LINE("push-cert" NUL capability-list LF)
+PKT-LINE("certificate version 0.1" LF)
+PKT-LINE("pusher" SP ident LF)
+PKT-LINE("pushee" SP url LF)
+PKT-LINE("nonce" SP nonce LF)
+*PKT-LINE("push-option" SP push-option LF)
+PKT-LINE(LF)
+*PKT-LINE(command LF)              ; old/new/refname, same shape as
+                                    ; the unsigned command list
+*PKT-LINE(signature LF)            ; PGP or SSH armoured block
+PKT-LINE("push-cert-end" LF)
+```
+
+The `command` lines inside the cert *are* the ref updates for this
+push — mizzle reads them from there instead of the plain command list
+when a cert is present; there is exactly one ref-update source per
+push, never both.
+
+### Nonce, statelessly
+
+Git's own implementation validates the nonce via
+`receive.certNonceSeed`: the server advertises `HMAC(seed, timestamp)`
+as the nonce, the client signs it back unchanged inside the
+certificate, and the server recomputes the HMAC to classify the result
+as `Ok` / `Slop` (clock skew, within a configurable tolerance) / `Bad`
+/ `Missing`. No server-side state or storage is required — this fits
+mizzle's per-request, horizontally-scalable model exactly as well as
+signature verification does. The forge supplies the seed once,
+mizzle derives and compares:
+
+```rust
+/// HMAC seed for push-cert nonces. `None` (the default) disables
+/// push-cert support: mizzle does not advertise the `push-cert`
+/// capability and the pipeline behaves exactly as it does today.
+fn push_cert_nonce_seed(&self) -> Option<&[u8]> {
+    None
+}
+```
+
+Nonce validation happens in `read_receive_request`, ahead of pack
+transfer — a `Bad` nonce is rejected at the same point and the same
+cost as step 2's ref-name checks (no repository access, no crypto).
+`Slop` tolerance is a `ProtocolLimits`-style config value (see
+[`mizzle-proto/src/limits.rs`](../mizzle-proto/src/limits.rs) for the
+existing pattern), not a forge decision — it is about clock skew
+tolerance, not policy.
+
+### `PushCert`
+
+| Field / accessor    | What it gives the forge                                                                                    |
+|----------------------|--------------------------------------------------------------------------------------------------------------|
+| `pusher`             | Raw `ident` line from the certificate — name + email, self-reported by the client, exactly like commit author/committer. Not verified identity by itself. |
+| `pushee`             | The URL the client believes it's pushing to — a cross-check against SSRF/URL-confusion, not an identity signal. |
+| `nonce_status`       | `Ok`, `Slop { skew }`, `Bad`, `Missing` — mirrors git's own `--signed` verification states.                   |
+| signature (via `Comparison::verify_push_cert`) | `&VerificationStatus`, the same type used for commits/tags. Dispatches through the same `verify_native` / `verify_external` machinery as Phase B/C (PGP and SSH only — git itself does not support X.509 push certs), because forges already have `verification_keys` wired up for pusher identity. Lazy, cached. |
+
+Signature verification is deliberately routed through the *same*
+verifier plumbing as commit/tag signatures rather than a parallel
+implementation — same formats, same key-resolution callback, same
+`VerificationStatus` enum, same `verify_external` escape hatch for
+Sigstore-style flows.
+
+### Why this matters more than commit signing, for "who pushed this"
+
+A `Verified` push-cert is a materially stronger claim than a
+`Verified` commit signature: it attests "the holder of this key
+authorized *this exact set of ref moves, at this moment, against this
+nonce*" — a transaction, not a content claim. It cannot be replayed
+(nonce-bound), it cannot be forwarded from an unrelated push
+(ref-update-bound), and unlike commit signatures it says nothing about
+authorship, so it composes cleanly with unsigned commits, rebases, or
+squash-merges. A forge that wants strong "who pushed this" evidence
+without insisting every commit be signed gets it from the push-cert
+alone; a forge that also insists `pusher` matches the pre-authenticated
+identity on `RepoAccess` gets the closest thing git has to
+non-repudiable "X pushed this, right now."
+
+### Failure model additions
+
+- **`nonce_status` is `Bad`** — rejected in `read_receive_request`,
+  before pack transfer; same failure shape as a malformed ref-update
+  line.
+- **`nonce_status` is `Missing`** (client sent a cert with no nonce,
+  or none at all when the forge expected one) — surfaced to
+  `authorize_push` via `Comparison::push_cert()`; the forge decides
+  whether an unsigned/uncertified push is acceptable, same as any
+  other policy gap.
+- **Cert signature fails verification** — surfaces as
+  `VerificationStatus::BadSignature` from `verify_push_cert`, same
+  handling as a tampered commit signature.
+- **No cert sent at all** — `push_cert()` returns `None`. Mizzle never
+  requires a push-cert; forges that want to enforce one check for
+  `None` themselves in `authorize_push`.
+
 ## Trait surface
 
 The canonical definition lives in
@@ -266,6 +381,13 @@ pub trait RepoAccess {
         sig: &ExternalSig<'_>,
     ) -> Option<VerificationStatus>;
 
+    /// HMAC seed for push-cert nonces. `None` (the default) disables
+    /// push-cert support entirely: mizzle does not advertise the
+    /// `push-cert` capability.
+    fn push_cert_nonce_seed(&self) -> Option<&[u8]> {
+        None
+    }
+
     fn post_receive<'a>(
         &'a self,
         push: &'a dyn Comparison<'a>,
@@ -304,6 +426,11 @@ workflow `release.yml` on branch `main`".
 | Signature crypto (PGP/SSH/X.509)  | Mizzle, lazily via `Comparison::verify`                      |
 | Resolving keys for a signer       | Forge (`verification_keys`)                                  |
 | Sigstore / gitsign verification   | Forge (`verify_external`), reference adapter optional        |
+| Advertising `push-cert` capability | Mizzle, only when `push_cert_nonce_seed` returns `Some`     |
+| Parsing the push-cert block        | Mizzle (`mizzle-proto`, `read_receive_request`)              |
+| Nonce derivation + comparison      | Mizzle, stateless HMAC against the forge-supplied seed       |
+| Push-cert signature crypto         | Mizzle, lazily via `Comparison::verify_push_cert`             |
+| Requiring a push-cert at all       | Forge (`authorize_push`, reads `Comparison::push_cert()`)     |
 | DCO / sign-off / message regex    | Forge (`authorize_push`, reads `CommitInfo.message`)         |
 | Path / size / submodule rules     | Forge (`authorize_push`, reads `Comparison::ref_diff` and `Comparison::read_blob`) |
 
