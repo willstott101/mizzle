@@ -163,6 +163,44 @@ provide `verify_external` for X.509 CMS signatures with embedded Rekor
 SETs. Defers all the Fulcio root + Rekor key plumbing out of the core
 library. Ship later; not blocking.
 
+### Phase F — Push certificates and `Comparison::receipt`
+
+**Goal:** implement the `git push --signed` support and the
+`Comparison::receipt()` audit convenience specified in
+[auth.md § Push certificates](auth.md#push-certificates--git-push---signed)
+and [§ `Comparison::receipt`](auth.md#comparisonreceipt--an-audit-log-convenience):
+push-cert parsing in `mizzle-proto::receive`, stateless nonce
+validation against `RepoAccess::push_cert_nonce_seed`, the
+`Comparison::push_cert()` / `verify_push_cert()` accessors (reusing
+Phase B/C's verifier dispatch), and the `PushCert` / `PushCertSummary`
+/ `PushRefOutcome` / `PushReceipt` / `NonceStatus` types.
+
+**Serialization note — do this from the start, not as a follow-up.**
+The basics already landed ahead of this phase: an optional `serde`
+Cargo feature on `mizzle` (no new dependency — `serde`/`serde_json`
+are already mandatory for the LFS batch API) and `Serialize` derives
+on `PushKind`, `PushRef`, `Identity`, `SignatureFormat`,
+`SignedIdentity`, and `VerificationStatus` (`mizzle/src/auth_types.rs`).
+The one rule those derives establish, and that every new Phase F type
+must follow: **never let `ObjectId` or `BString`/`BStr` reach a forge's
+serializer through their own `Serialize` impls.** `gix-hash`'s derived
+impl emits `{"Sha1": [<20 raw bytes>]}`; `bstr`'s calls
+`serialize_bytes`, which `serde_json` (and most human-readable formats)
+render as an array of integers. Either shape forces a forge to write
+decoding code before an audit log is even readable — exactly the
+"decisions and unwrappings" this convenience is supposed to remove.
+Route every OID through `auth_types::serde_support::oid_hex` (or an
+`oid_slice_hex` seq variant, not yet written — add it when
+`CommitInfo::parents` or a dropped-commits list first needs one) and
+every git-identity byte string through `bstring_lossy` /
+`opt_bstring_lossy`, exactly as `PushRef` and `Identity` already do.
+`PushCertSummary.pusher`/`.pushee` and `NonceStatus`'s `Slop { skew }`
+duration need the same treatment: plain hex/string/seconds, not a
+serde derive taken as-is from whatever type happened to be convenient
+internally. This mirrors `LfsOid` in `mizzle-proto/src/lfs.rs`, which
+independently arrived at "serialize as plain hex" for the same reason
+— follow that precedent rather than re-deriving the question per type.
+
 ---
 
 ## Example rules
