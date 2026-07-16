@@ -10,16 +10,62 @@ use gix::ObjectId;
 
 pub use mizzle_proto::types::PushKind;
 
+/// `serialize_with` helpers used across this module.
+///
+/// `gix-hash` and `bstr` each have their own optional `serde` support, but
+/// neither produces what a forge actually wants in a log: `ObjectId`'s
+/// derive emits `{"Sha1": [<20 raw bytes>]}` and `BString`'s `Serialize`
+/// calls `serialize_bytes`, which most human-readable formats (including
+/// `serde_json`) render as an array of integers, not a string. Routing every
+/// OID and every git-identity field through these helpers instead means a
+/// forge gets a plain hex string / UTF-8 string with zero decoding of its
+/// own — matching the "as few decisions as possible" bar for the audit
+/// surface (`Comparison::receipt`, see `design/auth.md`).
+#[cfg(feature = "serde")]
+pub(crate) mod serde_support {
+    use bstr::{BString, ByteSlice};
+    use gix::ObjectId;
+    use serde::Serializer;
+
+    pub(crate) fn oid_hex<S: Serializer>(oid: &ObjectId, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&oid.to_hex().to_string())
+    }
+
+    // A `Vec<ObjectId>` variant (`serialize_seq` of `oid.to_hex()`) will be
+    // needed once `CommitInfo::parents` or `PushReceipt`'s dropped-commit
+    // lists grow a `Serialize` impl — add it there rather than speculatively
+    // here.
+
+    /// Lossy: git allows non-UTF-8 bytes in names/emails; invalid sequences
+    /// become U+FFFD rather than failing serialization.
+    pub(crate) fn bstring_lossy<S: Serializer>(b: &BString, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&b.to_str_lossy())
+    }
+
+    pub(crate) fn opt_bstring_lossy<S: Serializer>(
+        b: &Option<BString>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match b {
+            Some(b) => s.serialize_some(b.to_str_lossy().as_ref()),
+            None => s.serialize_none(),
+        }
+    }
+}
+
 /// A single ref update within a push.
 ///
 /// Carries identifying information mizzle has computed without opening the
 /// repository: the refname, the [`PushKind`] classification, and the
 /// before / after OIDs from the receive-pack commands.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct PushRef<'a> {
     pub refname: &'a str,
     pub kind: PushKind,
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serde_support::oid_hex"))]
     pub old_oid: ObjectId,
+    #[cfg_attr(feature = "serde", serde(serialize_with = "serde_support::oid_hex"))]
     pub new_oid: ObjectId,
 }
 
@@ -29,10 +75,23 @@ pub struct PushRef<'a> {
 /// email fields.  Forges that only deal with ASCII identities can use
 /// [`bstr::ByteSlice::to_str`] to lift them.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct Identity {
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "serde_support::bstring_lossy")
+    )]
     pub name: BString,
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "serde_support::bstring_lossy")
+    )]
     pub email: BString,
     /// Raw time field as it appears in the header, e.g. `1700000000 +0000`.
+    #[cfg_attr(
+        feature = "serde",
+        serde(serialize_with = "serde_support::bstring_lossy")
+    )]
     pub time: BString,
 }
 
@@ -73,6 +132,7 @@ pub(crate) struct SignatureBlob {
 
 /// Signature format detected from the raw signature bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum SignatureFormat {
     /// OpenPGP, ASCII-armoured.
@@ -179,6 +239,7 @@ pub enum RefDiffChange {
 ///
 /// Lazily populated by [`Comparison::verify`](crate::auth::Comparison::verify).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum VerificationStatus {
     /// The signature verified against a key the forge supplied.
@@ -200,14 +261,23 @@ pub enum VerificationStatus {
 
 /// Identity material recovered from a verified signature.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[non_exhaustive]
 pub enum SignedIdentity {
     Pgp {
         key_id: String,
+        #[cfg_attr(
+            feature = "serde",
+            serde(serialize_with = "serde_support::bstring_lossy")
+        )]
         email: BString,
     },
     Ssh {
         fingerprint: String,
+        #[cfg_attr(
+            feature = "serde",
+            serde(serialize_with = "serde_support::opt_bstring_lossy")
+        )]
         principal: Option<BString>,
     },
     X509 {
@@ -215,9 +285,7 @@ pub enum SignedIdentity {
         san: Option<String>,
     },
     /// Identity material outside the natively-supported formats.
-    Other {
-        description: String,
-    },
+    Other { description: String },
 }
 
 impl SignedIdentity {
@@ -284,3 +352,55 @@ pub struct ExternalSig<'a> {
 
 /// Convenience type for the `verification_keys` return.
 pub type VerificationKeys = HashMap<SignerKey, Vec<VerificationKey>>;
+
+#[cfg(all(test, feature = "serde"))]
+mod serde_tests {
+    use super::*;
+
+    /// Locks in the actual point of `serde_support`: OIDs and git-identity
+    /// bytes must come out as plain strings, not the raw-bytes shape
+    /// `gix-hash`'s / `bstr`'s own `Serialize` impls would produce.
+    #[test]
+    fn push_ref_serializes_oids_as_hex_strings() {
+        let oid = ObjectId::from_hex(b"0123456789abcdef0123456789abcdef01234567").unwrap();
+        let push_ref = PushRef {
+            refname: "refs/heads/main",
+            kind: PushKind::FastForward,
+            old_oid: gix::hash::Kind::Sha1.null(),
+            new_oid: oid,
+        };
+        let json = serde_json::to_value(&push_ref).unwrap();
+        assert_eq!(json["new_oid"], "0123456789abcdef0123456789abcdef01234567");
+        assert_eq!(json["old_oid"], "0000000000000000000000000000000000000000");
+        assert_eq!(json["kind"], "FastForward");
+    }
+
+    #[test]
+    fn identity_serializes_bstring_as_utf8_string() {
+        let identity = Identity {
+            name: BString::from("Alice Example"),
+            email: BString::from("alice@example.com"),
+            time: BString::from("1700000000 +0000"),
+        };
+        let json = serde_json::to_value(&identity).unwrap();
+        assert_eq!(json["name"], "Alice Example");
+        assert_eq!(json["email"], "alice@example.com");
+    }
+
+    #[test]
+    fn verification_status_verified_serializes_readably() {
+        let status = VerificationStatus::Verified {
+            identity: SignedIdentity::Pgp {
+                key_id: "ABCDEF1234567890".into(),
+                email: BString::from("alice@example.com"),
+            },
+            format: SignatureFormat::OpenPgp,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["Verified"]["identity"]["Pgp"]["email"],
+            "alice@example.com"
+        );
+        assert_eq!(json["Verified"]["format"], "OpenPgp");
+    }
+}

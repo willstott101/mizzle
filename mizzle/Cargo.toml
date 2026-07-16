@@ -45,6 +45,12 @@ axum = ["dep:axum"]
 ssh = ["dep:russh"]
 sql = ["dep:sqlx", "dep:flate2"]
 tikv = ["dep:tikv-client", "dep:flate2"]
+# `serde` and `serde_json` are already mandatory deps (LFS batch API), so this
+# feature adds no new dependency — it only switches on `Serialize` derives for
+# the auth/audit types (VerificationStatus, SignedIdentity, PushRef, Identity,
+# ...). OIDs and BStrings never rely on gix-hash's/bstr's own `serde` support
+# (which would emit raw byte arrays); see `auth_types::serde_support`.
+serde = []
 
 [[example]]
 name = "axum"

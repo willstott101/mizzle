@@ -1,7 +1,7 @@
 /// Describes how a push changes a ref.  Computed by mizzle before calling
 /// [`RepoAccess::authorize_push`] so that authorisers never need to open the
 /// repository themselves.
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, serde::Serialize)]
 pub enum PushKind {
     /// This ref is being created for the first time.
     Create,
