@@ -464,7 +464,7 @@ impl gix_object::Find for MemObjectStore {
                 Ok(Some(gix_object::Data {
                     kind: *kind,
                     data: buf,
-                    hash_kind: gix_hash::Kind::Sha1,
+                    object_hash: gix_hash::Kind::Sha1,
                 }))
             }
             None => Ok(None),
