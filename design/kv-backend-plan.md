@@ -7,6 +7,30 @@ transactional KV `StorageBackend` targeting **TiKV** and
 **FoundationDB**.  Positioned as a path to HA / geo-replicated
 deployments without operating Postgres or CockroachDB clusters.
 
+## Status
+
+A TiKV proof of concept is merged behind the `tikv` feature
+([`mizzle/src/backend/kv/`](../mizzle/src/backend/kv/)), with a CI job
+that runs the KV parity tests against a `tiup playground` cluster.  The
+pack-cache extraction pre-work is done.  Not done:
+
+- **FoundationDB** (the `fdb` feature, `chunked.rs`) — not started.
+- **Key layout** — the implemented layout (see
+  [`kv/keys.rs`](../mizzle/src/backend/kv/keys.rs)) uses one-byte
+  prefixes rather than tuple encoding, has no `("meta",
+  "schema_version")` cell, and stores `obj` values as
+  `kind(u8) ‖ raw bytes` without a length field.
+- **Rollback** — `rollback_ingest` is a no-op; `inserted_oids` is kept
+  but unused.
+- **Progress reporting** and streaming in `build_pack` — the pack is
+  built into memory.
+- **Phase 7** — KV tests are a hand-written `mod kv_tests` in
+  `tests/backend_parity.rs` (stale-oid CAS and pack cache) rather than a
+  `kv_backend_access_test!` macro; no KV arms in
+  `comparison_regression.rs` or `make_servers()`.
+- **Convergence MR** — `temp_pack_repo.rs` was not extracted; SQL and KV
+  each have their own temp-repo pack builder.
+
 ## Why a KV backend at all
 
 The SQL backend (now merged on `main`) already runs against SQLite and
@@ -389,7 +413,7 @@ everything in this plan.  Re-use, don't redesign:
      `backend/pack_cache.rs`; refactor SQL backend to consume it.
      Repo-id type widened to `u64` in the shared API.
    - Update `design/roadmap.md` Phase 8 to mark SQL as ✓ and add a
-     Phase 8.1 / 9 reference to this plan.
+     Phase 8.1 reference to this plan.  (Done.)
 2. **KV backend MR(s):** Phases 1–7 of this plan against TiKV first.
    FDB chunking module added behind `--features fdb` either in the
    same series or follow-up.

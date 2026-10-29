@@ -6,40 +6,49 @@ For the high-level pitch see [../README.md](../README.md).
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  Transport                                                    │
-│  HTTP smart protocol v1/v2 · SSH                             │
+│  Transport                                                   │
+│  HTTP smart protocol v1/v2 · SSH · Git LFS (HTTP)            │
 │  Axum integration + generic protocol functions               │
 └──────────────────────────────┬───────────────────────────────┘
                                │
 ┌──────────────────────────────▼───────────────────────────────┐
-│  Auth  —  RepoAccess trait (HTTP) · SshAuth trait (SSH)       │
-│  Constructed by caller with all permissions pre-resolved.     │
-│  All calls into it are pure value comparisons.               │
+│  Auth  —  RepoAccess trait (HTTP) · SshAuth trait (SSH)      │
+│  Constructed by caller with all permissions pre-resolved.    │
+│  Pushes inspected through a lazy, bounded Comparison handle. │
 └──────────────────────────────┬───────────────────────────────┘
                                │
 ┌──────────────────────────────▼───────────────────────────────┐
-│  Protocol layer  —  always gitoxide                          │
-│  Pack negotiation · push-kind classification · pkt-line I/O  │
+│  Protocol layer  (mizzle-proto + mizzle serve/fetch/receive) │
+│  pkt-line I/O · fetch/push argument parsing · negotiation    │
 │  Temporary FS staging of received packs                      │
 └──────────┬───────────────────────────────┬───────────────────┘
            │                               │
-┌──────────▼──────────┐        ┌───────────▼──────────────────┐
-│  Thin storage trait │        │  Full-bypass backend trait   │
-│  FsGitoxide         │        │  FsGitCli                    │
-│  SqlBackend         │        │  (hands off after auth)      │
-└─────────────────────┘        └──────────────────────────────┘
+┌──────────▼──────────────────────┐ ┌──────▼───────────────────┐
+│  StorageBackend (git objects,   │ │  LfsStore (LFS blobs)    │
+│  refs, graph, packs)            │ │  FsLfs · NoLfs           │
+│  FsGitoxide · FsGitCli          │ │                          │
+│  SqlBackend (feature "sql")     │ │                          │
+│  KvBackend  (feature "tikv")    │ │                          │
+└─────────────────────────────────┘ └──────────────────────────┘
 ```
 
 ### Transport
 
-Mizzle is pinned to tokio.  The SSH server (russh) requires it, and every
-HTTP framework in the ecosystem uses it (axum, actix, rocket all run on
-tokio).
+Mizzle is pinned to tokio.  The SSH server (russh, behind the `ssh`
+feature) requires it, and every mainstream Rust HTTP framework runs on
+it.
 
-The canonical HTTP integration is axum.  The core protocol functions
-(`serve_upload_pack`, `serve_receive_pack`, `serve_git_protocol_1`,
-`serve_git_protocol_2`) take generic `AsyncRead`/`AsyncWrite` types and
-can be called from any tokio-based framework directly.
+The canonical HTTP integration is axum (default `axum` feature):
+[`servers::axum::serve_with_backends`](../mizzle/src/servers/axum.rs)
+dispatches git smart-HTTP requests to a `StorageBackend` and
+`info/lfs/…` requests to an `LfsStore` (pass `NoLfs` for git-only
+serving).  The core protocol functions in
+[`serve.rs`](../mizzle/src/serve.rs) (`serve_upload_pack`,
+`serve_receive_pack`, `serve_git_protocol_1`, `serve_git_protocol_2`)
+take generic `AsyncRead`/`AsyncWrite` types and can be called from any
+tokio-based framework directly.  See
+[`mizzle/examples/axum.rs`](../mizzle/examples/axum.rs) for a complete
+server.
 
 Mizzle is a library that can be included into a wider HTTP rust
 application. This should offer forge APIs that use git data to directly
@@ -47,13 +56,17 @@ access the mizzle backend, rather than proxying/translating API calls.
 
 ### Auth — `RepoAccess`
 
-See [`mizzle/src/traits.rs`](../mizzle/src/traits.rs).
+See [`mizzle/src/traits.rs`](../mizzle/src/traits.rs) and
+[auth.md](auth.md) for the full design.
 
 **`RepoAccess` construction is where expensive work happens.** The caller
 resolves the user, loads permissions, evaluates branch-protection rules, and
 stores results in the `RepoAccess` value before handing it to mizzle. Every
 subsequent call mizzle makes is a cheap value comparison against
-already-loaded data.
+already-loaded data.  Push-time policies that need commit data read it
+through the `Comparison` handle, which computes walks, diffs and
+signature checks lazily via the storage backend — the authoriser itself
+never opens the repository.
 
 This is faster and simpler than hook-callback patterns (Gitea, GitLab)
 where the server opens the repository and runs `git rev-list` or makes HTTP
@@ -61,10 +74,11 @@ round-trips on every push. In those systems the complexity of auth bleeds
 into the hot path. In mizzle it is front-loaded at connection/request time,
 invisible to the library.
 
-Unlike Gitea and GitLab, which accept and index the full pack before running
-auth in a `pre-receive` hook, mizzle stages received pack data in temporary
-local storage and does not write it into the repository until auth has
-passed. An unauthorised push leaves no trace in the object store.
+Received pack data is first staged in a temporary local file.  A push
+rejected by `authorize_preliminary` never reaches the backend at all.
+A push rejected by `authorize_push` has its ingested pack rolled back
+and no refs move — see [Push receive flow](#push-receive-flow) for the
+exact ordering.
 
 ### Auth — `SshAuth`
 
@@ -90,60 +104,89 @@ orthogonal while the type system enforces they speak the same language:
 
 ```rust
 trait RepoAccess {
-    type RepoHandle;
-    fn repo_handle(&self) -> &Self::RepoHandle;
-    // authorize_push, post_receive, auto_init …
+    type RepoId;
+    type PushContext: Default;
+    fn repo_id(&self) -> &Self::RepoId;
+    // authorize_preliminary, authorize_push, post_receive, auto_init,
+    // authorize_lfs …
 }
 
 trait StorageBackend {
-    type RepoHandle;
-    fn list_refs(&self, repo: &Self::RepoHandle) -> …;
-    // read_object, write_objects, update_refs …
+    type RepoId;
+    type Repo;          // per-request handle from `open`
+    type IngestedPack;  // handle for rollback on auth failure
+    fn open(&self, id: &Self::RepoId) -> impl Future<Output = Result<Self::Repo>> + Send;
+    fn list_refs(&self, repo: &Self::Repo) -> impl Future<…> + Send;
+    // resolve_ref, update_refs, init_repo, has_object(s),
+    // compute_push_kind, build_pack, ingest_pack, inspect_ingested,
+    // rollback_ingest, reachable_excluding, tree_diff,
+    // read_commit_info, read_blob, read_object_raw …
 }
 ```
 
-The serve entry-point carries the constraint
-`B: StorageBackend<RepoHandle = A::RepoHandle>`. Pairing a mismatched auth
-and backend is a compile error.
+The serve entry-points carry the constraints
+`B: StorageBackend<RepoId = A::RepoId>` and
+`L: LfsStore<RepoId = A::RepoId>`. Pairing a mismatched auth and
+backend is a compile error.
 
 `RepoAccess` is constructed per-request by the caller. The storage backend
-is a shared singleton (connection pool, cluster client, etc.). The handle
-flows from the per-request auth object into the shared backend's methods.
+is a shared singleton (connection pool, cluster client, etc.). The id
+flows from the per-request auth object into the shared backend's `open`,
+which returns a per-request `Repo` handle used for every subsequent call.
 
-For filesystem backends `RepoHandle = PathBuf`. For a SQL backend
-`RepoHandle` might be a `(OwnerId, RepoId)` pair or a UUID.
+All the shipped backends use `RepoId = PathBuf`; for SQL and KV the path
+is just a lookup key.  A forge-specific backend could use a
+`(OwnerId, RepoId)` pair or a UUID.
 
 ### Protocol layer
 
-gitoxide is always in the middle:
+The protocol layer parses requests (via `mizzle-proto`), drives
+negotiation, and calls the storage backend for everything that touches
+repository data:
 
-- **Fetch**: ref listing, commit graph traversal for have/want negotiation,
-  pack construction, partial clone filters, shallow clone depth limiting.
-- **Push**: receives the pack into temporary local storage, inflates thin
-  packs, classifies each ref update as create/delete/fast-forward/force-push
-  via graph traversal. Auth is called with the classified `PushKind` values.
-  Only after auth passes does control move to the storage backend.
+- **Fetch**: ref listing, have/want negotiation, then
+  `StorageBackend::build_pack`, which is responsible for graph traversal,
+  partial clone filters and shallow depth limiting.  The resulting pack
+  is streamed to the client over side-band.
+- **Push**: parses ref updates, runs preliminary auth, stages the pack
+  to a temp file, and hands it to the backend to ingest, inspect and
+  classify (create / delete / fast-forward / force-push).  Auth is
+  called with the classified `PushKind` values and the `Comparison`
+  handle.  Refs are only updated after auth passes.
 
-Push-kind classification always uses gitoxide regardless of which storage
-backend is in use, because the received objects must be locally available
-before the graph can be walked.
+Each backend implements push classification and graph walks with its
+own machinery: gitoxide for `FsGitoxide`, `git merge-base` /
+`git rev-list` for `FsGitCli`, recursive CTEs for `SqlBackend`, and
+in-process BFS over `par/` keys for `KvBackend`.  Pack-metadata
+extraction for auth (`inspect.rs`) and signed-payload reconstruction
+(`sigverify.rs`) are shared, gitoxide-based code.
 
 ### Storage backends
 
-Two trait levels, for two kinds of backend:
+One trait, [`StorageBackend`](../mizzle/src/backend/mod.rs), is
+implemented by every backend.  All methods are async
+(`-> impl Future<…> + Send`).  The filesystem backends mostly do their
+work synchronously on the calling task and return a ready future; only
+pack inspection and rollback go through `spawn_blocking`.
 
-**Thin storage trait** — for backends where gitoxide does the protocol work
-and the backend just stores and retrieves objects and refs:
-- `list_refs(repo)`
-- `read_object(repo, oid)`
-- `has_object(repo, oid)`
-- `write_objects(repo, iter)`
-- `update_refs(repo, updates)`
-- `init(repo)`
+| Backend | Feature | Objects / refs | Notes |
+|---|---|---|---|
+| `FsGitoxide` | — | bare repo via gitoxide | Production FS backend; bitmap have-set and whole-pack reuse fast paths |
+| `FsGitCli` | — | bare repo via `git` subprocesses | Correctness oracle |
+| `SqlBackend` | `sql` | SQLite via sqlx | See [sql-backend-plan.md](sql-backend-plan.md) |
+| `KvBackend` | `tikv` | TiKV transactions | See [kv-backend-plan.md](kv-backend-plan.md) |
 
-**Full-bypass backend trait** — for backends that want to handle the storage
-step themselves after auth passes. `FsGitCli` is the only planned
-full-bypass backend.
+SQL and KV build packs by materialising the objects into a temporary
+gitoxide repo and share an on-disk pack cache
+([`backend/pack_cache.rs`](../mizzle/src/backend/pack_cache.rs)).
+
+A `BypassBackend` marker trait exists in `backend/mod.rs` for a
+hypothetical backend that handles the whole protocol itself.  Nothing
+implements it; `FsGitCli` uses the ordinary `StorageBackend` trait.
+
+Git LFS is a separate trait, [`LfsStore`](../mizzle/src/lfs/mod.rs),
+joined to the rest only by `RepoId` — see
+[lfs-backend-plan.md](lfs-backend-plan.md).
 
 ---
 
@@ -152,13 +195,13 @@ full-bypass backend.
 Protocol primitives extracted into a standalone crate with no storage
 dependency:
 
-- pkt-line encoding/decoding
-- capability advertisement parsing
-- fetch/push argument parsing
+- capability-advertisement and command parsing
+- fetch (v1 and v2), ls-refs and receive-pack request parsing
 - filter and shallow handling utilities
+- `ProtocolLimits` caps on request sizes
+- Git LFS batch API types, `LfsOid`, and pointer-blob parsing
 
-This lets full-bypass backends reuse the fiddly protocol parts without
-pulling in the rest of mizzle.
+pkt-line encoding/decoding itself comes from `gix-packetline`.
 
 ---
 
@@ -167,28 +210,35 @@ pulling in the rest of mizzle.
 ```
 1. Client sends ref update headers (old OID, new OID, refname) + pack data
 
-2. Preliminary auth on ref names only — can reject before any pack is
-   received (e.g. pushing to a ref the user has no access to at all)
+2. Preliminary auth (authorize_preliminary) on ref names and a cheap
+   PushKind guess — can reject before any pack data is read
 
-3. Pack received into temporary local storage — never written to the
-   repository until auth has passed
+3. Pack streamed into a temporary local file
 
-4. gitoxide walks the object graph to classify each ref (Create / Delete /
-   FastForward / ForcePush), resolving thin-pack deltas against the local
-   repo on demand
+4. Backend ingest_pack — the pack becomes readable by the backend
+   (FS backends: indexed into objects/pack; SQL/KV: objects inserted)
+   so that the Comparison handle can walk it
 
-5. Full auth: authorize_push(refs with PushKind) — cheap value comparison
+5. inspect_ingested extracts commit/tag metadata; failure rejects the
+   push.  compute_push_kind classifies each ref (Create / Delete /
+   FastForward / ForcePush)
 
-6a. FsGitoxide: gitoxide indexes pack, updates refs
-6b. FsGitCli:   pipe pack + ref updates to `git receive-pack`
-6c. SqlBackend: gitoxide explodes pack, write_objects() + update_refs()
+6. Full auth: authorize_push(PushContext, &dyn Comparison)
+   On Err: rollback_ingest, `ng` for every ref, no refs move
 
-7. post_receive() callback (CI triggers, notifications, audit log)
+7. update_refs — one CAS transaction for all refs
+
+8. post_receive() callback (CI triggers, notifications, audit log)
 ```
 
-Step 2 (preliminary auth on ref names) costs nothing — just a check against
-data already in `RepoAccess` — and catches obvious rejections before any
-pack data is transferred.
+Step 2 costs nothing — just a check against data already in
+`RepoAccess` — and catches obvious rejections before any pack data is
+read.
+
+Rollback after step 6 differs by backend: the filesystem backends
+unlink the pack they installed, while `SqlBackend` and `KvBackend`
+leave the inserted objects in place as unreferenced orphans.  In every
+case no ref points at a rejected push's objects.
 
 ---
 
@@ -198,12 +248,14 @@ The two filesystem backends exist specifically to measure and validate:
 
 | | `FsGitoxide` | `FsGitCli` |
 |---|---|---|
-| **Object reads** | gitoxide | gitoxide |
-| **Push-kind classification** | gitoxide | gitoxide |
+| **Object reads** | gitoxide | `git cat-file` |
+| **Push-kind classification** | gitoxide | `git merge-base --is-ancestor` |
+| **Pack building** | gitoxide | `git pack-objects` |
 | **Pack indexing** | gitoxide | `git index-pack` |
-| **Ref updates** | gitoxide | `git update-ref` |
+| **Ref updates** | gitoxide | `git update-ref --stdin` |
 | **Purpose** | production use, no CLI dependency | correctness baseline |
 
-The SQL backend comparison is more significant: object reads, graph
-traversal for fetch negotiation, and ref listing are all against the
-database.
+The SQL and KV backend comparison is more significant: object reads,
+graph traversal for fetch negotiation, and ref listing are all against
+the database.  The same integration tests run against them
+(`backend_parity.rs`, `sql_backend_access_test!`, and the TiKV CI job).

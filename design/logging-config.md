@@ -9,8 +9,11 @@ the staging of pack data.  This document draws the line between the two.
 
 ### Principle
 
-Mizzle uses the `log` crate and emits structured messages at appropriate
-levels.  It never configures a logger — that is the forge's job.
+`mizzle` uses the `tracing` crate (events plus a handful of
+`#[instrument]` spans on the pack path); `mizzle-proto` still uses `log`.
+Mizzle never installs a subscriber or logger — that is the forge's job.
+Forges using `tracing-subscriber` can pick up `mizzle-proto`'s `log`
+records with `tracing-log`.
 
 What mizzle logs is limited to things only it can observe: protocol-level
 events and errors.  Anything that could be a metric, alert trigger, or audit
@@ -42,10 +45,13 @@ record should instead be surfaced through a **callback** on `RepoAccess` (or
 
 ### Current state
 
-Logging is sparse and ad-hoc: mostly `error!` on write failures in spawned
-tasks and `info!` on request start.  This is roughly correct in spirit but
-lacks request-end logging and structured fields.  No immediate changes
-needed — tighten as the API stabilises.
+Logging is sparse and ad-hoc: mostly `error!` on failures (including the
+full error chain from `res_try!` in `serve.rs`), `info!`/`debug!` in the
+LFS handlers, and timing spans on `build_have_set`,
+`objects_for_fetch_*` and `try_bitmap_have_set` used by the benches.
+This is roughly correct in spirit but lacks request-end logging and
+structured fields.  No immediate changes needed — tighten as the API
+stabilises.
 
 ---
 
@@ -61,6 +67,18 @@ What *is* worth exposing falls into two categories:
 
 1. **Limits** — things that protect the server from abuse.
 2. **Identity** — things that identify the server to clients.
+
+### Current state
+
+There is no `ServerConfig` or `SshConfig` yet.  What exists:
+
+- `ProtocolLimits` (in `mizzle-proto`) — passed to every serve entry
+  point and to `ssh::run` / `run_on_socket`.
+- `ComparisonOptions` (`max_reachable_commits`) — currently always the
+  default inside `serve.rs`, not exposed to callers.
+- `ssh::run` / `run_on_socket` take a raw `russh::server::Config`.
+- The `agent=` capability is hard-coded as `mizzle/dev`, and the SSH exec
+  timeout is a 10s constant.
 
 ### Proposed: `ServerConfig`
 

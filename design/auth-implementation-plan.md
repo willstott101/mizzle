@@ -5,6 +5,28 @@ mizzle's `RepoAccess` surface with the typed `PushContext`, the
 `Comparison` handle, signature-verification plumbing, and the example
 rules that prove the surface is expressive enough.
 
+## Status
+
+| Phase | Status |
+|---|---|
+| A — `Comparison` handle, typed `PushContext` | ✓ Done |
+| B — verification plumbing | ✓ Done (`mizzle/src/sigverify.rs`) |
+| C — real verifiers | Not started — `sigverify::verify_native` is still a stub |
+| D — example rules | Partial — see below |
+| E — Sigstore adapter (out of tree) | Not started |
+| F — push certificates, `Comparison::receipt` | Not started; the optional `serde` feature it builds on has landed |
+
+Phase D coverage in [`mizzle/tests/auth_rules.rs`](../mizzle/tests/auth_rules.rs):
+examples 1, 2, 3, 4, 8, 9 and 10 are implemented.  Example 5 (signed
+commits) is blocked on Phase C, and so are the signed-commit cases of
+example 7 — only the drop-count limit exists.  Example 6 has only the
+fast-forward rejection test.  The signature fixtures
+(`tests/common/sig_fixtures.rs`, `tests/fixtures/keys/`) don't exist yet.
+Phase A's integration tests landed in `tests/auth.rs` (`comparison_*`)
+and `tests/comparison_regression.rs`, and Phase B's as unit tests in
+`sigverify.rs`; they don't all use the names listed below, and not
+every listed test has a counterpart.
+
 ## Staging
 
 Each phase is independently shippable and testable. Earlier phases
