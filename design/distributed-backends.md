@@ -3,8 +3,13 @@
 The thin storage trait has two distinct access patterns worth separating
 when targeting distributed systems:
 
-- **Objects** (`read_object`, `has_object`, `write_objects`): immutable,
-  content-addressed — any CAS or blob store works.
+- **Objects** (`read_object_raw`, `has_object(s)`, `ingest_pack`):
+  immutable, content-addressed — any CAS or blob store works.
+
+The SQL backend (SQLite) and a TiKV backend now exist — see
+[sql-backend-plan.md](sql-backend-plan.md) and
+[kv-backend-plan.md](kv-backend-plan.md).  The rest of this document is a
+survey of candidates.
 - **Refs** (`update_refs`): mutable pointers requiring compare-and-swap —
   the hard constraint that rules out eventually-consistent stores.
 

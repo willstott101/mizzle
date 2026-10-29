@@ -23,6 +23,9 @@ Audit all gitoxide calls in `fetch.rs`, `pack.rs`, `ls_refs.rs`,
 trait. Move the current gitoxide implementation behind the thin storage
 trait as `FsGitoxide`. Existing tests must all pass unchanged.
 
+Outcome: a single `StorageBackend` trait.  The full-bypass trait exists
+only as an unimplemented `BypassBackend` marker.
+
 The trait shape is the most consequential design decision in the project.
 Worth prototyping on paper before writing code — particularly streaming
 pack data (must not buffer), async graph traversal, and atomic
@@ -30,11 +33,20 @@ receive-pack (write + ref update).
 
 ### Phase 5 — `FsGitCli` backend ✓
 
-Full-bypass backend that hands off to git CLI after auth. Use as the
+Backend that delegates storage work to the git CLI.  It ended up
+implementing the ordinary `StorageBackend` trait rather than a
+full-bypass one, so it shells out for ingest and push classification
+(before auth) as well as for ref updates.  Use as the
 correctness oracle: run the integration tests against both `FsGitoxide`
 and `FsGitCli` and verify identical behaviour.
 
-### Phase 5.1 — Performance testing infrastructure
+### Phase 5.1 — Performance testing infrastructure (partial)
+
+Done: `tracing` spans on `build_have_set` and the pack path, the `deep`
+reference repo, the span-totals bench subscriber, and the
+`fetch_incremental` / `clone_full` benches.  Still to do: the `medium`
+and other reference repos, bandwidth benches, the concurrency harness,
+and the external `git-http-backend` baseline.
 
 Instrument `build_have_set` and the pack-generation path with `tracing`
 spans.  Build the deterministic reference repos (`medium`, `deep`) and
@@ -63,7 +75,7 @@ runs only for commits and tags.
 of OIDs.  Git solves this with `.bitmap` files alongside pack indexes —
 a single bitmap lookup replaces the full commit + tree walk.
 
-Gitoxide 0.67/0.68 exposes the EWAH primitive (`gix-bitmap`) but not a
+At the time, gitoxide 0.67/0.68 exposed the EWAH primitive (`gix-bitmap`) but not a
 reachability-bitmap reader, so `mizzle/src/bitmap.rs` parses the `.bitmap`
 + `.rev` files directly (v1 format, sha1 only).  `FsGitoxide::build_pack`
 calls `try_bitmap_have_set` first; on any uncovered have (or no bitmap)
@@ -104,10 +116,10 @@ single push or fetch opens the same repo multiple times (list_refs,
 build_pack/ingest, has_object, compute_push_kind, update_refs).  Cache a
 repo handle for the lifetime of the request.
 
-#### 5.2e — Reduce intermediate allocations
+#### 5.2e — Reduce intermediate allocations (open)
 
-- `stream_pack_to_channel`: `counts.into_iter().collect()` re-collects
-  unnecessarily.
+- `stream_pack_to_channel` (and its SQL/KV copies):
+  `counts.into_iter().collect()` re-collects unnecessarily.
 - `objects_for_fetch_filtered`: final `HashSet` → `Vec` conversion could
   be avoided by returning an iterator or the set itself.
 - `ChunkBuffer::new()` starts at zero capacity — pre-allocate.
@@ -122,17 +134,26 @@ After this phase every subsequent backend gets full coverage for free.
 libfuzzer/AFL harness over the protocol parsing layer. Seed corpus from
 traffic captures. Run against a minimal in-memory stub.
 
-### Phase 7.1 — Async `StorageBackend` migration
+### Phase 7.1 — Async `StorageBackend` migration ✓
 
-Standalone MR.  Convert all `StorageBackend` methods to
-`-> impl Future<…> + Send`.  Filesystem backends wrap CPU-bound work
-in `spawn_blocking`.  Fix `stream_pack_sideband` blocking read.
-`Comparison` trait goes async.  See
-[sql-backend-plan.md](sql-backend-plan.md) Phase 0 for full scope.
+All `StorageBackend` methods return `-> impl Future<…> + Send`.  See
+[sql-backend-plan.md](sql-backend-plan.md) Phase 0.
 
-### Phase 8 — SQL backend
+Differences from the original plan:
 
-SQLite first (via `sqlx::Sqlite`), then CockroachDB/Postgres.
+- `Comparison` stayed synchronous.  Its accessors call the async backend
+  through `tokio::task::block_in_place` (`auth.rs::block_on_backend`),
+  which keeps laziness without making `authorize_push` async.  This
+  requires a multi-threaded tokio runtime.
+- Most filesystem-backend methods still run synchronously and return a
+  ready future; only pack inspection and rollback use `spawn_blocking`.
+- `stream_pack_sideband` (`fetch.rs`) still does a blocking
+  `reader.read()` on the executor.  Open.
+
+### Phase 8 — SQL backend ✓ (SQLite)
+
+`SqlBackend` behind the `sql` feature (PR #12).  CockroachDB/Postgres is
+not started.  SQLite first (via `sqlx::Sqlite`), then CockroachDB/Postgres.
 Full plan in [sql-backend-plan.md](sql-backend-plan.md).
 
 Schema: `repositories`, `objects`, `refs`, `commit_parents`.
@@ -146,7 +167,21 @@ round-trip.
 The cross-backend harness from Phase 6 immediately validates correctness
 and surfaces performance characteristics.
 
-### Phase 9 — Git LFS
+### Phase 8.1 — Transactional KV backend (TiKV) ✓ (proof of concept)
+
+`KvBackend` behind the `tikv` feature, with a CI job against a
+`tiup playground` cluster.  FoundationDB support is not started.  Full
+plan in [kv-backend-plan.md](kv-backend-plan.md).
+
+### Phase 9 — Git LFS (phases 0–3 ✓)
+
+Done: proto types, `LfsStore` trait, `authorize_lfs`, batch API, proxy
+transfer endpoints and the `FsLfs` store, wired up through
+`serve_with_backends`.  Not started: coupled SQL/KV stores, the S3
+redirect store, SSH `git-lfs-authenticate`, and the `git lfs`
+round-trip test harness — the LFS handlers in `mizzle` currently have
+no tests (only the `mizzle-proto` types do).
+
 
 LFS as a storage concern orthogonal to the git `StorageBackend`: a thin
 `LfsStore` trait joined to the auth layer only by `RepoId`, so the LFS
@@ -165,6 +200,6 @@ every backend. Tests make real `git clone`, `git fetch`, `git push` calls
 against a live mizzle server backed by each backend in turn. Correctness
 parity is verified; timing is recorded for performance comparison.
 
-**Fuzzing** — the protocol parsing layer (pkt-line, fetch args, push
+**Fuzzing** (not started, see Phase 7) — the protocol parsing layer (pkt-line, fetch args, push
 headers) is fuzzed against a minimal in-memory backend stub, independent
 of storage.

@@ -12,7 +12,7 @@ This unlocks things that are difficult or impossible with forge software today:
 
 - **Horizontal scaling.** Storage backends backed by distributed databases or object storage can serve fetch requests from multiple nodes without shared filesystem state.
 - **Rich querying.** Storing the object graph in a relational database means you can query commit history, file ownership, and ref state with SQL — the same data that powers code review, blame, and search features — without separate indexing pipelines.
-- **Correctness and performance testing.** The same integration test suite and fuzz corpus runs against every backend. You can verify that a novel backend is protocol-correct, and measure whether it's faster or slower than the baseline.
+- **Correctness and performance testing.** The same integration test suite runs against every backend. You can verify that a novel backend is protocol-correct, and measure whether it's faster or slower than the baseline.
 - **Novel hosting models.** Serverless git, WASM-hosted git, git over a custom transport — all are possible when storage and protocol are decoupled.
 
 ## Architecture
@@ -20,30 +20,42 @@ This unlocks things that are difficult or impossible with forge software today:
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Transport                        │
-│         (HTTP smart protocol v1/v2, SSH)             │
+│     (HTTP smart protocol v1/v2, SSH, Git LFS)       │
 └─────────────────────┬───────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
 │                  Auth layer                         │
-│   pluggable: OIDC, SSH key, token, anonymous, ...   │
+│  RepoAccess / SshAuth — implemented by the forge    │
 └─────────────────────┬───────────────────────────────┘
                       │
 ┌─────────────────────▼───────────────────────────────┐
-│               Repository trait                      │
-│   list_refs · fetch_pack · receive_pack · hooks     │
+│        StorageBackend trait  (+ LfsStore)           │
+│  refs · objects · ingest · build_pack · graph walks │
 └──────────────────┬──────────────┬───────────────────┘
                    │              │
       ┌────────────▼────────┐  ┌──▼──────────────────────┐
-      │   Filesystem / NFS  │  │  Novel backends         │
-      │  (bare git repos)   │  │  (SQL, object store...) │
+      │   Filesystem / NFS  │  │  Database backends      │
+      │  (bare git repos)   │  │  (SQLite, TiKV)         │
       └─────────────────────┘  └─────────────────────────┘
 ```
 
-The `Transport` layer requires tokio and ships with an axum adapter for HTTP. Mizzle is a library, so forges can serve git and their own web API from the same process — avoiding proxy overhead between the forge API and git data access. The core protocol handlers accept generic `AsyncRead`/`AsyncWrite` types, so any tokio-based framework can integrate directly without an adapter.
+The `Transport` layer requires tokio and ships with an axum adapter for HTTP (default `axum` feature) and a russh-based SSH server (`ssh` feature). Mizzle is a library, so forges can serve git and their own web API from the same process — avoiding proxy overhead between the forge API and git data access. The core protocol handlers accept generic `AsyncRead`/`AsyncWrite` types, so any tokio-based framework can integrate directly without an adapter.
 
-The `Auth` layer receives structured information about the operation being requested (repo path, ref name, push kind) and returns a decision. It never opens the repository.
+The `Auth` layer is a trait the forge implements: mizzle doesn't authenticate users itself, the forge resolves identity (tokens, OIDC, SSH keys, ...) and hands mizzle a `RepoAccess` value. Mizzle passes it structured information about the operation (repo id, ref names, push kind) plus a lazy `Comparison` handle for inspecting a push's commits, diffs and signatures, and gets back a decision. The authoriser never opens the repository. See [design/auth.md](design/auth.md).
 
-The `Repository` trait is what backends implement. The same test suite runs against every backend, so correctness and performance can be compared directly.
+The `StorageBackend` trait is what backends implement. The same test suite runs against every backend, so correctness and performance can be compared directly. Git LFS objects go through a separate `LfsStore` trait, so they can live in the same backend as the git data or a different one.
+
+### Backends
+
+| Backend | Cargo feature | Storage |
+|---|---|---|
+| `FsGitoxide` | — | Bare repos, pure Rust via [gitoxide](https://github.com/Byron/gitoxide) |
+| `FsGitCli` | — | Bare repos via the `git` CLI |
+| `SqlBackend` | `sql` | SQLite (via sqlx) |
+| `KvBackend` | `tikv` | [TiKV](https://tikv.org/) transactional KV (proof of concept) |
+| `FsLfs` (LFS) | — | Standard git-lfs on-disk layout |
+
+See [design/architecture.md](design/architecture.md) for the full picture and [design/roadmap.md](design/roadmap.md) for status.
 
 ### Filesystem backends
 
@@ -51,12 +63,12 @@ The filesystem backend has two implementations, both shipping with mizzle, prima
 
 | Implementation | How it works | Use case |
 |---|---|---|
-| `FsGitCli` | mizzle handles auth and protocol; git CLI handles pack indexing and ref updates | Ground-truth correctness and performance baseline |
+| `FsGitCli` | mizzle handles auth and protocol; git CLI handles pack building, indexing, graph walks and ref updates | Ground-truth correctness and performance baseline |
 | `FsGitoxide` | Pure Rust via [gitoxide](https://github.com/Byron/gitoxide) for the full stack | Performance comparison, no git CLI dependency |
 
 For most users these are interchangeable — both serve bare repos on a local or networked filesystem. Having both makes it easy to catch divergence and to benchmark pack indexing and ref update performance between the two.
 
-Note: push-kind classification (fast-forward vs. force-push) always uses gitoxide regardless of backend, because the received pack must be inspected before mizzle can call auth. The CLI backend hands off to `git` only after auth has passed.
+Note: on push, the received pack is ingested into the repository *before* `authorize_push` runs, so the backend can classify each ref (fast-forward vs. force-push) and walk the new commits. If auth rejects the push, the pack is removed again and no refs move. Pack metadata extraction for auth (commit/tag parsing) is shared gitoxide code, but each backend does its own classification — `FsGitCli` uses `git merge-base`.
 
 ## Notes on the git protocol spec
 

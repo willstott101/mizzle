@@ -4,9 +4,10 @@ How concurrent reads and writes interact in mizzle, and which of those
 interactions are safe under the locking guarantees gitoxide actually
 provides.
 
-This document is specific to the filesystem backends.  SQL and other
-backends will have their own concurrency stories rooted in the
-transactional guarantees of the underlying store.
+This document is specific to the filesystem backends.  The SQL and KV
+backends get their concurrency story from the transactional guarantees
+of the underlying store (see [SQL and KV backends](#sql-and-kv-backends)
+at the end).
 
 ## Where concurrency comes from
 
@@ -75,12 +76,11 @@ The default failure mode for the lock is `Fail::Immediately` — if the
 `.lock` file already exists, the transaction errors out instead of
 blocking.
 
-Note that `gix-ref` also exposes a *multi-edit* transaction API
+`gix-ref` also exposes a *multi-edit* transaction API
 (`Transaction::prepare`/`commit` with a vec of `RefEdit`) that locks all
-affected refs in the prepare phase and commits them as a unit.  mizzle
-does not currently use this — see the
-[multi-ref non-atomicity gap](#non-atomic-multi-ref-updates-fsgitoxide)
-below.
+affected refs in the prepare phase and commits them as a unit.
+`FsGitoxide::update_refs` uses this — see
+[Ref updates](#ref-updates-cas-and-atomicity) below.
 
 ### Packs — content-addressed atomic install
 
@@ -94,7 +94,8 @@ mmaps).
 
 mizzle stages each ingestion into a *fresh* `tempfile::tempdir()` and
 then `move_file`s the produced files into `objects/pack`
-(see [fs_gitoxide.rs:266-301](../mizzle/src/backend/fs_gitoxide.rs#L266)).
+(see `FsGitoxide::ingest_pack_sync` in
+[fs_gitoxide.rs](../mizzle/src/backend/fs_gitoxide.rs)).
 The move ordering matters: `.pack` first, then `.idx`.  Pack discovery
 walks `.idx` files, so other readers never see an indexed pack whose
 data file is missing.
@@ -111,7 +112,7 @@ just-ingested objects if it ever needs them.
 already-mapped packs are *never* unloaded for the lifetime of the
 handle, even if maintenance removes them from disk.  mizzle calls this
 inside `stream_pack_to_channel`
-([fs_gitoxide.rs:379](../mizzle/src/backend/fs_gitoxide.rs#L379)) so the
+([fs_gitoxide.rs](../mizzle/src/backend/fs_gitoxide.rs)) so the
 streaming pack writer keeps a stable view of the pack files it's reading
 from while the response streams to the client.
 
@@ -149,90 +150,50 @@ pack will continue to read from it.  On Windows this would fail — see
 `<refname>.lock`.  `gix-ref` honours these per-ref locks even though
 the transactions don't otherwise coordinate.
 
-## Gaps and races
+**Two pushes racing for the same ref.**  Covered by CAS — see the next
+section.  Exercised by `concurrent_pushes_only_one_wins_*` in
+[`tests/backend_parity.rs`](../mizzle/tests/backend_parity.rs) for every
+backend.
 
-### Lost updates on `refs/*` (FsGitoxide only)
+## Ref updates: CAS and atomicity
 
-`FsGitoxide::update_refs` calls
+The [`StorageBackend::update_refs`](../mizzle/src/backend/mod.rs)
+contract requires an all-or-nothing transaction with compare-and-swap
+against each update's `old_oid`.
 
-```rust
-local.reference(name, oid, PreviousValue::Any, "push")
-```
+`FsGitoxide::update_refs` builds one `gix_ref` transaction with a
+`RefEdit` per update and commits it as a unit.  Each edit's `expected`
+value is derived from the protocol:
 
-at [fs_gitoxide.rs:131-141](../mizzle/src/backend/fs_gitoxide.rs#L131).
-`PreviousValue::Any` tells `gix-ref` to overwrite whatever value is
-currently in the ref without comparison.  The protocol-supplied
-`old_oid` (the value the client believed the ref had when it started its
-push) is discarded.
+| Update | `PreviousValue` |
+|---|---|
+| create (`old_oid` null) | `MustNotExist` |
+| update | `MustExistAndMatch(old_oid)` |
+| delete (`new_oid` null) | `MustExistAndMatch(old_oid)` |
 
-This breaks the lost-update guarantee that the git wire protocol
-otherwise provides.  Two pushes racing for `refs/heads/main`:
+Locks are acquired with `Fail::Immediately`, so a push that races
+another push holding the same ref lock fails rather than waiting.
+`FsGitCli::update_refs` gets the same behaviour by piping all
+`update <ref> <new> <old>` lines into one `git update-ref --stdin`
+invocation, which git treats as a single transaction; it serves as the
+behavioural oracle.  `stale_oid_rejected` and `multi_ref_atomicity` in
+`tests/backend_parity.rs` pin both properties.
 
-1. Both observe `main = A` in the receive-pack ref advertisement.
-2. Push #1 sends `A → B`, push #2 sends `A → C`.
-3. mizzle classifies push #1 as fast-forward (B descends from A) and
-   push #2 as fast-forward (C also descends from A).
-4. Both authorisations pass.
-5. Push #1 takes the `.lock`, writes `B`, releases.
-6. Push #2 takes the `.lock`, writes `C`, releases — **silently
-   overwriting B**.
+`compute_push_kind` walks the full ancestry of `new_oid` looking for
+`old_oid` (there is no walk cap), so a legitimate deep fast-forward is
+never misclassified as a force-push.  Note that the classification is
+computed against the *client's* `old_oid`; it is the CAS check in
+`update_refs` that guarantees the ref still holds that value when the
+update lands.
 
-The same hole bypasses branch protection: the push-kind classification
-(`compute_push_kind`) walks from the *client's* `new_oid` looking for
-the *client's* `old_oid`, not the live server value.  A user whose
-authoriser only allows fast-forwards to `main` can still clobber a
-concurrent push by pushing a fast-forward of a stale tip.
+**Error surface.**  A CAS or lock failure is returned from
+`update_refs` as an error.  The protocol layer currently logs it and
+aborts the report-status response rather than emitting per-ref
+`ng <ref> stale info` lines, so the client sees a failed push without a
+ref-specific reason.  The ingested pack is not rolled back in this path
+— it stays in `objects/pack` as unreferenced data until GC.
 
-`FsGitCli` does not have this bug.  `update_refs` pipes
-`update <ref> <new> <old>` lines into `git update-ref --stdin`, and
-git's update-ref enforces CAS against `<old>` under the per-ref lock.
-A racing push fails with `cannot lock ref … is at … but expected …`.
-
-The fix is a one-liner per case in `FsGitoxide::update_refs`: translate
-the protocol's `old_oid` into the right `PreviousValue` variant —
-`MustExistAndMatch(old)` for a normal update, `MustNotExist` for a
-create, `MustExistAndMatch(old)` paired with the deletion variant for a
-delete.  Then surface the resulting `ReferenceOutOfDate` error to the
-client as an `ng <ref> stale info` line.
-
-A subtlety: `compute_push_kind` walks at most `MAX_FF_WALK` commits from
-`new_oid` looking for `old_oid`
-([fs_gitoxide.rs:174-178](../mizzle/src/backend/fs_gitoxide.rs#L174)).
-A legitimate fast-forward whose ancestry chain is longer than the cap
-will be misclassified as a force-push.  This is a **false negative for
-authorisation only**: the `compute_push_kind` misclassification may
-cause the authoriser to reject a legitimate fast-forward as if it were
-a force-push.  It does *not* affect the CAS outcome — the gix-ref CAS
-check (`MustExistAndMatch`) is a direct OID equality between the
-on-disk ref value and the supplied `old_oid`; it contains no
-reachability walk and will pass regardless of how `compute_push_kind`
-classified the update.  The cap should be lifted or documented as a
-known false negative on the trait.
-
-### Non-atomic multi-ref updates (FsGitoxide)
-
-`FsGitoxide::update_refs` iterates over `updates` and issues one
-single-ref transaction per update via `local.reference(...)`
-([fs_gitoxide.rs:133-142](../mizzle/src/backend/fs_gitoxide.rs#L133)).
-There is no enclosing transaction.  A push that updates several refs
-atomically on the wire — say `refs/heads/main` plus `refs/tags/v1.0` —
-can land partially: the first ref commits, the second fails (lock
-contention, CAS mismatch once that's fixed, disk error), and the
-repository is left in a state the client never asked for.
-
-`gix-ref` exposes the right primitive: a single `Transaction` carrying a
-vec of `RefEdit` locks every affected ref in `prepare` and commits them
-as a batch.  Either every edit lands or none do.
-
-`FsGitCli::update_refs` already gets this behaviour for free by piping
-all `update <ref> <new> <old>` lines into one
-`git update-ref --stdin` invocation, which git treats as a single
-transaction.
-
-The fix is to build a `gix_ref::transaction::Transaction` with one
-`RefEdit` per update and commit it once.  This change pairs naturally
-with the CAS fix — both are about translating the protocol's intent
-into the right `gix-ref` API surface.
+## Remaining gaps
 
 ### Inconsistent multi-ref snapshots in `list_refs`
 
@@ -244,34 +205,31 @@ refs from before the commit and some from after.
 
 In practice this is invisible to clients because the ref advertisement
 is a flat list with no cross-ref invariants the protocol cares about.
-Clients that re-list immediately afterwards just see the new state.
-Documented here so it isn't surprising: `list_refs` does not promise a
-linearisable snapshot of the ref space.
+This is documented as part of the `list_refs` contract on
+`StorageBackend`: the snapshot is not linearisable and callers must not
+derive cross-ref invariants from it.
 
 `FsGitCli::list_refs` runs `git for-each-ref` and inherits whatever
 snapshotting `git` provides, which is similarly best-effort.
 
-### `init_repo` TOCTOU
+### `init_repo` races
 
-`FsGitoxide::init_repo` checks `repo_path.exists()` and then calls
-`gix::init_bare`.  Two concurrent first-pushes to the same auto-init
-repo could both pass the check.  `gix::init_bare` on an already-initialised
-directory is idempotent enough not to corrupt anything (it rewrites the
-skeleton files atomically), but the two inits will race on creating
-`refs/`, `objects/`, `HEAD`, `config`, etc.  This is a latent issue more
-than an active one; if it becomes a real problem the fix is to take a
-filesystem-level lock on the repo path.
+`FsGitoxide::init_repo` creates parent directories and calls
+`gix::init_bare` unconditionally.  If a concurrent first-push to the
+same auto-init repo wins the race, `init_bare` fails on the now
+non-empty directory; mizzle treats that as success when `HEAD` exists.
 
-`FsGitCli::init_repo` has the same shape.
+`FsGitCli::init_repo` still has the original check-then-act shape
+(`repo_path.exists()` followed by `git init --bare`).  Re-running
+`git init --bare` on an existing repo is harmless, so this is a latent
+issue rather than an active one.
 
 ### Pack rollback on Windows
 
-`rollback_ingest` `unlink`s the idx and then the pack file
-unconditionally
-([fs_gitoxide.rs:326-329](../mizzle/src/backend/fs_gitoxide.rs#L326)).
-The order matters: removing the idx first means a concurrent reader
-that rescans `objects/pack/*.idx` will stop seeing the pack before its
-data file disappears.
+`rollback_ingest` `unlink`s the idx and then the pack file.  The order
+matters: removing the idx first means a concurrent reader that rescans
+`objects/pack/*.idx` will stop seeing the pack before its data file
+disappears.
 
 On POSIX this is safe even if a concurrent fetch has either file
 mapped.  On Windows, `DeleteFile` fails on a file that's open — and a
@@ -282,49 +240,24 @@ fetches complete or use `MOVEFILE_DELAY_UNTIL_REBOOT`-style staging.
 
 ### Pack-name collision under concurrent ingest of identical content
 
-Two pushes carrying the same set of objects will produce the same
-`pack-<hash>.{pack,idx}` filenames.  mizzle's `move_file` uses
-`std::fs::rename`, which on POSIX overwrites silently.  The second
-ingest then issues `rollback_ingest` on a file path that the first
-ingest still owns and considers durable, which would unlink the live
-pack.
+Two pushes carrying the same set of objects produce the same
+`pack-<hash>.{pack,idx}` filenames.  `ingest_pack` skips the move when
+the destination already exists (identical content, by construction) and
+records that it does not own the file, so a later `rollback_ingest`
+never unlinks a pack another push installed.
 
-This is a vanishingly rare ordering — two clients pushing byte-identical
-packs simultaneously — but worth recording.  A defensive fix would be
-to skip the move (and skip rollback registration) if the destination
-already exists with the same content hash.
+## SQL and KV backends
 
-## Recommendations
+Both get their guarantees from the store's transactions rather than
+from `gix-lock`:
 
-In rough priority order:
+- **`SqlBackend`** applies every update inside one sqlx transaction;
+  each update is a conditional `UPDATE`/`DELETE` (or `INSERT` for a
+  create) and a zero `rows_affected` aborts the whole batch.
+- **`KvBackend`** (TiKV) runs `update_refs` in a single pessimistic
+  transaction that reads each ref, validates `old_oid`, and writes or
+  clears the keys before committing.
 
-1. **Rewrite `FsGitoxide::update_refs` to use a single multi-ref
-   transaction with per-ref CAS.**  Highest priority — covers two
-   correctness bugs at once.  Build a `gix_ref::transaction::Transaction`
-   with one `RefEdit` per update; set each edit's `expected` to
-   `MustExistAndMatch(old)` / `MustNotExist` derived from the protocol's
-   `old_oid`.  Commit as a unit.  Surface
-   `Error::PreviousValueMismatch` to the client as `ng <ref> stale info`,
-   and any other transaction error as `ng <ref> <reason>` for every ref
-   in the batch.  The CLI backend already gets both behaviours via
-   `git update-ref --stdin`, so it serves as a behavioural oracle.
-2. **Either lift `MAX_FF_WALK` for `compute_push_kind` or document the
-   false-negative.**  Once (1) lands, a stale walk cap turns a
-   legitimate deep fast-forward into a CAS-rejected push.  Pick one:
-   walk to history root for the FF check, or accept the misclassification
-   and document it on the trait.
-3. **Define the `list_refs` consistency contract in the storage trait
-   docs.**  Make explicit that the snapshot is not linearisable and
-   that callers must not derive cross-ref invariants from it.
-4. **Tighten `init_repo` against double-init**, either with a path-level
-   lock or by swallowing the "already initialised" race on the second
-   `gix::init_bare` call.
-5. **Defer pack-rollback until safe on Windows** if/when Windows
-   hosting becomes a target.
-6. **Skip the rename in `ingest_pack` when the destination pack already
-   exists**, mirroring what `gix-pack` itself does inside its own
-   tempdir flow, to close the duplicate-content race.
-
-None of these block the SQL backend work — that backend will get its
-concurrency story from the database's transaction model rather than
-from `gix-lock`.
+Neither backend rolls back ingested objects on auth failure
+(`rollback_ingest` is a no-op): orphan objects without a ref pointing at
+them are harmless, matching unreferenced packs on the filesystem.

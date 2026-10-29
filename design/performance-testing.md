@@ -11,15 +11,24 @@ whether a backend is production-viable and where the bottlenecks are.
 
 ## What we already have
 
-`benches/backends.rs` runs criterion microbenchmarks for clone, push,
-fetch, and ls-remote against both filesystem backends.  These use a small
-two-commit repo and measure wall-clock time.  This is a useful starting
-point but has gaps:
+`benches/backends.rs` runs criterion benchmarks against both filesystem
+backends (the SQL and KV backends are not wired in yet):
+
+- `clone`, `push`, `fetch`, `ls_remote` — a small two-commit repo,
+  wall-clock time, through a live axum server.
+- `fetch_incremental` and `clone_full` — the `deep` reference repo
+  (10,000 linear commits), with and without a `.bitmap`, driving
+  `build_pack` directly.  A span-totals `tracing` subscriber
+  (`benches/support/span_totals.rs`) records per-span timings.
+
+`benches/support/repo_builder.rs` builds the `deep` repo
+deterministically.  Remaining gaps:
 
 - No bandwidth measurement — a fast clone that sends 10× the minimum
   pack is hiding a problem.
-- Single repo shape — two commits doesn't exercise negotiation, delta
-  compression, or shallow boundaries meaningfully.
+- Only two repo shapes (`tiny`, `deep`) — no `medium`, `large-blobs` or
+  `wide-refs`, so branchy negotiation, delta compression and many-ref
+  advertisement aren't covered.
 - No concurrency — measures single-client latency only.
 - No resource profiling — memory and CPU are invisible.
 - No comparison to a vanilla `git-http-backend` or Gitea baseline.
@@ -262,6 +271,16 @@ Use `git-http-backend` only as a bandwidth reference (Step 6); latency
 comparisons should be between mizzle backends only.
 
 ## Implementation plan
+
+| Step | Status |
+|---|---|
+| 1 — deterministic repo builder | Partial: `RepoBuilder` exists in `benches/support/` with linear-history and bitmap options; only `deep` is built, and `tests/common` doesn't use it |
+| 2 — bandwidth benchmarks | Not started |
+| 3 — tracing instrumentation | Done for `mizzle` (`mizzle-proto` still uses `log`); `medium` repo not added |
+| 3.1 — bitmap bench | Done |
+| 4 — concurrency harness | Not started |
+| 5 — resource profiling | Not started |
+| 6 — external baseline | Not started |
 
 ### Step 1 — Deterministic repo builder
 

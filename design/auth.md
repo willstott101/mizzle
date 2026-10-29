@@ -6,6 +6,23 @@ that.
 
 For the wider architecture see [architecture.md](architecture.md).
 
+## Implementation status
+
+This document describes the target design.  What exists in the code
+today (see [auth-implementation-plan.md](auth-implementation-plan.md)
+for the phases):
+
+| Feature | Status |
+|---|---|
+| `PushContext`, `authorize_preliminary` / `authorize_push`, `Comparison` handle (Phase A) | Implemented |
+| `verification_keys` / `verify_external` plumbing, lazy signed-payload reconstruction (Phase B) | Implemented |
+| Native OpenPGP / SSH / X.509 verifiers (Phase C) | **Not yet** — `verify` returns `UnknownKey` when no keys are supplied, otherwise `UnsupportedFormat`, unless `verify_external` overrides |
+| Push certificates — `push_cert()`, `verify_push_cert()`, `push_cert_nonce_seed` (Phase F) | **Not yet** — specified below |
+| `Comparison::receipt()` (Phase F) | **Not yet** — specified below |
+| Optional `serde` feature for audit types | Implemented |
+
+Sections and rows describing unimplemented features are marked as planned.
+
 ## Principles
 
 Two rules govern every interface in this document:
@@ -15,8 +32,12 @@ Two rules govern every interface in this document:
    or via a `Comparison` handle whose accessors are explicit and bounded.
    The forge never has to call `git rev-list` itself or open the object
    graph behind mizzle's back.
-2. **Pack data is staged, not stored, until auth passes.** A rejected push
-   leaves no trace in the object store.
+2. **No ref moves until auth passes.** Pack data is staged to a temp
+   file and only handed to the backend after preliminary auth.  It is
+   ingested before `authorize_push` (so the `Comparison` handle can walk
+   it) and rolled back if auth rejects the push: the filesystem backends
+   unlink the pack, while the SQL and KV backends leave the objects as
+   unreferenced orphans.
 
 Mizzle does not legislate *when* the forge spends its latency budget — see
 [§ Strategies](#strategies) for the common shapes.
@@ -104,14 +125,15 @@ from the lazy `Comparison` accessors only on the refs it cares about.
 
 ```
 0. forge handler                  resolve identity, construct RepoAccess
-1. read_receive_request           parse ref-update headers (or the
-                                  push-cert block, if the client used
-                                  `git push --signed`); validate the
-                                  cert nonce statelessly
+1. read_receive_request           parse ref-update headers (planned:
+                                  or the push-cert block, if the client
+                                  used `git push --signed`, validating
+                                  the cert nonce statelessly)
 2. authorize_preliminary          refnames + PushKind only;
                                   returns PushContext
 3. stage_pack                     stream to a temp file
-4. ingest_pack                    write into object store as quarantined data
+4. ingest_pack                    write into the backend's object store
+                                  (no ref points at it yet)
 5. inspect_ingested               extract commit/tag metadata + signatures
 6. authorize_push                 forge gets a Comparison handle and the
                                   PushContext from step 2; signature
@@ -143,8 +165,8 @@ state:
 | `read_blob(oid, cap)`          | Blob bytes for content-inspection policies (e.g. `.gitmodules`, secret-scanning).                        | O(blob size); `None` if not in the staged pack or above the cap.  |
 | `pack_metadata()`              | Object identities and sizes from pack inspection.                                                        | Already populated by step 5.                                      |
 | `tags()`                       | Annotated tags introduced by this push.                                                                  | Populated by step 5.                                              |
-| `push_cert()`                  | `Option<&PushCert>` — parsed `git push --signed` certificate, if the client sent one.                    | Already parsed by step 1; `verify()` on it runs lazily, same as commit signatures. |
-| `receipt()`                    | Owned `PushReceipt` — every ref, every new commit's verification status, the push-cert's verification status. See [§ `Comparison::receipt`](#comparisonreceipt--an-audit-log-convenience). | Default method built from the accessors above; pays only for what wasn't already cached. |
+| `push_cert()` *(planned)*      | `Option<&PushCert>` — parsed `git push --signed` certificate, if the client sent one.                    | Already parsed by step 1; `verify()` on it runs lazily, same as commit signatures. |
+| `receipt()` *(planned)*        | Owned `PushReceipt` — every ref, every new commit's verification status, the push-cert's verification status. See [§ `Comparison::receipt`](#comparisonreceipt--an-audit-log-convenience). | Default method built from the accessors above; pays only for what wasn't already cached. |
 
 A forge that touches only `refs()` pays nothing beyond what the pipeline
 already did. A forge that calls `dropped_commits` for every ref pays for
@@ -159,8 +181,11 @@ push-time and merge-request-time policies.
 
 ## Committer verification — supported flows
 
-Mizzle ships verifiers for the three commit-signature formats that
-account for essentially all real-world signed commits:
+Mizzle will ship verifiers for the three commit-signature formats that
+account for essentially all real-world signed commits.  *(Planned,
+Phase C: the dispatch and key-resolution plumbing exist, but no native
+verifier is wired in yet — until then, only `verify_external` can
+produce a `Verified` status.)*
 
 | Format                       | Forge supplies                                                                                              |
 |------------------------------|-------------------------------------------------------------------------------------------------------------|
@@ -226,6 +251,11 @@ part of the core library.
   promotion via the forge UI.
 
 ## Push certificates — `git push --signed`
+
+*Not yet implemented (Phase F of the
+[implementation plan](auth-implementation-plan.md)).  mizzle does not
+currently advertise `push-cert`, and none of the types or methods in
+this section exist yet.*
 
 Committer verification (above) tells the forge whether a *commit* was
 signed by a trusted key. It says nothing about the *push itself* — the
@@ -336,6 +366,10 @@ non-repudiable "X pushed this, right now."
   `None` themselves in `authorize_push`.
 
 ## `Comparison::receipt` — an audit-log convenience
+
+*Not yet implemented (Phase F).  Forges can build the same summary today
+by looping over `refs()`, `new_commits()` and `verify()` in
+`post_receive`.*
 
 Neither commit-signature nor push-certificate verification runs unless
 something asks for it — that's the point of making them lazy
@@ -457,19 +491,25 @@ pub trait RepoAccess {
         sig: &ExternalSig<'_>,
     ) -> Option<VerificationStatus>;
 
-    /// HMAC seed for push-cert nonces. `None` (the default) disables
-    /// push-cert support entirely: mizzle does not advertise the
-    /// `push-cert` capability.
+    /// (planned, Phase F) HMAC seed for push-cert nonces. `None` (the
+    /// default) disables push-cert support entirely: mizzle does not
+    /// advertise the `push-cert` capability.
     fn push_cert_nonce_seed(&self) -> Option<&[u8]> {
         None
     }
 
-    fn post_receive<'a>(
-        &'a self,
-        push: &'a dyn Comparison<'a>,
-    ) -> PostReceiveFut<'a>;
+    /// Called after refs are updated. Cannot abort. The returned future
+    /// is 'static: copy anything needed out of `push` before building it.
+    fn post_receive(&self, push: &dyn Comparison<'_>) -> PostReceiveFut;
 
     fn auto_init(&self) -> bool;
+
+    /// Gate a Git LFS batch request. See lfs-backend-plan.md.
+    fn authorize_lfs(
+        &self,
+        op: LfsOperation,
+        git_ref: Option<&str>,
+    ) -> Result<(), String>;
 }
 ```
 
@@ -498,15 +538,15 @@ workflow `release.yml` on branch `main`".
 | Computing `dropped_commits`       | Mizzle, lazily via `Comparison::dropped_commits`             |
 | Computing path-level `RefDiff`    | Mizzle, lazily via `Comparison::ref_diff`                    |
 | Extracting commit metadata        | Mizzle (`inspect_ingested`)                                  |
-| Reconstructing signed payload     | Mizzle (`inspect.rs`)                                        |
-| Signature crypto (PGP/SSH/X.509)  | Mizzle, lazily via `Comparison::verify`                      |
+| Reconstructing signed payload     | Mizzle (`sigverify.rs`), lazily at verify time               |
+| Signature crypto (PGP/SSH/X.509)  | Mizzle, lazily via `Comparison::verify` (planned, Phase C)   |
 | Resolving keys for a signer       | Forge (`verification_keys`)                                  |
 | Sigstore / gitsign verification   | Forge (`verify_external`), reference adapter optional        |
-| Advertising `push-cert` capability | Mizzle, only when `push_cert_nonce_seed` returns `Some`     |
-| Parsing the push-cert block        | Mizzle (`mizzle-proto`, `read_receive_request`)              |
-| Nonce derivation + comparison      | Mizzle, stateless HMAC against the forge-supplied seed       |
-| Push-cert signature crypto         | Mizzle, lazily via `Comparison::verify_push_cert`             |
-| Requiring a push-cert at all       | Forge (`authorize_push`, reads `Comparison::push_cert()`)     |
+| Advertising `push-cert` capability (planned) | Mizzle, only when `push_cert_nonce_seed` returns `Some`     |
+| Parsing the push-cert block (planned) | Mizzle (`mizzle-proto`, `read_receive_request`)              |
+| Nonce derivation + comparison (planned) | Mizzle, stateless HMAC against the forge-supplied seed       |
+| Push-cert signature crypto (planned) | Mizzle, lazily via `Comparison::verify_push_cert`             |
+| Requiring a push-cert at all (planned) | Forge (`authorize_push`, reads `Comparison::push_cert()`)     |
 | DCO / sign-off / message regex    | Forge (`authorize_push`, reads `CommitInfo.message`)         |
 | Path / size / submodule rules     | Forge (`authorize_push`, reads `Comparison::ref_diff` and `Comparison::read_blob`) |
 
@@ -536,4 +576,7 @@ workflow `release.yml` on branch `main`".
 - [architecture.md](architecture.md) — high-level layers
 - [dos-protection.md](dos-protection.md) — limits applied before auth runs
 - [auth-implementation-plan.md](auth-implementation-plan.md) —
-  staged work plan and example forge rules
+  staged work plan and example forge rules; the rules are implemented as
+  integration tests in
+  [`mizzle/tests/auth_rules.rs`](../mizzle/tests/auth_rules.rs)
+- [lfs-backend-plan.md](lfs-backend-plan.md) — `authorize_lfs`

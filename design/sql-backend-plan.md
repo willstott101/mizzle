@@ -5,6 +5,31 @@ Companion to [roadmap.md](roadmap.md) Phase 8 and
 work to add a SQL `StorageBackend`, generic over SQLite (initial) and
 CockroachDB/Postgres (future), with local filesystem pack caching.
 
+## Status
+
+Phases 0–7 are merged (PR #12) for SQLite; the code lives in
+[`mizzle/src/backend/sql/`](../mizzle/src/backend/sql/).  Postgres /
+CockroachDB is not started.  Where the implementation differs from the
+plan below:
+
+- **Phase 0:** `Comparison` stayed synchronous and reaches the async
+  backend through `tokio::task::block_in_place` — neither of the two
+  options listed.  Most filesystem-backend methods still compute
+  synchronously and return a ready future rather than using
+  `spawn_blocking`, and the blocking read in `stream_pack_sideband` is
+  not fixed.
+- **Phase 5:** `build_pack` builds the whole pack into memory and
+  returns it as a `Cursor`, so the response isn't streamed and there
+  is no progress reporting.
+- **Phase 6:** the cache was later extracted to the shared
+  [`backend/pack_cache.rs`](../mizzle/src/backend/pack_cache.rs) (used by
+  the KV backend too).  Its key also mixes in `repo_id` and the pack
+  options (`filter` / `deepen` / `thin_pack`).  **No eviction is
+  implemented** — the cache grows without bound.
+- **Phase 7:** a separate `sql_backend_access_test!` macro was added
+  instead of a third arm on the dual-backend macros.  The SQL backend was
+  not added to `make_servers()` in `benches/backends.rs`.
+
 Design decisions made up front:
 
 - **Everything goes through SQL except packs.**  Objects, refs, and

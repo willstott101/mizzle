@@ -12,15 +12,25 @@ that the forge or its infrastructure handles regardless of mizzle:
 
 Only two things are git-specific enough to live in mizzle:
 
-1. **Pack size limiting** — mizzle knows it's receiving a packfile and can
+1. **Pack size limiting** — mizzle knows it's receiving a packfile and could
    reject before staging to disk with a meaningful error ("pack too large"
    vs a generic "request entity too large").  For SSH there is no framework
-   layer, so mizzle must enforce this directly.
+   layer, so mizzle would have to enforce this directly.  **Not yet
+   implemented:** there is no `max_pack_bytes` setting today.  Over HTTP
+   the forge's body limit is the only cap (the example uses axum's
+   `DefaultBodyLimit`); over SSH, push size is currently unbounded.
 
 2. **Fetch negotiation limits** — only mizzle understands the negotiation
    loop.  A generic request timeout would eventually catch a runaway
-   negotiation, but coarsely.  A future `max_negotiation_rounds` on
-   `ServerConfig` would cap this precisely.
+   negotiation, but coarsely.  A future `max_negotiation_rounds` setting
+   would cap this precisely (not yet implemented).
+
+What mizzle does enforce today is `ProtocolLimits`
+([`mizzle-proto/src/limits.rs`](../mizzle-proto/src/limits.rs)): caps on
+the number of ref updates, wants, haves, want-refs and ref-prefixes in a
+single request, so pathological input can't cause unbounded allocation.
+On the push side, `Comparison` walks are capped by
+`ComparisonOptions::max_reachable_commits`.
 
 Everything else belongs in the forge's middleware or example code.
 
@@ -28,7 +38,8 @@ Everything else belongs in the forge's middleware or example code.
 
 The SSH server accepts all public keys at the SSH layer and defers real auth
 to `SshAuth::authorize` at exec-request time.  This means unauthenticated
-clients can hold open SSH sessions.  The `exec_timeout` (default 10s)
+clients can hold open SSH sessions.  An exec timeout (`EXEC_TIMEOUT`,
+10s, currently a constant in `servers/ssh.rs` and not configurable)
 actively disconnects clients that open a channel but never send a git
 command.  This is enforced by a spawned task, not a passive check.
 
@@ -37,8 +48,10 @@ command.  This is enforced by a spawned task, not a passive check.
 | Threat                         | Mitigation                          | Owner                     |
 |--------------------------------|-------------------------------------|---------------------------|
 | Connection floods              | Connection limits, SYN cookies      | **Forge / infrastructure** |
-| Idle SSH sessions              | `exec_timeout`                      | **Mizzle**                |
-| Oversized push pack            | `max_pack_bytes`                    | **Mizzle** (backstop)     |
+| Idle SSH sessions              | `EXEC_TIMEOUT`                      | **Mizzle**                |
+| Oversized request arguments    | `ProtocolLimits`                    | **Mizzle**                |
+| Oversized push pack (HTTP)     | Body size limit                     | **Forge** today; `max_pack_bytes` backstop planned for **Mizzle** |
+| Oversized push pack (SSH)      | `max_pack_bytes` (future)           | **Mizzle** — currently unmitigated |
 | Infinite fetch negotiation     | `max_negotiation_rounds` (future)   | **Mizzle**                |
 | Large clone bandwidth          | Rate-limit at network edge          | **Forge / infrastructure** |
 | Rate limiting                  | Tower middleware / load balancer     | **Forge / infrastructure** |

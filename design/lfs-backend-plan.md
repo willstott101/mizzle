@@ -8,6 +8,26 @@ object store can be the **same** backend (coupled) or **different**
 backends (e.g. S3 for LFS, SQLite for git) with no change to the
 protocol or auth layers.
 
+## Status
+
+Phases 0–3 are merged: `mizzle-proto/src/lfs.rs`, the `LfsStore` trait
+and `NoLfs` placeholder in `mizzle/src/lfs/`, `authorize_lfs`, the batch
+and proxy transfer handlers, and `FsLfs`.  Phases 4–7 are not started;
+in particular there are no LFS integration tests yet.
+
+Where the code differs from the sketches below:
+
+- The git-only `serve_with_backend` entry point was made private.
+  Callers always use `serve_with_backends`, passing `NoLfs` when they
+  don't want LFS.  `serve_lfs` and `serve_with_backends` live in
+  `servers/axum.rs`, not `lfs/mod.rs`.
+- `LfsStore::read` returns `Box<dyn AsyncRead + Send + Unpin>`, and
+  `LfsStore::write` returns a typed `LfsWriteError` (`HashMismatch` /
+  `SizeMismatch` / `Io`) so the handler can pick 422 vs 500.
+- There is no `LfsError::ProxyNotSupported`; redirect-only stores will
+  need to return a plain error from `read`/`write`.
+- Phases 0–3 landed in a single change rather than as separate MRs.
+
 ## Why LFS is a separate trait, not new `StorageBackend` methods
 
 A Git LFS object is an opaque, immutable blob addressed by its SHA-256
@@ -28,8 +48,8 @@ own lifecycle.
 This is exactly the "Objects" access pattern
 [distributed-backends.md](distributed-backends.md) already isolates:
 
-> **Objects** (`read_object`, `has_object`, `write_objects`): immutable,
-> content-addressed — any CAS or blob store works.
+> **Objects** (`read_object_raw`, `has_object(s)`, `ingest_pack`):
+> immutable, content-addressed — any CAS or blob store works.
 
 LFS is that pattern with none of the ref/graph/pack machinery.  Folding
 it into `StorageBackend` would force every git backend to grow a blob
@@ -76,7 +96,7 @@ only by `RepoId`, every combination is a one-line wiring change.
 
 | Topology | git store | LFS store | How |
 |---|---|---|---|
-| **No LFS** | `SqlBackend` | — | `serve_with_backend` (today's path) |
+| **No LFS** | `SqlBackend` | `NoLfs` | `serve_with_backends(access, git, NoLfs::new(), …)` |
 | **Coupled** | `SqlBackend` | `SqlBackend` | one type implements both traits; pass it twice |
 | **Coupled (KV)** | `KvBackend` | `KvBackend` | LFS bytes under `("lfs", repo, oid)` keys |
 | **Separated** | `SqlBackend` | `S3LfsStore` | two types, same `RepoId = PathBuf` |
@@ -202,8 +222,7 @@ Reference stores at a glance:
 
 ## Wiring into `serve`
 
-Two entry points, mirroring the existing `serve` / `serve_with_backend`
-pair:
+Two entry points in `servers/axum.rs`:
 
 ```rust
 /// LFS-only handler.  Mount for `*/info/lfs/...` paths.
@@ -227,7 +246,7 @@ where A: RepoAccess + Send + 'static,
 Path resolution reuses the existing
 `path.rsplit_once(".git/")` split in `servers/axum.rs`: an LFS request
 has `service_path` beginning `info/lfs/`.  Forges that don't want LFS
-keep calling `serve_with_backend` unchanged.
+pass `NoLfs` as the LFS store.
 
 LFS service paths to dispatch:
 
